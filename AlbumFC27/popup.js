@@ -21,7 +21,7 @@ function render(s) {
   const rows = [
     ['Recherches', s.searches ?? 0],
     ['Joueurs collectés', s.purchases ?? 0],
-    ['Score de base ajouté', s.scoreAdded ?? 0],
+    ['Score Galerie ajouté', s.scoreAdded ?? 0],
     ['Dépensé', s.spent ?? 0],
     ['Vendus', s.listed == null ? s.sold ?? 0 : `${s.sold ?? 0} (${s.listed} en vente)`],
     ['Taxe EA payée', s.taxPaid ?? 0],

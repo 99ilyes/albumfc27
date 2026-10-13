@@ -21,6 +21,7 @@
     buyDelayMaxMs: 900,
     markupPct: 0,
     maxBuysPerSearch: 3,
+    maxCoinsPerPoint: 0,
     maxPagesPerStep: 5,
     dropAfterExpiries: 0,
     coinReserve: 0,
@@ -106,7 +107,7 @@
   // Balayage global par qualité, du meilleur score par crédit au moins bon : chaque joueur collecté
   // alimente à la fois ses ensembles championnat, club, nation et rareté.
   const AUTO_SETS = [
-    { id: 'auto-gold84', label: 'Auto · Or 84+', criteria: { level: 'gold' }, maxPrice: 3000, minRating: 84, maxRating: 99 },
+    { id: 'auto-gold84', label: 'Auto · Or 84+', criteria: { level: 'gold' }, maxPrice: 15000, minRating: 84, maxRating: 99 },
     { id: 'auto-gold75', label: 'Auto · Or 75–83', criteria: { level: 'gold' }, maxPrice: 1000, minRating: 75, maxRating: 83 },
     { id: 'auto-silver', label: 'Auto · Argent', criteria: { level: 'silver' }, maxPrice: 400, minRating: 0, maxRating: 99 },
     { id: 'auto-bronze', label: 'Auto · Bronze', criteria: { level: 'bronze' }, maxPrice: 300, minRating: 0, maxRating: 99 },
@@ -126,8 +127,29 @@
   let diagSink = null;
   const galleryCaptures = [];
 
+  // Données Galerie lues dans les réponses EA brutes : isCollected et gradingScore par definitionId
+  const netItems = new Map();
+  const clubCollected = new Set();
+  function recordItems(url, j) {
+    const list = [...(Array.isArray(j.itemData) ? j.itemData : []), ...(Array.isArray(j.auctionInfo) ? j.auctionInfo.map((a) => a?.itemData) : [])];
+    const club = /\/club(\?|$)/i.test(url);
+    for (const it of list) {
+      const defId = Number(it?.resourceId ?? 0);
+      if (!defId || it.itemType !== 'player') continue;
+      const collected = it.isCollected === true;
+      const prev = netItems.get(defId);
+      netItems.set(defId, { collected: collected || !!prev?.collected, score: Number(it.gradingScore) || prev?.score || 0 });
+      if (club && collected) clubCollected.add(defId);
+    }
+  }
+
   function onResponse(url, status, text) {
     if (status !== 200) return;
+    if (/\/ut\/game\//i.test(url) && /"itemData"/.test(text)) {
+      try {
+        recordItems(url, JSON.parse(text));
+      } catch {}
+    }
     if (PILE_RE.test(url)) {
       try {
         const j = JSON.parse(text);
@@ -249,7 +271,8 @@
       defId: Number(i.definitionId ?? 0),
       rating: Number(i.rating ?? 0),
       name: String(i._staticData?.name ?? i.getStaticData?.()?.name ?? i.definitionId),
-      collected: collectedFlag(i),
+      collected: netItems.get(Number(i.definitionId ?? 0))?.collected === true || collectedFlag(i) === true,
+      score: netItems.get(Number(i.definitionId ?? 0))?.score || Number(i.gradingScore) || itemScore(Number(i.rating ?? 0)),
       duplicate: (() => {
         try {
           return i.isDuplicate?.() === true;
@@ -326,6 +349,7 @@
     };
   }
 
+  let clubScanShape = null;
   async function scanClubDefIds(onProgress) {
     if (typeof services.Club?.search !== 'function') throw Error('recherche club indisponible dans cette version de la Web App');
     const ids = new Set();
@@ -340,13 +364,20 @@
         if (!ids.size) throw Error(`statut ${r.status}`);
         break;
       }
-      const items = r.data?.items ?? [];
+      const d = r.data;
+      const items = Array.isArray(d) ? d : (d?.items ?? d?.itemData ?? Object.values(d ?? {}).find(Array.isArray) ?? []);
+      if (offset === 0) clubScanShape = { status: r.status, dataKeys: Object.keys(d ?? {}), count: items.length, firstItemKeys: Object.keys(items[0] ?? {}).slice(0, 60) };
       const before = ids.size;
-      for (const i of items) if (i.definitionId) ids.add(Number(i.definitionId));
+      for (const i of items) {
+        const id = Number(i?.definitionId ?? i?.resourceId ?? i?.getDefinitionId?.() ?? 0);
+        if (id) ids.add(id);
+      }
       onProgress?.(ids.size);
       if (!items.length || ids.size === before) break;
       await sleep(rand(800, 1600));
     }
+    for (const id of clubCollected) ids.add(id);
+    if (!ids.size) throw Error(`aucun joueur lu (statut ${clubScanShape?.status}, clés réponse : ${clubScanShape?.dataKeys.join(', ') || 'aucune'}, ${clubScanShape?.count ?? 0} élément(s))`);
     return ids;
   }
 
@@ -484,16 +515,21 @@
       const now = Date.now();
       const searches = this.all('searches').filter((t) => now - t < DAY);
       const purchases = this.all('purchases').filter((t) => now - t < DAY);
-      const dayWait = (arr, what) => {
-        const w = Math.max(6e4, arr[0] + DAY - now + 5e3);
-        return { ok: false, waitMs: w, reason: `Quota journalier ${what} atteint, reprise dans ${fmtMin(w)}` };
+      const split = (kind) => {
+        const own = this.s[kind].filter((t) => now - t < DAY).length;
+        const snipe = (this.other()[kind] ?? []).filter((t) => now - t < DAY).length;
+        return `AlbumFC27 ${own} + SnipeFC27 ${snipe}`;
       };
-      if (searches.length >= cfg.maxSearchesPerDay) return dayWait(searches, 'de recherches');
-      if (purchases.length >= cfg.maxPurchasesPerDay) return dayWait(purchases, "d'achats");
+      const dayWait = (arr, what, kind, max) => {
+        const w = Math.max(6e4, arr[arr.length - max] + DAY - now + 5e3);
+        return { ok: false, waitMs: w, reason: `Quota journalier ${what} atteint (${split(kind)} sur 24 h, max ${max}), reprise dans ${fmtMin(w)}` };
+      };
+      if (searches.length >= cfg.maxSearchesPerDay) return dayWait(searches, 'de recherches', 'searches', cfg.maxSearchesPerDay);
+      if (purchases.length >= cfg.maxPurchasesPerDay) return dayWait(purchases, "d'achats", 'purchases', cfg.maxPurchasesPerDay);
       const hour = searches.filter((t) => now - t < HOUR);
       if (hour.length >= cfg.maxSearchesPerHour) {
         const w = hour[0] + HOUR - now + 5e3;
-        return { ok: false, waitMs: w, reason: `Quota horaire atteint (${hour.length}), reprise dans ${fmtMin(w)}` };
+        return { ok: false, waitMs: w, reason: `Quota horaire atteint (${hour.length}, max ${cfg.maxSearchesPerHour}), reprise dans ${fmtMin(w)}` };
       }
       return { ok: true };
     }
@@ -780,8 +816,8 @@
         const ok = r.calls.filter((c) => !c.error && !c.result?.timeout).length;
         this.log(
           r.apis.length
-            ? `Galerie : ${r.apis.length} module(s) détecté(s) (${r.apis.map((a) => a.path).join(', ')}), ${ok} lecture(s) réussie(s). Envoie le rapport Galerie pour activer la lecture directe des ensembles`
-            : 'Galerie : aucun module Galerie dans la Web App, complétion par balayage du marché',
+            ? `Galerie : ${r.apis.length} module(s) détecté(s) (${r.apis.map((a) => a.path).join(', ')}), ${ok} lecture(s) réussie(s)`
+            : 'Galerie : statut collecté et score lus dans les réponses EA de chaque carte',
         );
       } catch (e) {
         this.log(`Détection Galerie impossible : ${e instanceof Error ? e.message : String(e)}`);
@@ -793,7 +829,7 @@
       const set = sets[idx];
       this.bumpSet(set.id, 'sweeps', 1);
       const s = this.setStats[set.id] ?? {};
-      this.log(`Ensemble « ${set.label} » balayé (${s.bought ?? 0} joueurs collectés au total, score de base ~${s.score ?? 0})`);
+      this.log(`Ensemble « ${set.label} » balayé (${s.bought ?? 0} joueurs collectés au total, score Galerie +${s.score ?? 0})`);
       if (idx + 1 < sets.length) {
         this.cursor = { setId: sets[idx + 1].id, stepIdx: 0, page: 1 };
         return false;
@@ -827,6 +863,7 @@
           this.clubOwned.add(it.defId);
           continue;
         }
+        if (cfg.maxCoinsPerPoint > 0 && it.buyNow / it.score > cfg.maxCoinsPerPoint) continue;
         const prev = best.get(it.defId);
         if (!prev || it.buyNow < prev.buyNow) best.set(it.defId, it);
       }
@@ -834,7 +871,7 @@
         this.flagLogged = true;
         this.log(`Marqueur Galerie détecté sur les cartes (${flagKey}) : joueurs déjà dans la Galerie ignorés`);
       }
-      const picks = [...best.values()].sort((a, b) => a.buyNow - b.buyNow).slice(0, cfg.maxBuysPerSearch);
+      const picks = [...best.values()].sort((a, b) => b.score / b.buyNow - a.score / a.buyNow).slice(0, cfg.maxBuysPerSearch);
       this.feed(`${set.label} : ${items.length} annonce${items.length > 1 ? 's' : ''}, ${best.size} joueur${best.size > 1 ? 's' : ''} manquant${best.size > 1 ? 's' : ''}${picks.length ? ' → achat' : ''}`);
       let budget = available;
       let tried = 0;
@@ -878,7 +915,7 @@
         this.feed(`Raté ${it.name} à ${it.buyNow} (${why})`);
         return 'missed';
       }
-      const score = itemScore(it.rating);
+      const score = it.score;
       this.stats.purchases++;
       this.stats.spent += it.buyNow;
       this.stats.scoreAdded += score;
@@ -888,7 +925,7 @@
       this.bumpSet(set.id, 'bought', 1);
       this.bumpSet(set.id, 'score', score);
       this.bumpSet(set.id, 'spent', it.buyNow);
-      this.log(`Collecté ${it.name} (${it.rating}) à ${it.buyNow} pour « ${set.label} »`);
+      this.log(`Collecté ${it.name} (${it.rating}) à ${it.buyNow}, +${score} pts Galerie, pour « ${set.label} »`);
 
       const id = Number(it.raw?.id);
       const sell = sellPriceFor(it.buyNow, cfg.markupPct);
@@ -1062,9 +1099,11 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
 .neg { color: #ff6b6b; }
 `;
 
+  const FLOAT_KEYS = new Set(['markupPct', 'maxCoinsPerPoint']);
   const SETTINGS = [
     { key: 'markupPct', label: 'Majoration revente (%, 0 = prix d’achat)' },
     { key: 'maxBuysPerSearch', label: 'Achats max par recherche' },
+    { key: 'maxCoinsPerPoint', label: 'Crédits max par point Galerie (0 = sans limite)' },
     { key: 'maxPagesPerStep', label: 'Pages max par palier de prix' },
     { key: 'coinReserve', label: 'Crédits à garder' },
     { key: 'maxSpend', label: 'Dépense max par session (0 = illimitée)' },
@@ -1307,9 +1346,10 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
       const v = this.config[key];
       const i = h('input', { type: 'number', min: '0', value: String(seconds ? v / 1e3 : v) });
       if (seconds) i.step = String(stepS);
+      else if (FLOAT_KEYS.has(key)) i.step = '0.05';
       i.onchange = () => {
         const n = Number(i.value);
-        this.setConfig({ [key]: seconds ? Math.round(n * 1e3) : key === 'markupPct' ? Math.max(0, n) : Math.floor(n) });
+        this.setConfig({ [key]: seconds ? Math.round(n * 1e3) : FLOAT_KEYS.has(key) ? Math.max(0, n) : Math.floor(n) });
       };
       return i;
     }
@@ -1334,7 +1374,7 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
       const rows = [
         ['Recherches', s.searches],
         ['Joueurs collectés', s.attempts ? `${s.purchases} / ${s.attempts} tentés` : s.purchases],
-        ['Score de base ajouté (estim.)', s.scoreAdded],
+        ['Score Galerie ajouté', s.scoreAdded],
         ['Dépensé (immobilisé)', s.spent],
         ['Vendus', s.listed === null ? s.sold : `${s.sold} (${s.listed} en vente)`],
         ['Taxe EA payée', s.taxPaid],
@@ -1388,7 +1428,7 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
       lastUiCriteria: () => lastUiCriteria,
       galleryReport: async () => {
         if (!galleryReport.probedAt) await probeGallery();
-        return { ...galleryReport, responses: galleryCaptures, url: location.href, at: new Date().toISOString() };
+        return { ...galleryReport, clubScan: clubScanShape, responses: galleryCaptures, url: location.href, at: new Date().toISOString() };
       },
       onDiag: (on) => {
         diagSink = on ? (l) => panel.update(bot.snapshot(), `${new Date().toLocaleTimeString()} ${l}`) : null;

@@ -25,10 +25,12 @@ Bouton **Compléter automatiquement la Galerie** : ajoute 4 ensembles automatiqu
 
 | Ensemble | Filtre | Prix max |
 |---|---|---|
-| Auto · Or 84+ | or, note ≥ 84 | 3 000 |
+| Auto · Or 84+ | or, note ≥ 84 | 15 000 |
 | Auto · Or 75–83 | or, note 75–83 | 1 000 |
 | Auto · Argent | argent | 400 |
 | Auto · Bronze | bronze | 300 |
+
+Les réponses brutes d'EA indiquent pour chaque carte `isCollected` (déjà dans ta Galerie) et `gradingScore` (score Galerie exact). L'extension les lit : un joueur déjà collecté n'est jamais racheté, et dans chaque page les cartes sont achetées par meilleur rapport points / crédits. Réglage **Crédits max par point Galerie** : ignore les cartes trop chères pour leur score (ex. 1,4 pour viser le niveau 10 au moindre coût).
 
 Chaque joueur collecté alimente en même temps ses ensembles championnat, club, nation et rareté. Au démarrage, l'extension scanne le club (au plus toutes les 12 h) et cherche un module Galerie dans la Web App. Si les cartes portent un marqueur « déjà dans la Galerie », il est utilisé pour ne pas racheter ces joueurs. Prix max et notes : supprimer l'ensemble auto et le recréer à la main pour les changer.
 
@@ -50,7 +52,6 @@ Repris de SnipeFC27 : délais aléatoires, quotas recherches / achats par heure 
 
 ## Limites connues
 
-- Le score affiché est une **estimation** du score de base (bronze 20, argent 35, or 75 = 90 … 90 = 14 000, valeurs communautaires), sans bonus de rareté ni tags. Le grade réel se lit dans la Galerie.
-- Unicité supposée par definitionId : une même carte n'est achetée qu'une fois.
-- La structure de la Galerie côté Web App n'est pas documentée : sans marqueur sur les cartes, les joueurs déjà dans la Galerie mais plus dans le club ne sont pas détectés et peuvent être rachetés une fois. Le rapport Galerie sert à lever cette limite.
+- Le score affiché vient du `gradingScore` d'EA quand il est disponible (sinon estimation par note), sans les bonus de tags. Le grade réel se lit dans la Galerie.
+- Unicité par definitionId (resourceId EA) : une même carte n'est achetée qu'une fois.
 - L'automatisation de la Web App est contraire aux conditions d'EA : risque de restriction du marché ou du compte.
