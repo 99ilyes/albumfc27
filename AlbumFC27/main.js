@@ -110,10 +110,28 @@
     }
   }
 
+  // Session EA vue passer dans les requêtes de la Web App : permet de remettre en vente par identifiant de carte
+  const eaApi = { base: null, headers: {} };
+  function noteUrl(url) {
+    try {
+      const m = new URL(String(url), location.href).href.match(/^(https?:\/\/[^?#]*?\/ut\/game\/[^/?#]+\/)/i);
+      if (m) eaApi.base = m[1];
+    } catch {}
+  }
+  function noteHeader(name, value) {
+    if (/^x-ut-/i.test(String(name)) && value) eaApi.headers[String(name)] = String(value);
+  }
+
   function installNetHooks() {
     const X = XMLHttpRequest.prototype;
     const open = X.open;
+    const setHeader = X.setRequestHeader;
+    X.setRequestHeader = function (name, value) {
+      noteHeader(name, value);
+      return setHeader.call(this, name, value);
+    };
     X.open = function (method, url, ...rest) {
+      noteUrl(url);
       this.addEventListener('readystatechange', () => {
         if (this.readyState === 4 && (this.responseType === '' || this.responseType === 'text')) onResponse(String(url), this.status, this.responseText);
       });
@@ -122,6 +140,13 @@
     const f = window.fetch;
     window.fetch = async function (input, init) {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (/\/ut\//i.test(url)) {
+        noteUrl(url);
+        try {
+          const hs = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+          hs.forEach((v, k) => noteHeader(k, v));
+        } catch {}
+      }
       const res = await f.call(this, input, init);
       if (/\/ut\//i.test(url)) res.clone().text().then((t) => onResponse(url, res.status, t)).catch(() => {});
       return res;
@@ -142,7 +167,7 @@
     return new Promise((resolve) => {
       if (typeof obs?.observe !== 'function') return resolve({ success: false, status: -1, data: undefined, error: 'fonction Web App introuvable' });
       obs.observe(undefined, (_, r) =>
-        resolve({ success: !!r?.success, status: Number(r?.status ?? 0), data: r?.data, error: r?.error ?? r?.data?.reason ?? r?.data?.message }),
+        resolve({ success: !!r?.success, status: Number(r?.status ?? 0), data: r?.data, response: r?.response, error: r?.error ?? r?.data?.reason ?? r?.data?.message }),
       );
     });
   }
@@ -180,9 +205,40 @@
   const bid = (item) => observe(services.Item.bid(item.raw, item.buyNow));
   const listItem = (raw, buyNow) => observe(services.Item.list(raw, priceDown(buyNow), buyNow, 3600));
 
+  // Même requête que la Web App (POST auctionhouse), pour une carte que la Web App n'a pas chargée
+  function listById(id, buyNow) {
+    return new Promise((resolve) => {
+      if (!eaApi.base || !Object.keys(eaApi.headers).length) return resolve({ success: false, status: -1, error: 'session EA pas encore vue : ouvre la liste de transferts puis relance' });
+      const x = new XMLHttpRequest();
+      x.open('POST', `${eaApi.base}auctionhouse`);
+      for (const [k, v] of Object.entries(eaApi.headers)) x.setRequestHeader(k, v);
+      x.setRequestHeader('Content-Type', 'application/json');
+      x.onload = () => resolve({ success: x.status >= 200 && x.status < 300, status: x.status, error: x.status >= 300 ? String(x.responseText || '').slice(0, 200) : undefined });
+      x.onerror = () => resolve({ success: false, status: 0, error: 'réseau' });
+      x.send(JSON.stringify({ itemData: { id: Number(id) }, startingBid: priceDown(buyNow), duration: 3600, buyNowPrice: buyNow }));
+    });
+  }
+
   async function moveAndList(raw, price) {
     const m = await observe(services.Item.move(raw, ItemPile.TRANSFER));
     return m.success ? listItem(raw, price) : m;
+  }
+
+  // Cartes de la liste de transferts (objets Web App nécessaires pour remettre en vente) : selon la version,
+  // dans data.items, response.items ou le dépôt local de la Web App
+  function transferEntities(r) {
+    const isItem = (x) => x && typeof x === 'object' && Number(x.id) > 0 && ('definitionId' in x || typeof x.getAuctionData === 'function');
+    const lists = [r?.data?.items, r?.response?.items, r?.data?.response?.items];
+    try {
+      const repo = typeof repositories !== 'undefined' ? repositories.Item : undefined;
+      lists.push(repo?.getTransferItems?.(), repo?.transfer?.items, repo?.getPile?.(ItemPile.TRANSFER), repo?.piles?.[ItemPile.TRANSFER]?.items);
+    } catch {}
+    const out = new Map();
+    for (const l of lists) {
+      const arr = l instanceof Map ? [...l.values()] : Array.isArray(l) ? l : l && typeof l === 'object' ? Object.values(l) : [];
+      for (const x of arr) if (isItem(x) && !out.has(Number(x.id))) out.set(Number(x.id), x);
+    }
+    return [...out.values()];
   }
 
   const tradeState = (s, bidV) => (s === 'closed' && bidV > 0 ? 'sold' : s === 'expired' || s === 'closed' ? 'expired' : s === 'active' ? 'active' : 'unlisted');
@@ -193,7 +249,7 @@
     } catch {}
     const t0 = Date.now();
     const r = await observe(services.Item.requestTransferItems?.());
-    const items = r.data?.items ?? [];
+    const items = transferEntities(r);
     const byId = new Map(items.map((i) => [Number(i.id), i]));
     let pile = lastPile;
     for (let n = 0; n < 10 && !(pile && pile.at >= t0); n++) {
@@ -208,7 +264,7 @@
           const id = Number(a.itemData?.id);
           const raw = byId.get(id);
           const defId = Number(raw?.definitionId ?? a.itemData?.resourceId ?? 0);
-          return { raw, id, defId, name: raw ? staticName(raw) : String(defId || id), state: tradeState(String(a.tradeState ?? ''), Number(a.currentBid ?? 0)), soldPrice: Number(a.currentBid ?? 0), buyNow: Number(a.buyNowPrice ?? 0) };
+          return { raw, id, defId, type: String(a.itemData?.itemType ?? raw?.type ?? 'player'), name: raw ? staticName(raw) : String(defId || id), state: tradeState(String(a.tradeState ?? ''), Number(a.currentBid ?? 0)), soldPrice: Number(a.currentBid ?? 0), buyNow: Number(a.buyNowPrice ?? 0) };
         }),
       };
     }
@@ -1008,6 +1064,7 @@
         if (!this.fatal(pile, 'pile')) this.log(`Lecture de la liste de transferts impossible (statut ${pile.status})${errText(pile.error)}`);
         return null;
       }
+      for (const i of pile.data) if (!i.raw || /^\d+$/.test(i.name)) i.name = this.bought[i.id]?.name || this.findPlayer(i.defId)?.name || i.name;
       const sold = pile.data.filter((i) => i.state === 'sold');
       for (const i of sold) {
         const net = netOf(i.soldPrice);
@@ -1053,18 +1110,28 @@
 
     // --- Relister : chaque invendu au prix de l'annonce la moins chère trouvée par sondage ---
 
+    async relistAll(n, why) {
+      await sleep(rand(800, 1600));
+      const g = await observe(services.Item.relistExpiredAuctions?.());
+      if (g.success) {
+        this.log(`${n} invendu(s) remis en vente en bloc à leur prix précédent (${why})`, 'list');
+        for (const b of Object.values(this.bought)) if (isUnsold(b)) b.state = 'active';
+        this.saveBought();
+      } else if (!this.fatal(g, 'list')) this.log(`Remise en vente en bloc échouée (statut ${g.status})${errText(g.error)}`, 'error');
+    }
+
     async relist() {
       if (!(await this.enter('relist'))) return;
       try {
         const items = await this.syncPile();
         if (!items) return;
-        const players = items.filter((i) => i.raw ? (i.raw.type ?? i.raw.itemType ?? 'player') === 'player' : true);
+        const players = items.filter((i) => (i.type ?? i.raw?.type ?? 'player') === 'player');
         const active = players.filter((i) => i.state === 'active').length;
-        const unsold = players.filter((i) => i.state !== 'active');
-        const todo = unsold.filter((i) => i.raw);
-        this.log(`Liste de transferts : ${active} en vente, ${unsold.length} invendu(s)${unsold.length > todo.length ? `, ${unsold.length - todo.length} non chargé(s) par la Web App` : ''}${this.pileFresh ? '' : ' (lue depuis le cache de la Web App : si des invendus manquent, ouvre Transferts > Liste de transferts puis relance)'}`);
+        const todo = players.filter((i) => i.state !== 'active');
+        const direct = todo.filter((i) => !i.raw).length;
+        this.log(`Liste de transferts : ${active} en vente, ${todo.length} invendu(s)${direct ? ` (${direct} remis en vente par requête directe, carte non chargée par la Web App)` : ''}${this.pileFresh ? '' : ' (lue depuis le cache de la Web App : si des invendus manquent, ouvre Transferts > Liste de transferts puis relance)'}`);
         if (!todo.length) {
-          if (active) this.log(`Rien à relister : EA ne permet pas de modifier une annonce en cours, les ${active} joueur(s) en vente seront relistables à leur expiration (1 h)`);
+          this.log(active ? `Aucun invendu. Les ${active} joueur(s) en vente ne peuvent pas être modifiés (règle EA) : relistables à leur expiration (1 h)` : 'Aucun invendu à relister');
           return;
         }
         this.log(`Relister ${todo.length} invendu(s) au prix de l'annonce la moins chère`);
@@ -1079,7 +1146,7 @@
           const defId = b?.defId || i.defId;
           const cur = i.buyNow || b?.sell || b?.price || 0;
           this.activity(`${i.name} : sondage du prix${cur ? ` (était à ${fmtNum(cur)})` : ''}`);
-          const r = await this.probe(defId, 0);
+          const r = defId ? await this.probe(defId, 0) : { items: [], lowest: 0 };
           if (r.stop) break;
           const price = r.lowest >= 200 ? r.lowest : cur;
           if (!(price >= 200)) {
@@ -1088,7 +1155,7 @@
             continue;
           }
           await sleep(rand(500, 1200));
-          const l = await listItem(i.raw, price);
+          const l = i.raw ? await listItem(i.raw, price) : await listById(i.id, price);
           if (!l.success) {
             if (this.fatal(l, 'list')) break;
             failed++;
@@ -1106,13 +1173,11 @@
             this.feed(`${i.name} relisté à ${fmtNum(price)} (${why}, ${loss >= 0 ? `perte si vendu ${fmtNum(loss)}` : `gain si vendu ${fmtNum(-loss)}`})`);
           } else this.feed(`${i.name} relisté à ${fmtNum(price)} (${why})`);
         }
-        // Secours : les invendus non relistés un par un sont remis en vente en bloc à leur prix précédent
-        if (failed && !this.stopRequested) {
-          await sleep(rand(800, 1600));
-          const g = await observe(services.Item.relistExpiredAuctions?.());
-          if (g.success) this.log(`${failed} invendu(s) remis en vente en bloc à leur prix précédent`, 'list');
-          else if (!this.fatal(g, 'list')) this.log(`Remise en vente en bloc échouée (statut ${g.status})${errText(g.error)}`);
-        }
+        // Secours : invendus qui n'ont pas pu être relistés au prix du marché, remis en vente en bloc à leur prix précédent
+        if (failed && !this.stopRequested) await this.relistAll(failed, 'échec de la remise en vente au prix du marché');
+        try {
+          repositories?.Item?.setDirty?.(ItemPile.TRANSFER);
+        } catch {}
         if (this.pile && ok) {
           this.pile = { ...this.pile, active: this.pile.active + ok, unsold: Math.max(0, this.pile.unsold - ok) };
           save(K_PILE, this.pile);
