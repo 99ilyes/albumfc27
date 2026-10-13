@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AlbumFC27",
-  "version": "1.0.0",
-  "description": "Complète un ensemble de la Galerie FC 27 : joueurs du set (fut.gg ou marché), achat puis remise en vente immédiate au prix d'achat.",
+  "version": "1.2.0",
+  "description": "Complète un ensemble de la Galerie FC 27 : joueurs du set (fut.gg ou marché), achat puis remise en vente immédiate juste sous le marché.",
   "action": { "default_popup": "popup.html", "default_title": "AlbumFC27" },
   "permissions": ["storage"],
   "host_permissions": [

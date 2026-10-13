@@ -23,6 +23,8 @@
     pricePct: 10,
     triesPerPlayer: 3,
     coinReserve: 0,
+    watchMinutes: 5,
+    minSellPct: 0,
     maxSearchesPerHour: 300,
     maxSearchesPerDay: 1500,
     maxPurchasesPerDay: 150,
@@ -40,6 +42,7 @@
     return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`;
   };
   const fmtNum = (n) => Number(n || 0).toLocaleString('fr-FR');
+  const fmtSigned = (n) => (n < 0 ? `gain ${fmtNum(-n)}` : fmtNum(n));
   const clock = (ms) => new Date(Date.now() + ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const errText = (e) => {
     if (e == null || e === '') return '';
@@ -242,7 +245,8 @@
         data: pile.auctions.map((a) => {
           const id = Number(a.itemData?.id);
           const raw = byId.get(id);
-          return { raw, id, name: raw ? staticName(raw) : String(a.itemData?.resourceId ?? id), state: tradeState(String(a.tradeState ?? ''), Number(a.currentBid ?? 0)), soldPrice: Number(a.currentBid ?? 0) };
+          const defId = Number(raw?.definitionId ?? a.itemData?.resourceId ?? 0);
+          return { raw, id, defId, name: raw ? staticName(raw) : String(defId || id), state: tradeState(String(a.tradeState ?? ''), Number(a.currentBid ?? 0)), soldPrice: Number(a.currentBid ?? 0), buyNow: Number(a.buyNowPrice ?? 0) };
         }),
       };
     }
@@ -251,7 +255,7 @@
       data: items.map((i) => {
         const a = i._auction ?? i.getAuctionData?.() ?? {};
         const cur = Number(a.currentBid ?? 0);
-        return { raw: i, id: Number(i.id), name: staticName(i), state: tradeState(String(a.tradeState ?? ''), cur), soldPrice: cur };
+        return { raw: i, id: Number(i.id), defId: Number(i.definitionId ?? 0), name: staticName(i), state: tradeState(String(a.tradeState ?? ''), cur), soldPrice: cur, buyNow: Number(a.buyNowPrice ?? 0) };
       }),
     };
   }
@@ -428,6 +432,7 @@
   const K_ACTIVE = `${NS}:active`;
   const K_RESUME = `${NS}:resume`;
   const K_TOTAL = `${NS}:total`;
+  const K_WATCH = `${NS}:watch`;
 
   function loadConfig() {
     const raw = load(K_CONFIG, {});
@@ -439,7 +444,7 @@
   const STATUS_LABEL = {
     pending: 'en attente',
     searching: 'recherche…',
-    listed: 'acheté, en vente',
+    listed: 'acheté',
     bought: 'acheté, non mis en vente',
     notfound: 'introuvable au prix max',
     nocoins: 'crédits insuffisants',
@@ -458,8 +463,9 @@
     queue = load(K_QUEUE, []);
     done = new Set(load(K_DONE, []));
     bought = load(K_BOUGHT, {});
-    total = { bought: 0, spent: 0, tax: 0, ...load(K_TOTAL, {}) };
+    total = { bought: 0, spent: 0, tax: 0, lost: 0, sold: 0, ...load(K_TOTAL, {}) };
     pileCount = 0;
+    ownListed = 0;
     misses = 0;
     listFails = 0;
     wake = null;
@@ -471,6 +477,9 @@
     }
     get running() {
       return this.mode !== null;
+    }
+    get busy() {
+      return this.mode === 'scan' || this.mode === 'buy';
     }
 
     snapshot() {
@@ -485,7 +494,24 @@
         club: this.set?.name ?? null,
         queue: { total: q.length, listed: q.filter((e) => e.status === 'listed' || e.status === 'bought').length, failed: q.filter((e) => e.status === 'notfound' || e.status === 'nocoins').length },
         total: { ...this.total },
+        pendingLoss: this.pendingLoss(),
+        onSale: Object.keys(this.bought).length,
       };
+    }
+    // Perte si les joueurs encore en vente partent au prix affiché
+    pendingLoss() {
+      let n = 0;
+      for (const b of Object.values(this.bought)) {
+        const price = typeof b === 'number' ? b : b.price;
+        const sell = typeof b === 'number' ? b : b.sell || b.price;
+        n += price - Math.floor(sell * (1 - EA_TAX));
+      }
+      return n;
+    }
+    resetTotals() {
+      this.total = { bought: 0, spent: 0, tax: 0, lost: 0, sold: 0 };
+      save(K_TOTAL, this.total);
+      this.log('Compteurs remis à zéro');
     }
     emit(line) {
       this.onUpdate(this.snapshot(), line);
@@ -511,7 +537,7 @@
     // --- Ensemble ---
 
     setClub(set) {
-      if (this.running) return;
+      if (this.busy) return;
       this.set = { kind: 'club', ...set };
       save(K_SET, this.set);
       if (this.scan?.key !== setKey(this.set)) {
@@ -537,7 +563,7 @@
 
     // Set envoyé depuis une page Galerie de fut.gg (joueurs, defId, prix fut.gg)
     importSet(data) {
-      if (this.running) return this.log('Import fut.gg reçu pendant une tâche en cours : arrête-la puis renvoie le set');
+      if (this.busy) return this.log('Import fut.gg reçu pendant une tâche en cours : arrête-la puis renvoie le set');
       const list = Array.isArray(data?.players) ? data.players : [];
       const players = {};
       for (const x of list) {
@@ -574,13 +600,17 @@
     // --- Contrôles communs ---
 
     stop(msg = 'Arrêt demandé', byUser = false) {
-      if (byUser) save(K_ACTIVE, false);
+      if (byUser) {
+        save(K_ACTIVE, false);
+        save(K_WATCH, false);
+      }
       this.stopRequested = true;
       this.wake?.();
       this.log(msg);
     }
     lockout(msg) {
       save(K_ACTIVE, false);
+      save(K_WATCH, false);
       this.guard.lock(LOCK_HOURS);
       this.stopRequested = true;
       this.wake?.();
@@ -658,7 +688,16 @@
 
     // --- 1. Scan du club : joueurs disponibles sur le marché, regroupés par carte ---
 
+    // Interrompt le suivi des ventes pour laisser la place à une autre tâche
+    async stopWatch() {
+      if (this.mode !== 'watch') return;
+      this.stopRequested = true;
+      this.wake?.();
+      while (this.mode === 'watch') await sleep(200);
+    }
+
     async scanClub() {
+      await this.stopWatch();
       if (this.set?.kind !== 'club' || !this.set.club) return this.log("Choisis d'abord un club");
       if (!(await this.enter('scan'))) return;
       const cfg = this.getConfig();
@@ -718,9 +757,10 @@
       }
     }
 
-    // --- 2. Achat puis remise en vente immédiate au prix d'achat ---
+    // --- 2. Achat puis remise en vente immédiate ---
 
     async validate() {
+      await this.stopWatch();
       if (this.running) return;
       const picks = Object.entries(this.selection)
         .map(([id, max]) => ({ p: this.scan?.players?.[id], max: Number(max) }))
@@ -732,12 +772,14 @@
     }
 
     async runQueue() {
+      await this.stopWatch();
       if (!this.queue.some((e) => e.status === 'pending' || e.status === 'searching')) return this.log('Rien à acheter');
       if (!(await this.enter('buy'))) return;
       save(K_ACTIVE, true);
       const n = this.queue.length;
       const cfg = this.getConfig();
       this.log(`Achat et revente de ${n} joueur(s) pour « ${this.set?.name ?? 'ensemble'} »`);
+      let completed = false;
       try {
         await this.maintain();
         for (const e of this.queue) {
@@ -753,8 +795,7 @@
           save(K_ACTIVE, false);
           const ok = this.queue.filter((e) => e.status === 'listed' || e.status === 'bought').length;
           this.log(`Terminé : ${ok}/${n} joueur(s) achetés et remis en vente. Vérifie l'ensemble dans la Galerie.`);
-          await this.sleep(rand(1e3, 2e3));
-          await this.maintain();
+          completed = true;
         }
       } catch (err) {
         this.log(`Erreur : ${err instanceof Error ? err.message : String(err)}`);
@@ -763,6 +804,7 @@
         save(K_QUEUE, this.queue);
         this.leave();
       }
+      if (completed) await this.watch();
     }
 
     async buyOne(e) {
@@ -802,9 +844,13 @@
             save(K_DONE, [...this.done]);
             return this.feed(`${e.name} : déjà dans la Galerie, ignoré`);
           }
+          const missed = new Set();
           for (const it of cands) {
-            const r = await this.buyAndList(it, e, cfg);
+            // Autres annonces encore en vente (hors carte achetée et annonces ratées, parties chez un autre)
+            const others = res.data.filter((x) => x.defId === e.defId && x.buyNow > 0 && x.tradeId !== it.tradeId && !missed.has(x.tradeId));
+            const r = await this.buyAndList(it, e, cfg, others);
             if (r === 'stop' || r === 'ok') return;
+            missed.add(it.tradeId);
           }
           if (!cands.length) this.feed(`${e.name} : aucune annonce ≤ ${fmtNum(e.max)}`);
         }
@@ -816,7 +862,13 @@
       }
     }
 
-    async buyAndList(it, e, cfg) {
+    // Revente : un palier sous la moins chère des autres annonces (50 sous 1 000), sinon prix d'achat
+    sellPrice(it, others) {
+      if (!others.length) return it.buyNow;
+      return Math.max(200, priceDown(Math.min(...others.map((x) => x.buyNow))));
+    }
+
+    async buyAndList(it, e, cfg, others = []) {
       await sleep(rand(cfg.buyDelayMinMs, cfg.buyDelayMaxMs));
       if (this.stopRequested) return 'stop';
       this.activity(`Achat de ${it.name} à ${fmtNum(it.buyNow)}…`);
@@ -847,17 +899,23 @@
 
       const id = Number(it.raw?.id);
       if (id) {
-        this.bought[id] = it.buyNow;
+        this.bought[id] = { price: it.buyNow, sell: 0, defId: e.defId };
         save(K_BOUGHT, this.bought);
       }
       await sleep(rand(800, 1600));
       if (this.stopRequested) return 'ok';
-      const l = await moveAndList(it.raw, it.buyNow);
+      const sell = this.sellPrice(it, others);
+      const l = await moveAndList(it.raw, sell);
       if (l.success) {
         this.listFails = 0;
         this.pileCount++;
         e.status = 'listed';
-        this.feed(`${it.name} remis en vente à ${fmtNum(it.buyNow)}`);
+        e.sell = sell;
+        if (this.bought[id]) {
+          this.bought[id].sell = sell;
+          save(K_BOUGHT, this.bought);
+        }
+        this.feed(`${it.name} remis en vente à ${fmtNum(sell)} (${others.length ? `${others.length} autre(s) annonce(s), plus basse ${fmtNum(Math.min(...others.map((x) => x.buyNow)))}` : "aucune autre annonce : prix d'achat"})`);
       } else {
         if (this.fatal(l, 'list')) return 'stop';
         this.log(`Mise en vente de ${it.name} échouée (statut ${l.status})${errText(l.error)} : joueur dans les non-assignés`);
@@ -881,12 +939,20 @@
         const sold = pile.data.filter((i) => i.state === 'sold');
         const expired = pile.data.filter((i) => i.state === 'expired');
         for (const i of sold) {
-          const tax = i.soldPrice - Math.floor(i.soldPrice * (1 - EA_TAX));
-          if (this.bought[i.id] !== undefined) {
+          const net = Math.floor(i.soldPrice * (1 - EA_TAX));
+          const tax = i.soldPrice - net;
+          const b = this.bought[i.id];
+          let result = '';
+          if (b !== undefined) {
+            // Perte = prix d'achat - montant net encaissé (négatif = gain)
+            const loss = (typeof b === 'number' ? b : b.price) - net;
             this.addTotal('tax', tax);
+            this.addTotal('lost', loss);
+            this.addTotal('sold', 1);
             delete this.bought[i.id];
+            result = loss >= 0 ? `, perte ${fmtNum(loss)}` : `, gain ${fmtNum(-loss)}`;
           }
-          this.feed(`Vendu ${i.name} à ${fmtNum(i.soldPrice)} (taxe ${fmtNum(tax)})`);
+          this.feed(`Vendu ${i.name} à ${fmtNum(i.soldPrice)} (taxe ${fmtNum(tax)}${result})`);
         }
         save(K_BOUGHT, this.bought);
         if (sold.length) {
@@ -894,12 +960,26 @@
           const c = await observe(services.Item.clearSoldItems?.());
           if (!c.success) this.log(`Encaissement des ventes échoué (statut ${c.status})${errText(c.error)}`);
         }
-        if (expired.length) {
+        const cfg = this.getConfig();
+        const adjusted = new Set();
+        for (const i of expired) {
+          if (this.stopRequested) break;
+          const b = this.bought[i.id];
+          if (!b || !i.raw) continue;
+          const r = await this.readjust(i, typeof b === 'number' ? (this.bought[i.id] = { price: b, sell: 0, defId: i.defId }) : b, cfg);
+          if (r === 'stop') return;
+          if (r === 'ok') adjusted.add(i.id);
+        }
+        save(K_BOUGHT, this.bought);
+        if (this.stopRequested) return;
+        const rest = expired.length - adjusted.size;
+        if (rest > 0) {
           await sleep(rand(500, 1200));
           const r = await observe(services.Item.relistExpiredAuctions?.());
-          this.feed(r.success ? `${expired.length} invendu(s) remis en vente au même prix` : `Remise en vente des invendus échouée (statut ${r.status})`);
+          this.feed(r.success ? `${rest} invendu(s) remis en vente au même prix` : `Remise en vente des invendus échouée (statut ${r.status})`);
         }
         this.pileCount = pile.data.length - sold.length;
+        this.ownListed = pile.data.filter((i) => i.state !== 'sold' && this.bought[i.id] !== undefined).length;
         this.feed(`Liste de transferts : ${pile.data.filter((i) => i.state === 'active').length} en vente, ${sold.length} vendu(s), ${expired.length} invendu(s)`);
         await observe(services.User.requestCurrencies?.());
       } catch (e) {
@@ -909,10 +989,62 @@
       }
     }
 
-    async maintainOnly() {
-      if (!(await this.enter('buy'))) return;
+    // Invendu acheté par l'extension : un palier sous la moins chère des annonces concurrentes, sinon même prix
+    async readjust(i, b, cfg) {
+      const cur = i.buyNow || b.sell || b.price;
+      const defId = b.defId || i.defId;
+      let price = cur;
+      let others = 0;
+      if (defId) {
+        if (!(await this.waitGuard(cfg))) return 'stop';
+        await this.sleep(rand(cfg.minDelayMs, cfg.maxDelayMs));
+        if (this.stopRequested) return 'stop';
+        this.activity(`Prix de ${i.name} (invendu à ${fmtNum(cur)})`);
+        b.checks = (b.checks ?? 0) + 1;
+        const res = await searchMarket({ defId: [defId] }, b.checks % 2 ? 0 : 150, cur);
+        this.guard.record('searches');
+        if (!res.success) {
+          if (this.fatal(res, 'search')) return 'stop';
+        } else {
+          const lows = res.data.filter((x) => x.defId === defId && x.buyNow > 0).map((x) => x.buyNow);
+          others = lows.length;
+          if (others) price = Math.min(cur, Math.max(200, priceDown(Math.min(...lows))));
+        }
+      }
+      if (cfg.minSellPct > 0) price = Math.max(price, Math.min(cur, roundUp((b.price * cfg.minSellPct) / 100)));
+      await sleep(rand(500, 1200));
+      const r = await listItem(i.raw, price);
+      if (!r.success) {
+        if (this.fatal(r, 'list')) return 'stop';
+        this.feed(`Remise en vente de ${i.name} échouée (statut ${r.status})`);
+        return 'fail';
+      }
+      b.sell = price;
+      this.feed(price < cur ? `${i.name} invendu : ${fmtNum(cur)} → ${fmtNum(price)} (${others} annonce(s) moins chère(s) ou égale(s))` : `${i.name} invendu : remis à ${fmtNum(price)} (personne en dessous)`);
+      return 'ok';
+    }
+
+    // Suivi des ventes : encaisse et réajuste les invendus jusqu'à ce que tout soit vendu
+    async watch() {
+      if (!(await this.enter('watch'))) return;
+      save(K_WATCH, true);
+      const cfg = this.getConfig();
+      this.log(`Suivi des ventes : encaissement et réajustement des invendus toutes les ${cfg.watchMinutes} min`);
       try {
-        await this.maintain();
+        while (!this.stopRequested) {
+          await this.maintain();
+          if (this.stopRequested) break;
+          if (!this.ownListed) {
+            save(K_WATCH, false);
+            this.log('Plus aucun joueur acheté en vente : suivi terminé');
+            break;
+          }
+          const d = Math.max(1, this.getConfig().watchMinutes) * 6e4 * rand(0.8, 1.2);
+          this.activity(`${this.ownListed} joueur(s) en vente, prochain contrôle à ${clock(d)}`);
+          await this.sleep(d);
+        }
+      } catch (e) {
+        this.log(`Suivi des ventes : ${e instanceof Error ? e.message : String(e)}`);
       } finally {
         this.leave();
       }
@@ -1000,6 +1132,8 @@ details > * + * { margin-top: 6px; }
     { key: 'pricePct', label: 'Prix max proposé (% au-dessus du plus bas vu)' },
     { key: 'triesPerPlayer', label: 'Recherches max par joueur' },
     { key: 'coinReserve', label: 'Crédits à garder' },
+    { key: 'watchMinutes', label: 'Suivi des ventes : contrôle toutes les (min)' },
+    { key: 'minSellPct', label: 'Revente plancher (% du prix d’achat, 0 = aucun)' },
     { key: 'scanMaxPrice', label: 'Scan : prix max des cartes' },
     { key: 'scanMaxSearches', label: 'Scan : recherches max' },
     { key: 'scanPagesPerSlice', label: 'Scan : pages par tranche de prix' },
@@ -1101,6 +1235,7 @@ details > * + * { margin-top: 6px; }
       this.sumEl = h('div', { className: 'sum' });
       this.buyBtn = h('button', { className: 'big go', onclick: () => (this.engine.mode === 'buy' ? this.engine.stop('Arrêt demandé', true) : this.engine.validate()) });
       this.resumeBtn = h('button', { className: 'big', textContent: 'Reprendre les achats en attente', onclick: () => this.engine.runQueue() });
+      this.watchBtn = h('button', { className: 'big', onclick: () => (this.engine.mode === 'watch' ? this.engine.stop('Suivi des ventes arrêté', true) : this.engine.watch()) });
 
       // Journal / réglages
       this.statsEl = h('div', { className: 'stats' });
@@ -1115,7 +1250,8 @@ details > * + * { margin-top: 6px; }
         diag.textContent = (await copyText(JSON.stringify(diagnosticReport(), null, 1))) ? 'Copié' : 'Échec';
         setTimeout(() => (diag.textContent = 'Copier diagnostic clubs'), 1500);
       };
-      const pile = h('button', { textContent: 'Encaisser / remettre invendus', onclick: () => this.engine.maintainOnly() });
+      const reset = h('button', { textContent: 'Remettre les compteurs à zéro' });
+      reset.onclick = () => confirm('Remettre à zéro joueurs achetés, crédits perdus et taxe ?') && this.engine.resetTotals();
       const unlock = h('button', { textContent: 'Lever le verrou' });
       unlock.onclick = () => confirm("Lever le verrou anti-captcha ? À ne faire que si EA n'a pas affiché de captcha.") && this.engine.unlock();
 
@@ -1143,6 +1279,7 @@ details > * + * { margin-top: 6px; }
         h('div', {}, h('h4', { textContent: '2. Joueurs manquants' }), this.listTools, h('div', { style: 'margin-top:6px' }, this.listEl), h('div', { style: 'margin-top:6px' }, this.sumEl)),
         this.buyBtn,
         this.resumeBtn,
+        this.watchBtn,
         this.statsEl,
         h('details', {}, h('summary', { textContent: 'Journal' }), h('div', { className: 'actions' }, copy), this.logEl),
         h(
@@ -1152,7 +1289,7 @@ details > * + * { margin-top: 6px; }
           this.delayRow('Délai entre recherches (s)', 'minDelayMs', 'maxDelayMs'),
           this.delayRow('Délai avant achat (s)', 'buyDelayMinMs', 'buyDelayMaxMs', 0.1),
           ...SETTINGS.map((s) => this.numSetting(s)),
-          h('div', { className: 'actions' }, pile, unlock, diag),
+          h('div', { className: 'actions' }, unlock, diag, reset),
         ),
       );
       this.box.append(header, this.activityEl, this.feedEl, body);
@@ -1190,7 +1327,7 @@ details > * + * { margin-top: 6px; }
 
     renderList() {
       const e = this.engine;
-      const busy = e.running;
+      const busy = e.busy;
       const statusOf = new Map(e.queue.map((q) => [q.defId, q]));
       if (!e.scan) {
         this.listEl.replaceChildren(h('div', { className: 'empty', textContent: e.set?.kind === 'club' ? 'Lance la recherche des joueurs du club.' : 'Choisis un set sur fut.gg.' }));
@@ -1215,7 +1352,7 @@ details > * + * { margin-top: 6px; }
           if (cb.checked) e.setSelected(p.defId, true, v);
           this.renderSummary();
         };
-        const st = q ? h('span', { className: `st${q.status === 'listed' ? ' ok' : q.status === 'notfound' || q.status === 'nocoins' ? ' ko' : ''}`, textContent: `${STATUS_LABEL[q.status] ?? q.status}${q.price ? ` à ${fmtNum(q.price)}` : ''}` }) : '';
+        const st = q ? h('span', { className: `st${q.status === 'listed' ? ' ok' : q.status === 'notfound' || q.status === 'nocoins' ? ' ko' : ''}`, textContent: `${STATUS_LABEL[q.status] ?? q.status}${q.price ? ` à ${fmtNum(q.price)}` : ''}${q.sell ? `, en vente à ${fmtNum(q.sell)}` : ''}` }) : '';
         return h(
           'div',
           { className: `p${p.collected ? ' got' : ''}` },
@@ -1265,13 +1402,16 @@ details > * + * { margin-top: 6px; }
       this.scanBtn.textContent = e.mode === 'scan' ? 'Arrêter le scan' : e.scan ? 'Relancer la recherche des joueurs du club' : 'Chercher les joueurs du club';
       this.scanBtn.className = e.mode === 'scan' ? 'big stop' : 'big blue';
       this.scanBtn.disabled = e.set?.kind !== 'club' || e.mode === 'buy';
-      this.leagueSel.disabled = this.clubSel.disabled = e.running;
-      if (!e.running) {
+      this.leagueSel.disabled = this.clubSel.disabled = e.busy;
+      if (!e.busy) {
         this.leagueSel.disabled = !this.leagues.length;
         this.clubSel.disabled = !this.clubs.length;
       }
-      const pending = !e.running && e.queue.some((q) => q.status === 'pending' || q.status === 'searching');
+      const pending = !e.busy && e.queue.some((q) => q.status === 'pending' || q.status === 'searching');
       this.resumeBtn.style.display = pending ? '' : 'none';
+      this.watchBtn.textContent = e.mode === 'watch' ? 'Arrêter le suivi des ventes' : 'Suivre les ventes (réajuste les invendus)';
+      this.watchBtn.className = e.mode === 'watch' ? 'big stop' : 'big';
+      this.watchBtn.disabled = e.busy;
       this.renderList();
     }
 
@@ -1298,7 +1438,10 @@ details > * + * { margin-top: 6px; }
       this.feedEl.replaceChildren(...s.feed.map((f) => h('div', { textContent: f })));
       const rows = [
         ['Joueurs achetés (total)', fmtNum(s.total.bought)],
-        ['Taxe EA payée', fmtNum(s.total.tax)],
+        ['Joueurs revendus', fmtNum(s.total.sold)],
+        ['Crédits perdus (ventes faites)', fmtSigned(s.total.lost)],
+        [`Perte estimée (${s.onSale} en vente)`, fmtSigned(s.pendingLoss)],
+        ['dont taxe EA payée', fmtNum(s.total.tax)],
         ['Crédits', s.coins == null ? '?' : fmtNum(s.coins)],
       ];
       this.statsEl.replaceChildren(...rows.flatMap(([k, v]) => [h('span', { textContent: k }), h('b', { textContent: String(v) })]));
@@ -1364,6 +1507,10 @@ details > * + * { margin-top: 6px; }
         engine.log('Reprise automatique des achats dans 10 s');
         setTimeout(() => void engine.runQueue(), 1e4);
       } else save(K_ACTIVE, false);
+    }
+    if (load(K_WATCH, false) && !load(K_ACTIVE, false)) {
+      engine.log('Reprise du suivi des ventes dans 10 s');
+      setTimeout(() => void engine.watch(), 1e4);
     }
     onCommand = (cmd) => {
       if (cmd.type === 'stop') engine.stop('Arrêt demandé', true);

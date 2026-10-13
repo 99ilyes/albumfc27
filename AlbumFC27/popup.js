@@ -26,7 +26,8 @@ function render(s) {
     ['Ensemble', s.club ?? '?'],
     ['Achats en cours', q.total ? `${fmt(q.listed)} / ${fmt(q.total)}${q.failed ? ` (${q.failed} échec)` : ''}` : '-'],
     ['Joueurs achetés (total)', fmt(total.bought)],
-    ['Taxe EA payée', fmt(total.tax)],
+    ['Crédits perdus', (total.lost ?? 0) < 0 ? `gain ${fmt(-total.lost)}` : fmt(total.lost)],
+    ['Perte estimée en vente', fmt(s.pendingLoss)],
     ['Crédits', s.coins == null ? '?' : fmt(s.coins)],
   ];
   root.replaceChildren(
