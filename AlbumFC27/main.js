@@ -1052,44 +1052,66 @@
       try {
         const items = await this.syncPile();
         if (!items) return;
-        const unsold = items.filter((i) => i.state !== 'active' && i.raw);
-        const todo = unsold.filter((i) => this.bought[i.id]);
-        const ignored = unsold.length - todo.length;
-        if (!todo.length) return this.log(`Aucun invendu à relister${ignored ? ` (${ignored} invendu(s) non achetés par AlbumFC27, laissés tels quels)` : ''}`);
-        this.log(`Relister ${todo.length} invendu(s) au prix le plus bas du marché`);
+        const players = items.filter((i) => i.raw ? (i.raw.type ?? i.raw.itemType ?? 'player') === 'player' : true);
+        const active = players.filter((i) => i.state === 'active').length;
+        const unsold = players.filter((i) => i.state !== 'active');
+        const todo = unsold.filter((i) => i.raw);
+        this.log(`Liste de transferts : ${active} en vente, ${unsold.length} invendu(s)${unsold.length > todo.length ? `, ${unsold.length - todo.length} non chargé(s) par la Web App` : ''}`);
+        if (!todo.length) {
+          if (active) this.log(`Rien à relister : EA ne permet pas de modifier une annonce en cours, les ${active} joueur(s) en vente seront relistables à leur expiration (1 h)`);
+          return;
+        }
+        this.log(`Relister ${todo.length} invendu(s) au prix de l'annonce la moins chère`);
         let ok = 0;
+        let failed = 0;
         let diff = 0;
         for (const [n, i] of todo.entries()) {
           if (this.stopRequested) break;
           if (n) await this.sleep(this.delay(), 'Invendu suivant');
           if (this.stopRequested) break;
           const b = this.bought[i.id];
-          const cur = i.buyNow || b.sell || b.price;
-          this.activity(`${i.name} : sondage du prix (acheté ${fmtNum(b.price)}, était à ${fmtNum(cur)})`);
-          const r = await this.probe(b.defId || i.defId, 0);
+          const defId = b?.defId || i.defId;
+          const cur = i.buyNow || b?.sell || b?.price || 0;
+          this.activity(`${i.name} : sondage du prix${cur ? ` (était à ${fmtNum(cur)})` : ''}`);
+          const r = await this.probe(defId, 0);
           if (r.stop) break;
-          if (r.collected) continue;
           const price = r.lowest >= 200 ? r.lowest : cur;
+          if (!(price >= 200)) {
+            failed++;
+            this.feed(`${i.name} : aucune annonce sur le marché et pas de prix précédent, laissé tel quel`, 'miss');
+            continue;
+          }
           await sleep(rand(500, 1200));
           const l = await listItem(i.raw, price);
           if (!l.success) {
             if (this.fatal(l, 'list')) break;
-            this.feed(`Remise en vente de ${i.name} échouée (statut ${l.status})${errText(l.error)}`, 'error');
+            failed++;
+            this.feed(`Remise en vente de ${i.name} à ${fmtNum(price)} échouée (statut ${l.status})${errText(l.error)}`, 'error');
             continue;
           }
           ok++;
-          diff += price - cur;
-          b.sell = price;
-          b.state = 'active';
-          this.saveBought();
-          const loss = b.price - netOf(price);
-          this.feed(`${i.name} relisté à ${fmtNum(price)} (${r.lowest ? `annonce la moins chère ${fmtNum(r.lowest)}` : 'aucune autre annonce, prix inchangé'}, ${loss >= 0 ? `perte si vendu ${fmtNum(loss)}` : `gain si vendu ${fmtNum(-loss)}`})`);
+          if (cur) diff += price - cur;
+          const why = r.lowest ? `annonce la moins chère ${fmtNum(r.lowest)}` : 'aucune autre annonce, prix inchangé';
+          if (b) {
+            b.sell = price;
+            b.state = 'active';
+            this.saveBought();
+            const loss = b.price - netOf(price);
+            this.feed(`${i.name} relisté à ${fmtNum(price)} (${why}, ${loss >= 0 ? `perte si vendu ${fmtNum(loss)}` : `gain si vendu ${fmtNum(-loss)}`})`);
+          } else this.feed(`${i.name} relisté à ${fmtNum(price)} (${why})`);
+        }
+        // Secours : les invendus non relistés un par un sont remis en vente en bloc à leur prix précédent
+        if (failed && !this.stopRequested) {
+          await sleep(rand(800, 1600));
+          const g = await observe(services.Item.relistExpiredAuctions?.());
+          if (g.success) this.log(`${failed} invendu(s) remis en vente en bloc à leur prix précédent`, 'list');
+          else if (!this.fatal(g, 'list')) this.log(`Remise en vente en bloc échouée (statut ${g.status})${errText(g.error)}`);
         }
         if (this.pile && ok) {
           this.pile = { ...this.pile, active: this.pile.active + ok, unsold: Math.max(0, this.pile.unsold - ok) };
           save(K_PILE, this.pile);
         }
-        if (!this.stopRequested) this.log(`Relister terminé : ${ok}/${todo.length} remis en vente${diff ? `, prix ${diff < 0 ? 'baissés' : 'montés'} de ${fmtNum(Math.abs(diff))} au total` : ''}. Perte en attente ${fmtNum(this.pendingLoss())}`, 'list');
+        if (!this.stopRequested) this.log(`Relister terminé : ${ok}/${todo.length} remis en vente au prix du marché${diff ? `, prix ${diff < 0 ? 'baissés' : 'montés'} de ${fmtNum(Math.abs(diff))} au total` : ''}. Perte en attente ${fmtNum(this.pendingLoss())}`, 'list');
       } catch (err) {
         this.log(`Relister : ${err instanceof Error ? err.message : String(err)}`);
       } finally {
@@ -1107,6 +1129,7 @@
   display: flex; flex-direction: column; font: 12px/1.4 system-ui, sans-serif; color: #e6e7eb;
   background: #14161b; border: 1px solid #2a2e38; border-radius: 12px; box-shadow: 0 10px 30px #000a; overflow: hidden; }
 .box.hidden { display: none; }
+header, nav, .banner, .activity { flex: none; }
 header { display: flex; align-items: center; gap: 8px; padding: 10px 12px 8px; cursor: move; user-select: none; }
 header .title { font-weight: 700; font-size: 13px; }
 header .coins { margin-left: auto; font-size: 12px; font-weight: 700; color: #ffe066; background: #1e2129; padding: 2px 9px; border-radius: 10px; font-variant-numeric: tabular-nums; }
@@ -1124,7 +1147,7 @@ nav { display: flex; gap: 2px; padding: 0 8px; border-bottom: 1px solid #2a2e38;
 nav button { background: none; border-radius: 0; padding: 7px 12px; color: #8a8f9c; font-weight: 600; border-bottom: 2px solid transparent; }
 nav button.on { color: #e6e7eb; border-bottom-color: #4c6ef5; }
 nav button .badge { margin-left: 5px; padding: 0 6px; border-radius: 8px; background: #5c4012; color: #ffd8a8; font-size: 10px; }
-.body { flex: 1 1 auto; min-height: 120px; overflow-y: auto; padding: 10px 12px; }
+.body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 10px 12px; }
 .tab { display: none; flex-direction: column; gap: 10px; } .tab.on { display: flex; }
 h4 { margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #7c8190; }
 input { background: #0d0f13; color: inherit; border: 1px solid #2a2e38; border-radius: 6px; padding: 5px 7px; font: inherit; min-width: 0; }
@@ -1170,10 +1193,8 @@ button:disabled { opacity: .4; cursor: default; }
 .bar { height: 6px; background: #0d0f13; border-radius: 3px; overflow: hidden; display: flex; }
 .bar > span { height: 100%; transition: width .4s; }
 .bar .ok { background: #2f9e44; } .bar .use { background: #4c6ef5; } .bar .cap { background: repeating-linear-gradient(45deg, #4c6ef5 0 3px, #2a3570 3px 6px); } .bar .over { background: #e03131; }
-footer { border-top: 1px solid #2a2e38; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; background: #171a20; flex: 0 1 auto; min-height: 0; max-height: 55vh; }
-footer .fscroll { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; min-height: 0; flex: 0 1 auto; }
-footer .factions { display: flex; flex-direction: column; gap: 6px; flex: none; }
-@media (max-height: 640px) { .live .lbody { display: none; } .body { min-height: 90px; } }
+footer { border-top: 1px solid #2a2e38; padding: 8px 12px 10px; display: flex; flex-direction: column; gap: 6px; background: #171a20; flex: none; }
+.recap { background: #1b1e25; border-radius: 10px; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
 footer.hidden { display: none; }
 .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 .tile { background: #1e2129; border-radius: 8px; padding: 6px 8px; min-width: 0; }
@@ -1216,7 +1237,9 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
 .live .dot { width: 7px; height: 7px; border-radius: 50%; background: #5c6170; }
 .live.on .dot { background: #51cf66; animation: pulse 1.2s ease-in-out infinite; }
 .live .cd { margin-left: auto; color: #74c0fc; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
-.live .lbody { max-height: 110px; overflow-y: auto; padding: 0 8px 6px; }
+.live { flex: none; }
+.live .lbody { padding: 0 8px 6px; }
+.live .lbody .ev span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .live.closed .lbody { display: none; }
 .ev { display: grid; grid-template-columns: 52px 14px 1fr; gap: 4px; padding: 2px 4px; border-radius: 4px; font-size: 11px; line-height: 1.45; color: #c9ccd4; animation: fadein .35s ease-out; }
 .ev .tm { color: #6c7180; font-variant-numeric: tabular-nums; }
@@ -1230,7 +1253,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
 .jtools { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
 .jtools .chipbtn { padding: 3px 8px; font-size: 11px; font-weight: 500; background: #1e2129; }
 .jtools .chipbtn.on { background: #364fc7; color: #fff; }
-.jlist { background: #0d0f13; border-radius: 6px; padding: 4px; min-height: 200px; max-height: 480px; overflow-y: auto; }
+.jlist { background: #0d0f13; border-radius: 6px; padding: 4px; }
 `;
 
   function h(tag, props = {}, ...children) {
@@ -1313,7 +1336,8 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       this.salesBadge = h('span', { className: 'badge' });
       this.footer = this.buildFooter();
       this.live = this.buildLive();
-      this.box.append(header, this.bannerEl, this.activityEl, nav, h('div', { className: 'body' }, ...Object.values(this.tabs)), this.live, this.footer);
+      this.bodyEl = h('div', { className: 'body' }, ...Object.values(this.tabs));
+      this.box.append(header, this.bannerEl, this.activityEl, nav, this.bodyEl, this.live, this.footer);
       this.showTab('buy');
       this.renderEvents(true);
       this.baseTitle = document.title;
@@ -1326,6 +1350,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       this.tab = id;
       for (const [k, el] of Object.entries(this.tabs)) el.classList.toggle('on', k === id);
       for (const [k, b] of Object.entries(this.tabBtns)) b.classList.toggle('on', k === id);
+      this.bodyEl.scrollTop = 0;
       this.footer.classList.toggle('hidden', id !== 'buy');
       this.live.classList.toggle('hidden', id === 'log');
       if (id === 'sales') this.renderSales();
@@ -1348,7 +1373,18 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         h('button', { className: 'small', textContent: 'Aucun', onclick: () => this.checkVisible(false) }),
       );
       this.setsEl = h('div', { className: 'sets' });
-      return h('section', { className: 'tab' }, h('div', { className: 'row' }, importBtn), this.filtersEl, this.setsEl);
+      this.recapEl = h('div', { style: 'display:flex;flex-direction:column;gap:8px' });
+      this.raiseInput = h('input', { type: 'number', min: '0', max: '300', step: '5', value: String(this.config.raisePct) });
+      this.raiseInput.onchange = () => {
+        const v = Math.min(300, Math.max(0, Math.floor(Number(this.raiseInput.value) || 0)));
+        this.raiseInput.value = String(v);
+        this.setConfig({ raisePct: v });
+        this.renderSets();
+      };
+      this.raiseRow = h('label', { className: 'raise', title: 'Si aucune annonce au prix de départ, le prix monte par paliers de 5 % jusqu’à ce plafond' }, 'Si introuvable, monter jusqu’à +', this.raiseInput, '% du prix de départ');
+      this.speedLine = h('button', { className: 'speedline', title: 'Ouvrir les réglages', onclick: () => this.showTab('settings') });
+      const recap = h('div', { className: 'recap' }, this.recapEl, this.raiseRow, this.speedLine);
+      return h('section', { className: 'tab' }, h('div', { className: 'row' }, importBtn), recap, this.filtersEl, this.setsEl);
     }
 
     visibleIn(set, inQueue) {
@@ -1388,7 +1424,9 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       }
       const statusOf = new Map(e.queue.map((q) => [q.defId, q]));
       const inQueue = new Set(statusOf.keys());
+      const top = this.bodyEl?.scrollTop ?? 0;
       this.setsEl.replaceChildren(...sets.map((s) => this.renderSet(s, statusOf, inQueue)));
+      if (this.bodyEl) this.bodyEl.scrollTop = top;
       this.renderFooter();
     }
 
@@ -1502,27 +1540,18 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
     // --- Pied de l'onglet Achats : projection, crédits, bouton principal ---
 
     buildFooter() {
-      this.recapEl = h('div', { style: 'display:flex;flex-direction:column;gap:8px' });
-      this.raiseInput = h('input', { type: 'number', min: '0', max: '300', step: '5', value: String(this.config.raisePct) });
-      this.raiseInput.onchange = () => {
-        const v = Math.min(300, Math.max(0, Math.floor(Number(this.raiseInput.value) || 0)));
-        this.raiseInput.value = String(v);
-        this.setConfig({ raisePct: v });
-        this.renderSets();
-      };
-      this.raiseRow = h('label', { className: 'raise', title: 'Si aucune annonce au prix de départ, le prix monte par paliers de 5 % jusqu’à ce plafond' }, 'Si introuvable, monter jusqu’à +', this.raiseInput, '% du prix de départ');
+      this.progressBar = h('div');
       this.mainBtn = h('button', { className: 'big go' });
       this.mainBtn.onclick = () => (this.engine.mode === 'buy' ? this.engine.stop('Achats arrêtés', true) : void this.engine.validate());
       this.resumeBtn = h('button', { className: 'big', onclick: () => void this.engine.runQueue() });
-      // Bouton principal toujours visible ; le récapitulatif défile si la place manque
-      return h('footer', {}, h('div', { className: 'fscroll' }, this.recapEl, this.raiseRow, this.speedLine), h('div', { className: 'factions' }, this.mainBtn, this.resumeBtn));
+      // Pied fixe : seulement l'action principale (le récapitulatif est en haut de l'onglet Achats)
+      return h('footer', {}, this.progressBar, this.mainBtn, this.resumeBtn);
     }
 
     // --- Onglet Réglages : vitesse, ralentissement, pauses, quotas ---
 
     buildSettingsTab() {
       this.speedEl = h('div', { className: 'speed' });
-      this.speedLine = h('button', { className: 'speedline', title: 'Ouvrir les réglages', onclick: () => this.showTab('settings') });
       this.renderSpeed();
       return h('section', { className: 'tab' }, this.speedEl);
     }
@@ -1608,7 +1637,14 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       const pk = e.picks();
       this.raiseRow.style.display = buying ? 'none' : '';
       this.mainBtn.className = buying ? 'big stop' : 'big go';
-      this.mainBtn.textContent = buying ? 'Arrêter les achats' : pk.count ? `Acheter ${pk.count} joueur${pk.count > 1 ? 's' : ''} et revendre au prix d'achat` : 'Coche des joueurs à acheter';
+      const q = e.queue;
+      const treated = q.filter((x) => !isOpen(x)).length;
+      this.progressBar.replaceChildren(...(buying ? [bar([['ok', q.filter((x) => x.price > 0).length], ['over', q.filter(isFailed).length]], q.length)] : []));
+      this.mainBtn.textContent = buying
+        ? `Arrêter les achats (${treated}/${q.length})`
+        : pk.count
+          ? `Acheter ${pk.count} joueur${pk.count > 1 ? 's' : ''} · ~${fmtNum(pk.spend)} crédits · coût ~${fmtNum(pk.tax)}`
+          : 'Coche des joueurs à acheter';
       this.mainBtn.disabled = e.mode === 'relist' || (!buying && !pk.count);
       const open = e.queue.filter(isOpen).length;
       this.resumeBtn.style.display = !e.running && open ? '' : 'none';
@@ -1802,7 +1838,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       const evs = this.engine.events;
       const newest = evs[0]?.id ?? 0;
       if (full || newest < this.shownEventId) {
-        this.liveList.replaceChildren(...evs.slice(0, 6).map((ev) => this.eventRow(ev)));
+        this.liveList.replaceChildren(...evs.slice(0, 3).map((ev) => this.eventRow(ev)));
         this.jList.replaceChildren(...evs.filter((ev) => this.eventMatches(ev)).slice(0, 300).map((ev) => this.eventRow(ev)));
       } else {
         const fresh = evs.filter((ev) => ev.id > this.shownEventId).reverse();
@@ -1811,7 +1847,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           this.liveList.prepend(this.eventRow(ev));
           if (this.eventMatches(ev)) this.jList.prepend(this.eventRow(ev));
         }
-        while (this.liveList.childElementCount > 6) this.liveList.lastChild.remove();
+        while (this.liveList.childElementCount > 3) this.liveList.lastChild.remove();
         while (this.jList.childElementCount > 300) this.jList.lastChild.remove();
       }
       if (!evs.length) this.jList.replaceChildren(h('div', { className: 'empty', textContent: 'Journal vide.' }));
@@ -1847,6 +1883,13 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
     // --- Mise à jour ---
 
     update(s) {
+      // Les re-rendus ne doivent pas faire sauter la position de défilement
+      const top = this.bodyEl.scrollTop;
+      this.render(s);
+      if (this.bodyEl.scrollTop !== top) this.bodyEl.scrollTop = top;
+    }
+
+    render(s) {
       const locked = s.lockedUntil > Date.now();
       this.pill.className = `pill${s.running ? ' on' : locked ? ' lock' : ''}`;
       this.pill.textContent = s.mode === 'buy' ? 'Achats' : s.mode === 'relist' ? 'Relister' : locked ? 'Pause' : 'Prêt';
