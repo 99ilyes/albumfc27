@@ -203,6 +203,7 @@
     if (pile && pile.at >= t0) {
       return {
         success: true,
+        fresh: true,
         data: pile.auctions.map((a) => {
           const id = Number(a.itemData?.id);
           const raw = byId.get(id);
@@ -211,12 +212,16 @@
         }),
       };
     }
+    // Données du cache de la Web App (pas de réponse réseau vue) : une annonce « active » sans temps restant est expirée
     return {
       ...r,
+      fresh: false,
       data: items.map((i) => {
         const a = i._auction ?? i.getAuctionData?.() ?? {};
         const cur = Number(a.currentBid ?? 0);
-        return { raw: i, id: Number(i.id), defId: Number(i.definitionId ?? 0), name: staticName(i), state: tradeState(String(a.tradeState ?? ''), cur), soldPrice: cur, buyNow: Number(a.buyNowPrice ?? 0) };
+        let state = tradeState(String(a.tradeState ?? ''), cur);
+        if (state === 'active' && Number(a.expires ?? 1) <= 0) state = 'expired';
+        return { raw: i, id: Number(i.id), defId: Number(i.definitionId ?? 0), name: staticName(i), state, soldPrice: cur, buyNow: Number(a.buyNowPrice ?? 0) };
       }),
     };
   }
@@ -1025,6 +1030,7 @@
         if (!c.success) this.log(`Encaissement des ventes échoué (statut ${c.status})${errText(c.error)}`);
       }
       const rest = pile.data.filter((i) => i.state !== 'sold');
+      this.pileFresh = pile.fresh !== false;
       const byId = new Map(rest.map((i) => [String(i.id), i]));
       // Joueurs vendus ou retirés hors extension : plus suivis
       for (const [id, b] of Object.entries(this.bought)) {
@@ -1056,7 +1062,7 @@
         const active = players.filter((i) => i.state === 'active').length;
         const unsold = players.filter((i) => i.state !== 'active');
         const todo = unsold.filter((i) => i.raw);
-        this.log(`Liste de transferts : ${active} en vente, ${unsold.length} invendu(s)${unsold.length > todo.length ? `, ${unsold.length - todo.length} non chargé(s) par la Web App` : ''}`);
+        this.log(`Liste de transferts : ${active} en vente, ${unsold.length} invendu(s)${unsold.length > todo.length ? `, ${unsold.length - todo.length} non chargé(s) par la Web App` : ''}${this.pileFresh ? '' : ' (lue depuis le cache de la Web App : si des invendus manquent, ouvre Transferts > Liste de transferts puis relance)'}`);
         if (!todo.length) {
           if (active) this.log(`Rien à relister : EA ne permet pas de modifier une annonce en cours, les ${active} joueur(s) en vente seront relistables à leur expiration (1 h)`);
           return;
