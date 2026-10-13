@@ -21,24 +21,30 @@ function render(s) {
   }
   s ??= {};
   const q = s.queue ?? {};
-  const total = s.total ?? {};
-  const lost = total.lost ?? 0;
+  const t = s.total ?? {};
+  const real = (t.lost ?? 0) + (s.pendingLoss ?? 0);
   const locked = (s.lockedUntil ?? 0) > Date.now();
-  const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const hm = (x) => new Date(x).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const rows = [
-    ['Sets', s.sets?.length ? s.sets.join(', ') : '-'],
-    ['Achats', q.total ? `${fmt(q.listed)} / ${fmt(q.total)}${q.failed ? ` (${q.failed} échec)` : ''}` : '-'],
-    ['Crédits perdus', lost < 0 ? `gain ${fmt(-lost)}` : fmt(lost)],
-    ['Perte estimée en vente', fmt(s.pendingLoss)],
     ['Crédits', s.coins == null ? '?' : fmt(s.coins)],
+    ['Sets', s.sets?.length ? s.sets.join(', ') : '-'],
+    ['Dernier lot', q.total ? `${fmt(q.done)} / ${fmt(q.total)}${q.failed ? ` (${q.failed} non trouvé)` : ''}` : '-'],
+    ['En vente', `${fmt(s.onSale)}${s.unsold ? ` (${s.unsold} invendu)` : ''}`],
+    ['Coût réel', real < 0 ? `gain ${fmt(-real)}` : fmt(real)],
   ];
-  if (locked) rows.unshift(['Verrou', `jusqu'à ${hm(s.lockedUntil)}${s.resumeAt ? `, reprise ${hm(s.resumeAt)}` : ''}`]);
+  if (locked) rows.unshift(['Pause', `jusqu'à ${hm(s.lockedUntil)}${s.resumeAt ? `, reprise ${hm(s.resumeAt)}` : ''}`]);
   root.replaceChildren(
     el('h1', {}, 'AlbumFC27 ', el('span', { className: s.running ? 'dot on' : 'dot' })),
     el('p', { className: 'activity', textContent: s.running ? s.activity || 'En cours' : s.lastMessage || "À l'arrêt" }),
     el('dl', {}, ...rows.flatMap(([k, v]) => [el('dt', { textContent: k }), el('dd', { textContent: String(v) })])),
     s.feed?.length ? el('ul', { className: 'feed' }, ...s.feed.slice(0, 6).map((f) => el('li', { textContent: f }))) : '',
-    s.running ? el('div', { className: 'row' }, el('button', { className: 'stop', textContent: 'Arrêter', onclick: () => send({ type: 'stop' }) })) : '',
+    el(
+      'div',
+      { className: 'row' },
+      s.running
+        ? el('button', { className: 'stop', textContent: 'Arrêter', onclick: () => send({ type: 'stop' }) })
+        : el('button', { className: 'start', textContent: `Relister les invendus${s.unsold ? ` (${s.unsold})` : ''}`, onclick: () => send({ type: 'relist' }) }),
+    ),
     el('button', { className: 'ghost', textContent: 'Afficher / masquer le panneau', onclick: () => send({ type: 'toggle-panel' }) }),
   );
 }
