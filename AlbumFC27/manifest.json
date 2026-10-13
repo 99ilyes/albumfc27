@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "AlbumFC27",
-  "version": "0.4.0",
-  "description": "Complète la Galerie FC 27 : achète les joueurs des ensembles et les remet en vente au prix d'achat.",
+  "version": "1.0.0",
+  "description": "Complète un ensemble de la Galerie FC 27 : joueurs du set (fut.gg ou marché), achat puis remise en vente immédiate au prix d'achat.",
   "action": { "default_popup": "popup.html", "default_title": "AlbumFC27" },
   "permissions": ["storage"],
   "host_permissions": [
     "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*",
-    "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*"
+    "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*",
+    "https://www.fut.gg/*"
   ],
   "content_scripts": [
     {
@@ -25,6 +26,11 @@
         "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*"
       ],
       "js": ["bridge.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.fut.gg/*"],
+      "js": ["futgg.js"],
       "run_at": "document_idle"
     }
   ]

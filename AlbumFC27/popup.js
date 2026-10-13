@@ -20,12 +20,12 @@ function render(s) {
     return;
   }
   s ??= {};
+  const q = s.queue ?? {};
   const total = s.total ?? {};
-  const pct = s.target > 0 ? Math.min(100, ((s.progress ?? 0) / s.target) * 100) : 0;
   const rows = [
-    ['Progression', `${pct.toFixed(1).replace('.', ',')} %`],
-    ['Points estimés', `${fmt(s.progress)} / ${fmt(s.target)}`],
-    ['Joueurs collectés', fmt(total.bought)],
+    ['Ensemble', s.club ?? '?'],
+    ['Achats en cours', q.total ? `${fmt(q.listed)} / ${fmt(q.total)}${q.failed ? ` (${q.failed} échec)` : ''}` : '-'],
+    ['Joueurs achetés (total)', fmt(total.bought)],
     ['Taxe EA payée', fmt(total.tax)],
     ['Crédits', s.coins == null ? '?' : fmt(s.coins)],
   ];
@@ -34,13 +34,7 @@ function render(s) {
     el('p', { className: 'activity', textContent: s.running ? s.activity || 'En cours' : s.lastMessage || "À l'arrêt" }),
     el('dl', {}, ...rows.flatMap(([k, v]) => [el('dt', { textContent: k }), el('dd', { textContent: String(v) })])),
     s.feed?.length ? el('ul', { className: 'feed' }, ...s.feed.slice(0, 6).map((f) => el('li', { textContent: f }))) : '',
-    el(
-      'div',
-      { className: 'row' },
-      s.running
-        ? el('button', { className: 'stop', textContent: 'Arrêter', onclick: () => send({ type: 'stop' }) })
-        : el('button', { className: 'start', textContent: 'Lancer le niveau 10', onclick: () => send({ type: 'start' }) }),
-    ),
+    s.running ? el('div', { className: 'row' }, el('button', { className: 'stop', textContent: 'Arrêter', onclick: () => send({ type: 'stop' }) })) : '',
     el('button', { className: 'ghost', textContent: 'Afficher / masquer le panneau', onclick: () => send({ type: 'toggle-panel' }) }),
   );
 }
