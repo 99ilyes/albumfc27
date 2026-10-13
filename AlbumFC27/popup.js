@@ -8,6 +8,8 @@ function el(tag, props = {}, ...children) {
   return node;
 }
 
+const fmt = (n) => Number(n || 0).toLocaleString('fr-FR');
+
 function send(cmd) {
   if (tabId !== null) chrome.tabs.sendMessage(tabId, cmd);
 }
@@ -18,14 +20,14 @@ function render(s) {
     return;
   }
   s ??= {};
+  const total = s.total ?? {};
+  const pct = s.target > 0 ? Math.min(100, ((s.progress ?? 0) / s.target) * 100) : 0;
   const rows = [
-    ['Recherches', s.searches ?? 0],
-    ['Joueurs collectés', s.purchases ?? 0],
-    ['Score Galerie ajouté', s.scoreAdded ?? 0],
-    ['Dépensé', s.spent ?? 0],
-    ['Vendus', s.listed == null ? s.sold ?? 0 : `${s.sold ?? 0} (${s.listed} en vente)`],
-    ['Taxe EA payée', s.taxPaid ?? 0],
-    ['Crédits', s.coins ?? '?'],
+    ['Progression', `${pct.toFixed(1).replace('.', ',')} %`],
+    ['Points estimés', `${fmt(s.progress)} / ${fmt(s.target)}`],
+    ['Joueurs collectés', fmt(total.bought)],
+    ['Taxe EA payée', fmt(total.tax)],
+    ['Crédits', s.coins == null ? '?' : fmt(s.coins)],
   ];
   root.replaceChildren(
     el('h1', {}, 'AlbumFC27 ', el('span', { className: s.running ? 'dot on' : 'dot' })),
@@ -35,8 +37,9 @@ function render(s) {
     el(
       'div',
       { className: 'row' },
-      el('button', { className: 'start', textContent: 'Démarrer', disabled: !!s.running, onclick: () => send({ type: 'start' }) }),
-      el('button', { className: 'stop', textContent: 'Arrêter', disabled: !s.running, onclick: () => send({ type: 'stop' }) }),
+      s.running
+        ? el('button', { className: 'stop', textContent: 'Arrêter', onclick: () => send({ type: 'stop' }) })
+        : el('button', { className: 'start', textContent: 'Lancer le niveau 10', onclick: () => send({ type: 'start' }) }),
     ),
     el('button', { className: 'ghost', textContent: 'Afficher / masquer le panneau', onclick: () => send({ type: 'toggle-panel' }) }),
   );

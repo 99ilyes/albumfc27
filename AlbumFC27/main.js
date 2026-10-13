@@ -14,6 +14,9 @@
   const DAY = 24 * HOUR;
 
   const DEFAULTS = {
+    mode: 'level10',
+    galleryScore: 0,
+    targetScore: 3e6,
     sets: '[]',
     minDelayMs: 6e3,
     maxDelayMs: 12e3,
@@ -45,7 +48,7 @@
   const priceDown = (p) => Math.max(150, p - step(p - 1));
   const roundUp = (p) => Math.max(200, Math.ceil(p / step(p)) * step(p));
   const LADDER = [200, 300, 400, 500, 700, 1e3, 1500, 2e3, 3e3, 5e3, 7500, 1e4, 15e3, 2e4, 3e4, 5e4, 75e3, 1e5, 15e4, 2e5, 3e5, 5e5, 1e6, 15e6];
-  const ladder = (max) => [...LADDER.filter((p) => p < max), max];
+  const ladder = (max, min = 0) => [...LADDER.filter((p) => p > min && p < max), max];
   const sellPriceFor = (buy, markupPct) => (markupPct > 0 ? roundUp(buy * (1 + markupPct / 100)) : Math.max(200, buy));
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -54,6 +57,7 @@
     const m = Math.ceil(ms / 6e4);
     return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`;
   };
+  const fmtNum = (n) => Number(n || 0).toLocaleString('fr-FR');
   const clock = (ms) => new Date(Date.now() + ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const errText = (e) => {
     if (e == null || e === '') return '';
@@ -96,6 +100,7 @@
         label: String(s.label || 'Ensemble'),
         criteria: s.criteria ?? {},
         maxPrice: Math.max(200, Math.floor(Number(s.maxPrice) || 0)),
+        minPrice: Math.max(0, Math.floor(Number(s.minPrice) || 0)),
         minRating: Math.floor(Number(s.minRating) || 0),
         maxRating: Math.floor(Number(s.maxRating) || 99),
         enabled: s.enabled !== false,
@@ -104,14 +109,9 @@
     return { sets, error: null };
   }
 
-  // Balayage global par qualité, du meilleur score par crédit au moins bon : chaque joueur collecté
-  // alimente à la fois ses ensembles championnat, club, nation et rareté.
-  const AUTO_SETS = [
-    { id: 'auto-gold84', label: 'Auto · Or 84+', criteria: { level: 'gold' }, maxPrice: 15000, minRating: 84, maxRating: 99 },
-    { id: 'auto-gold75', label: 'Auto · Or 75–83', criteria: { level: 'gold' }, maxPrice: 1000, minRating: 75, maxRating: 83 },
-    { id: 'auto-silver', label: 'Auto · Argent', criteria: { level: 'silver' }, maxPrice: 400, minRating: 0, maxRating: 99 },
-    { id: 'auto-bronze', label: 'Auto · Bronze', criteria: { level: 'bronze' }, maxPrice: 300, minRating: 0, maxRating: 99 },
-  ];
+  // Mode niveau 10 : uniquement les cartes or 84+ au meilleur rapport points / crédits
+  const LEVEL10_SET = { id: 'level10', label: 'Niveau 10 · Or 84+', criteria: { level: 'gold' }, minPrice: 650, maxPrice: 15000, minRating: 84, maxRating: 99, enabled: true };
+  const LEVEL10_RATIO = 1.4;
 
   const describeCriteria = (c) =>
     Object.entries(c)
@@ -544,6 +544,11 @@
   const K_EXPIRIES = `${NS}:expiries`;
   const K_SETSTATS = `${NS}:setstats`;
   const K_RESUME = `${NS}:resume`;
+  const K_ACTIVE = `${NS}:active`;
+  const K_TOTAL = `${NS}:total`;
+
+  const activeSets = (cfg) => (cfg.mode === 'level10' ? [LEVEL10_SET] : parseSets(cfg.sets).sets.filter((s) => s.enabled));
+  const maxRatio = (cfg) => (cfg.maxCoinsPerPoint > 0 ? cfg.maxCoinsPerPoint : cfg.mode === 'level10' ? LEVEL10_RATIO : 0);
 
   const EMPTY_STATS = { running: false, searches: 0, purchases: 0, attempts: 0, spent: 0, scoreAdded: 0, sold: 0, revenue: 0, taxPaid: 0, netCost: 0, listed: null, startedAt: 0, activity: '', feed: [], coins: null, lastMessage: '' };
 
@@ -556,6 +561,8 @@
     bought = load(K_BOUGHT, {});
     expiries = load(K_EXPIRIES, {});
     setStats = load(K_SETSTATS, {});
+    total = { score: 0, bought: 0, tax: 0, ...load(K_TOTAL, {}) };
+    starting = false;
     seen = new Set();
     cursor = { setId: null, stepIdx: 0, page: 1 };
     pileFull = false;
@@ -574,7 +581,12 @@
       return this.stats.running;
     }
     snapshot() {
-      return { ...this.stats, coins: coins() };
+      const cfg = this.getConfig();
+      return { ...this.stats, coins: coins(), total: { ...this.total }, progress: cfg.galleryScore + this.total.score, target: cfg.targetScore, mode: cfg.mode };
+    }
+    addTotal(field, n) {
+      this.total[field] = (this.total[field] ?? 0) + n;
+      save(K_TOTAL, this.total);
     }
     owns(defId) {
       return this.collected.has(defId) || (this.getConfig().skipClubOwned && this.clubOwned.has(defId));
@@ -592,7 +604,8 @@
       this.stats.activity = msg;
       toFeed ? this.feed(msg) : this.onUpdate(this.snapshot());
     }
-    stop(msg = 'Arrêt demandé') {
+    stop(msg = 'Arrêt demandé', byUser = false) {
+      if (byUser) save(K_ACTIVE, false);
       this.stopRequested = true;
       this.wake?.();
       this.log(msg);
@@ -602,6 +615,7 @@
       this.log('Verrou levé manuellement');
     }
     lockout(msg) {
+      save(K_ACTIVE, false);
       this.guard.lock(LOCK_HOURS);
       this.stopRequested = true;
       this.wake?.();
@@ -620,6 +634,8 @@
       save(K_COLLECTED, []);
       this.setStats = {};
       save(K_SETSTATS, {});
+      this.total = { score: 0, bought: 0, tax: 0 };
+      save(K_TOTAL, this.total);
       this.log('Historique des joueurs collectés effacé');
     }
     async scanClub(force = true) {
@@ -655,6 +671,10 @@
       if (navigator.locks && !this.releaseLock) navigator.locks.request(`${NS}-running`, () => new Promise((r) => (this.releaseLock = r)));
     }
 
+    goalReached(cfg) {
+      return cfg.mode === 'level10' && cfg.targetScore > 0 && cfg.galleryScore + this.total.score >= cfg.targetScore;
+    }
+
     validate(cfg, sets) {
       if (!sets.some((s) => s.enabled)) return 'Ajouter ou activer au moins un ensemble';
       if (cfg.minDelayMs < 0 || cfg.maxDelayMs < cfg.minDelayMs) return 'Délais entre recherches invalides (max ≥ min)';
@@ -665,12 +685,26 @@
     }
 
     async start() {
-      if (this.running) return;
+      if (this.running || this.starting) return;
+      this.starting = true;
+      try {
+        await this.begin();
+      } finally {
+        this.starting = false;
+      }
+    }
+
+    async begin() {
       let cfg = this.getConfig();
-      const parsed = parseSets(cfg.sets);
-      const err = parsed.error ?? this.validate(cfg, parsed.sets);
+      const err = (cfg.mode === 'level10' ? null : parseSets(cfg.sets).error) ?? this.validate(cfg, activeSets(cfg));
       if (err) return this.log(err);
-      if (await this.otherBotRunning()) return this.log('SnipeFC27 tourne dans un autre onglet : arrête-le avant (quotas EA partagés)');
+      if (this.goalReached(cfg)) return save(K_ACTIVE, false), this.log(`Objectif déjà atteint (${cfg.galleryScore + this.total.score} pts estimés) : vérifie le niveau dans la Galerie`);
+      save(K_ACTIVE, true);
+      if (await this.otherBotRunning()) {
+        this.log('SnipeFC27 tourne : nouvel essai dans 5 min (quotas EA partagés)');
+        setTimeout(() => load(K_ACTIVE, false) && this.start(), 3e5);
+        return;
+      }
       const g = this.guard.check(cfg);
       if (!g.ok && 'stop' in g) return this.log(g.stop);
 
@@ -681,8 +715,12 @@
       this.listFails = 0;
       this.cursor = { setId: null, stepIdx: 0, page: 1 };
       this.holdWebLock();
-      const active = parsed.sets.filter((s) => s.enabled).length;
-      this.log(`Démarrage album (${active} ensemble${active > 1 ? 's' : ''}, revente ${cfg.markupPct > 0 ? `+${cfg.markupPct} %` : "au prix d'achat"})`);
+      const active = activeSets(cfg).length;
+      this.log(
+        cfg.mode === 'level10'
+          ? `Démarrage niveau 10 automatique (${cfg.galleryScore + this.total.score} / ${cfg.targetScore} pts estimés)`
+          : `Démarrage album (${active} ensemble${active > 1 ? 's' : ''}, revente ${cfg.markupPct > 0 ? `+${cfg.markupPct} %` : "au prix d'achat"})`,
+      );
       if (cfg.skipClubOwned && cfg.autoScanClub && Date.now() - load(K_CLUB_AT, 0) > 12 * HOUR) await this.scanClub(false);
       if (!galleryReport.probedAt) await this.reportGallery();
       if (this.stopRequested) return this.finish();
@@ -693,9 +731,14 @@
       try {
         while (!this.stopRequested) {
           cfg = this.getConfig();
-          const sets = parseSets(cfg.sets).sets.filter((s) => s.enabled);
+          const sets = activeSets(cfg);
           if (!sets.length) {
             this.log('Aucun ensemble actif');
+            break;
+          }
+          if (this.goalReached(cfg)) {
+            save(K_ACTIVE, false);
+            this.log(`Objectif atteint : ${cfg.galleryScore + this.total.score} pts estimés. Vérifie le niveau 10 dans la Galerie et récupère la récompense`);
             break;
           }
           if (cfg.stopAfterHours > 0 && Date.now() - this.stats.startedAt > cfg.stopAfterHours * HOUR) {
@@ -749,8 +792,8 @@
             this.cursor = { setId: sets[0].id, stepIdx: 0, page: 1 };
           }
           const set = sets[idx];
-          const steps = ladder(set.maxPrice);
-          const lo = this.cursor.stepIdx > 0 ? steps[this.cursor.stepIdx - 1] : 0;
+          const steps = ladder(set.maxPrice, set.minPrice ?? 0);
+          const lo = this.cursor.stepIdx > 0 ? steps[this.cursor.stepIdx - 1] : (set.minPrice ?? 0);
           if (lo >= available) {
             this.feed(`${set.label} : paliers suivants au-dessus des crédits disponibles (${Math.floor(available)})`);
             if (await this.nextSet(sets, idx, cfg)) break;
@@ -863,7 +906,8 @@
           this.clubOwned.add(it.defId);
           continue;
         }
-        if (cfg.maxCoinsPerPoint > 0 && it.buyNow / it.score > cfg.maxCoinsPerPoint) continue;
+        const ratio = maxRatio(cfg);
+        if (ratio > 0 && it.buyNow / it.score > ratio) continue;
         const prev = best.get(it.defId);
         if (!prev || it.buyNow < prev.buyNow) best.set(it.defId, it);
       }
@@ -919,6 +963,8 @@
       this.stats.purchases++;
       this.stats.spent += it.buyNow;
       this.stats.scoreAdded += score;
+      this.addTotal('score', score);
+      this.addTotal('bought', 1);
       this.guard.recordPurchase();
       this.collected.add(it.defId);
       save(K_COLLECTED, [...this.collected]);
@@ -962,6 +1008,7 @@
           this.stats.sold++;
           this.stats.revenue += net;
           this.stats.taxPaid += i.soldPrice - net;
+          if (this.bought[i.id]) this.addTotal('tax', i.soldPrice - net);
           const b = this.bought[i.id];
           if (b) {
             this.stats.netCost += b.price - net;
@@ -1097,6 +1144,12 @@ details summary { cursor: pointer; color: #889; font-size: 11px; }
 details[open] summary { margin-bottom: 6px; }
 details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
 .neg { color: #ff6b6b; }
+button.big { width: 100%; padding: 12px; font-size: 14px; }
+.bar { height: 10px; background: #0e0f12; border-radius: 5px; overflow: hidden; margin: 4px 0; }
+.bar .fill { height: 100%; width: 0; background: #2f9e44; transition: width .4s; }
+.goaltext { font-size: 11px; color: #aab; }
+details { border-top: 1px solid #2c303a; padding-top: 6px; }
+details > * + * { margin-top: 6px; }
 `;
 
   const FLOAT_KEYS = new Set(['markupPct', 'maxCoinsPerPoint']);
@@ -1173,11 +1226,13 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
       const header = h('header', {}, 'AlbumFC27', h('button', { className: 'x', textContent: '×', onclick: () => this.toggle() }));
       this.draggable(header);
       this.activityEl = h('div', { className: 'activity', title: "Afficher / masquer l'historique" });
-      this.feedEl = h('div', { className: 'feed' });
+      this.feedEl = h('div', { className: 'feed hidden' });
       this.activityEl.onclick = () => this.feedEl.classList.toggle('hidden');
       this.setsEl = h('div', { className: 'sets' });
-      this.startBtn = h('button', { className: 'start', textContent: 'Démarrer', onclick: () => this.handlers.onStart() });
-      this.stopBtn = h('button', { className: 'stop', textContent: 'Arrêter', disabled: true, onclick: () => this.handlers.onStop() });
+      this.mainBtn = h('button', { className: 'start big', textContent: 'Lancer le niveau 10 automatique', onclick: () => (this.running ? this.handlers.onStop() : this.handlers.onStart()) });
+      this.goalTitle = h('h4', { textContent: 'Objectif : Galerie niveau 10' });
+      this.barFill = h('div', { className: 'fill' });
+      this.goalText = h('div', { className: 'goaltext' });
       this.statsEl = h('div', { className: 'stats' });
       this.logEl = h('div', { className: 'log' });
       const copy = h('button', { textContent: 'Copier' });
@@ -1185,40 +1240,36 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
         copy.textContent = (await copyText(this.logEl.textContent ?? '')) ? 'Copié' : 'Échec';
         setTimeout(() => (copy.textContent = 'Copier'), 1500);
       };
+      const score = this.numInput('galleryScore');
+      score.placeholder = '0';
       const body = h(
         'div',
         { className: 'body' },
-        h('div', {}, h('h4', { textContent: 'Ensembles à compléter' }), this.autoButton(), this.setsEl),
-        this.addForm(),
+        h('div', {}, this.goalTitle, h('div', { className: 'bar' }, this.barFill), this.goalText),
+        this.mainBtn,
+        h('div', { className: 'setting' }, h('span', { textContent: 'Score Galerie actuel (facultatif, lu dans le jeu)' }), score),
+        this.statsEl,
+        h('details', {}, h('summary', { textContent: 'Journal' }), h('div', { className: 'loghead' }, h('span'), copy), this.logEl),
         h(
-          'div',
+          'details',
           {},
+          h('summary', { textContent: 'Avancé' }),
+          this.checkSetting('mode', 'Utiliser mes propres ensembles (au lieu du niveau 10)', (on) => (on ? 'custom' : 'level10')),
+          this.numSetting({ key: 'targetScore', label: 'Objectif niveau 10 (points)' }),
+          h('h4', { textContent: 'Mes ensembles' }),
+          this.setsEl,
+          this.addForm(),
           h('h4', { textContent: 'Réglages' }),
           this.delayRow('Délai recherches (s)', 'minDelayMs', 'maxDelayMs'),
           this.delayRow('Délai avant achat (s)', 'buyDelayMinMs', 'buyDelayMaxMs', 0.1),
           ...SETTINGS.map((s) => this.numSetting(s)),
           this.checkSetting('skipClubOwned', 'Ignorer les joueurs déjà possédés (club)'),
           this.checkSetting('autoScanClub', 'Scanner le club au démarrage (toutes les 12 h)'),
+          this.advanced(),
         ),
-        this.advanced(),
-        h('div', { className: 'actions' }, this.startBtn, this.stopBtn),
-        this.statsEl,
-        h('div', {}, h('div', { className: 'loghead' }, h('h4', { textContent: 'Journal' }), copy), this.logEl),
       );
       this.box.append(header, this.activityEl, this.feedEl, body);
       this.renderSets();
-    }
-
-    autoButton() {
-      const b = h('button', { className: 'start', style: 'width:100%;margin-bottom:6px', textContent: 'Compléter automatiquement la Galerie' });
-      b.title = 'Ajoute les ensembles automatiques (or 84+, or 75–83, argent, bronze), scanne le club et démarre';
-      b.onclick = () => {
-        const cur = this.sets().sets;
-        const missing = AUTO_SETS.filter((a) => !cur.some((x) => x.id === a.id)).map((a) => ({ ...a, enabled: true }));
-        this.saveSets([...cur.map((x) => (x.id.startsWith('auto-') ? { ...x, enabled: true } : x)), ...missing]);
-        this.handlers.onStart();
-      };
-      return b;
     }
 
     addForm() {
@@ -1356,9 +1407,9 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
     numSetting(s) {
       return h('div', { className: 'setting' }, h('span', { textContent: s.label }), this.numInput(s.key));
     }
-    checkSetting(key, label) {
-      const cb = h('input', { type: 'checkbox', checked: !!this.config[key] });
-      cb.onchange = () => this.setConfig({ [key]: cb.checked });
+    checkSetting(key, label, map) {
+      const cb = h('input', { type: 'checkbox', checked: map ? this.config[key] === map(true) : !!this.config[key] });
+      cb.onchange = () => this.setConfig({ [key]: map ? map(cb.checked) : cb.checked });
       return h('label', { className: 'setting' }, h('span', { textContent: label }), cb);
     }
     delayRow(label, a, b, stepS = 0.5) {
@@ -1366,20 +1417,22 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
     }
 
     update(s, line) {
+      this.running = s.running;
       this.activityEl.classList.toggle('on', s.running);
       this.activityEl.textContent = s.running ? s.activity || 'En cours' : "À l'arrêt";
       this.feedEl.replaceChildren(...s.feed.map((f) => h('div', { textContent: f })));
-      this.startBtn.disabled = s.running;
-      this.stopBtn.disabled = !s.running;
+      const level10 = s.mode !== 'custom';
+      this.mainBtn.textContent = s.running ? 'Arrêter' : level10 ? 'Lancer le niveau 10 automatique' : 'Lancer mes ensembles';
+      this.mainBtn.className = s.running ? 'stop big' : 'start big';
+      const pct = s.target > 0 ? Math.min(100, (s.progress / s.target) * 100) : 0;
+      this.goalTitle.textContent = level10 ? 'Objectif : Galerie niveau 10' : 'Mes ensembles';
+      this.barFill.style.width = `${pct}%`;
+      this.goalText.textContent = `${fmtNum(s.progress)} / ${fmtNum(s.target)} pts estimés (${pct.toFixed(1).replace('.', ',')} %)`;
       const rows = [
-        ['Recherches', s.searches],
-        ['Joueurs collectés', s.attempts ? `${s.purchases} / ${s.attempts} tentés` : s.purchases],
-        ['Score Galerie ajouté', s.scoreAdded],
-        ['Dépensé (immobilisé)', s.spent],
-        ['Vendus', s.listed === null ? s.sold : `${s.sold} (${s.listed} en vente)`],
-        ['Taxe EA payée', s.taxPaid],
-        ['Coût net des ventes', s.netCost],
-        ['Crédits', s.coins ?? '?'],
+        ['Joueurs collectés', fmtNum(s.total.bought)],
+        ['Taxe EA payée', fmtNum(s.total.tax)],
+        ['En vente', s.listed ?? '?'],
+        ['Crédits', s.coins == null ? '?' : fmtNum(s.coins)],
       ];
       this.statsEl.replaceChildren(...rows.flatMap(([k, v]) => [h('span', { textContent: k }), h('b', { textContent: String(v) })]));
       if (line) this.logEl.textContent = `${line}\n${this.logEl.textContent ?? ''}`.split('\n').slice(0, 1e3).join('\n');
@@ -1421,7 +1474,7 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
     hookUiSearch();
     const panel = new Panel({
       onStart: () => void bot.start(),
-      onStop: () => bot.stop(),
+      onStop: () => bot.stop('Arrêt demandé', true),
       onUnlock: () => bot.unlock(),
       onScanClub: () => void bot.scanClub(),
       onReset: () => bot.resetCollected(),
@@ -1447,16 +1500,16 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
     try {
       const at = Number(localStorage.getItem(K_RESUME) ?? 0);
       localStorage.removeItem(K_RESUME);
-      if (at && Date.now() - at < 9e5) {
-        panel.update(bot.snapshot(), 'Reprise automatique après rechargement');
-        setTimeout(() => void bot.start(), 5e3);
+      if ((at && Date.now() - at < 9e5) || load(K_ACTIVE, false)) {
+        panel.update(bot.snapshot(), 'Reprise automatique dans 10 s');
+        setTimeout(() => void bot.start(), 1e4);
       }
     } catch {}
     window.addEventListener('message', (e) => {
       if (e.source !== window || e.data?.ns !== NS || e.data.dir !== 'to-page') return;
       const { cmd } = e.data;
       if (cmd.type === 'start') bot.start();
-      else if (cmd.type === 'stop') bot.stop();
+      else if (cmd.type === 'stop') bot.stop('Arrêt demandé', true);
       else if (cmd.type === 'toggle-panel') panel.toggle();
     });
   }
