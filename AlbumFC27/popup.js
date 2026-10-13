@@ -22,14 +22,17 @@ function render(s) {
   s ??= {};
   const q = s.queue ?? {};
   const total = s.total ?? {};
+  const lost = total.lost ?? 0;
+  const locked = (s.lockedUntil ?? 0) > Date.now();
+  const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const rows = [
-    ['Ensemble', s.club ?? '?'],
-    ['Achats en cours', q.total ? `${fmt(q.listed)} / ${fmt(q.total)}${q.failed ? ` (${q.failed} échec)` : ''}` : '-'],
-    ['Joueurs achetés (total)', fmt(total.bought)],
-    ['Crédits perdus', (total.lost ?? 0) < 0 ? `gain ${fmt(-total.lost)}` : fmt(total.lost)],
+    ['Sets', s.sets?.length ? s.sets.join(', ') : '-'],
+    ['Achats', q.total ? `${fmt(q.listed)} / ${fmt(q.total)}${q.failed ? ` (${q.failed} échec)` : ''}` : '-'],
+    ['Crédits perdus', lost < 0 ? `gain ${fmt(-lost)}` : fmt(lost)],
     ['Perte estimée en vente', fmt(s.pendingLoss)],
     ['Crédits', s.coins == null ? '?' : fmt(s.coins)],
   ];
+  if (locked) rows.unshift(['Verrou', `jusqu'à ${hm(s.lockedUntil)}${s.resumeAt ? `, reprise ${hm(s.resumeAt)}` : ''}`]);
   root.replaceChildren(
     el('h1', {}, 'AlbumFC27 ', el('span', { className: s.running ? 'dot on' : 'dot' })),
     el('p', { className: 'activity', textContent: s.running ? s.activity || 'En cours' : s.lastMessage || "À l'arrêt" }),
