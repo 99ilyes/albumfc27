@@ -1103,7 +1103,7 @@
   const CSS = `
 :host { all: initial; }
 * { box-sizing: border-box; }
-.box { position: fixed; top: 64px; left: 16px; z-index: 2147483647; width: 420px; max-height: min(820px, 92vh);
+.box { position: fixed; top: 64px; left: 16px; z-index: 2147483647; width: 420px; max-height: calc(100vh - 76px);
   display: flex; flex-direction: column; font: 12px/1.4 system-ui, sans-serif; color: #e6e7eb;
   background: #14161b; border: 1px solid #2a2e38; border-radius: 12px; box-shadow: 0 10px 30px #000a; overflow: hidden; }
 .box.hidden { display: none; }
@@ -1124,7 +1124,7 @@ nav { display: flex; gap: 2px; padding: 0 8px; border-bottom: 1px solid #2a2e38;
 nav button { background: none; border-radius: 0; padding: 7px 12px; color: #8a8f9c; font-weight: 600; border-bottom: 2px solid transparent; }
 nav button.on { color: #e6e7eb; border-bottom-color: #4c6ef5; }
 nav button .badge { margin-left: 5px; padding: 0 6px; border-radius: 8px; background: #5c4012; color: #ffd8a8; font-size: 10px; }
-.body { flex: 1 1 auto; min-height: 140px; overflow-y: auto; padding: 10px 12px; }
+.body { flex: 1 1 auto; min-height: 120px; overflow-y: auto; padding: 10px 12px; }
 .tab { display: none; flex-direction: column; gap: 10px; } .tab.on { display: flex; }
 h4 { margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #7c8190; }
 input { background: #0d0f13; color: inherit; border: 1px solid #2a2e38; border-radius: 6px; padding: 5px 7px; font: inherit; min-width: 0; }
@@ -1170,7 +1170,10 @@ button:disabled { opacity: .4; cursor: default; }
 .bar { height: 6px; background: #0d0f13; border-radius: 3px; overflow: hidden; display: flex; }
 .bar > span { height: 100%; transition: width .4s; }
 .bar .ok { background: #2f9e44; } .bar .use { background: #4c6ef5; } .bar .cap { background: repeating-linear-gradient(45deg, #4c6ef5 0 3px, #2a3570 3px 6px); } .bar .over { background: #e03131; }
-footer { border-top: 1px solid #2a2e38; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; background: #171a20; }
+footer { border-top: 1px solid #2a2e38; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; background: #171a20; flex: 0 1 auto; min-height: 0; max-height: 55vh; }
+footer .fscroll { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; min-height: 0; flex: 0 1 auto; }
+footer .factions { display: flex; flex-direction: column; gap: 6px; flex: none; }
+@media (max-height: 640px) { .live .lbody { display: none; } .body { min-height: 90px; } }
 footer.hidden { display: none; }
 .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 .tile { background: #1e2129; border-radius: 8px; padding: 6px 8px; min-width: 0; }
@@ -1186,13 +1189,14 @@ footer.hidden { display: none; }
 .note.warn { color: #ffa94d; }
 .raise { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #a9aebb; }
 .raise input { width: 52px; text-align: right; }
-details.speed { font-size: 11px; color: #a9aebb; }
-details.speed summary { cursor: pointer; user-select: none; }
-details.speed .grid { display: grid; grid-template-columns: 1fr auto; gap: 6px 8px; align-items: center; margin-top: 6px; }
-details.speed .pair { display: flex; align-items: center; gap: 4px; color: #7c8190; }
-details.speed .pair input { width: 54px; text-align: right; }
-details.speed .presets { display: flex; gap: 4px; }
-details.speed .presets button.on { background: #364fc7; color: #fff; }
+.speed { font-size: 11px; color: #a9aebb; display: flex; flex-direction: column; gap: 4px; }
+.speed .grid { display: grid; grid-template-columns: 1fr auto; gap: 6px 8px; align-items: center; }
+.speed .pair { display: flex; align-items: center; gap: 4px; color: #7c8190; }
+.speed .pair input { width: 60px; text-align: right; }
+.speed .presets { display: flex; gap: 4px; }
+.speed .presets button.on { background: #364fc7; color: #fff; }
+.speedline { background: none; padding: 0; font-size: 11px; font-weight: 500; color: #a9aebb; text-align: left; }
+.speedline:hover { color: #e6e7eb; }
 button.big { width: 100%; padding: 10px; font-size: 13px; }
 .hero { background: #1b1e25; border-radius: 10px; padding: 10px 12px; display: flex; align-items: baseline; gap: 10px; }
 .hero span { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #8a8f9c; }
@@ -1299,10 +1303,10 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       this.draggable(header);
       this.activityEl = h('div', { className: 'activity' });
       this.bannerEl = h('div', { className: 'banner' });
-      this.tabs = { buy: this.buildBuyTab(), sales: this.buildSalesTab(), log: this.buildLogTab() };
+      this.tabs = { buy: this.buildBuyTab(), sales: this.buildSalesTab(), log: this.buildLogTab(), settings: this.buildSettingsTab() };
       this.tabBtns = {};
       const nav = h('nav');
-      for (const [id, label] of [['buy', 'Achats'], ['sales', 'Ventes'], ['log', 'Journal']]) {
+      for (const [id, label] of [['buy', 'Achats'], ['sales', 'Ventes'], ['log', 'Journal'], ['settings', 'Réglages']]) {
         this.tabBtns[id] = h('button', { textContent: label, onclick: () => this.showTab(id) });
         nav.append(this.tabBtns[id]);
       }
@@ -1314,6 +1318,8 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       this.renderEvents(true);
       this.baseTitle = document.title;
       setInterval(() => this.tick(), 1e3);
+      window.addEventListener('resize', () => this.fit());
+      this.fit();
     }
 
     showTab(id) {
@@ -1508,9 +1514,17 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       this.mainBtn = h('button', { className: 'big go' });
       this.mainBtn.onclick = () => (this.engine.mode === 'buy' ? this.engine.stop('Achats arrêtés', true) : void this.engine.validate());
       this.resumeBtn = h('button', { className: 'big', onclick: () => void this.engine.runQueue() });
-      this.speedEl = h('details', { className: 'speed' });
+      // Bouton principal toujours visible ; le récapitulatif défile si la place manque
+      return h('footer', {}, h('div', { className: 'fscroll' }, this.recapEl, this.raiseRow, this.speedLine), h('div', { className: 'factions' }, this.mainBtn, this.resumeBtn));
+    }
+
+    // --- Onglet Réglages : vitesse, ralentissement, pauses, quotas ---
+
+    buildSettingsTab() {
+      this.speedEl = h('div', { className: 'speed' });
+      this.speedLine = h('button', { className: 'speedline', title: 'Ouvrir les réglages', onclick: () => this.showTab('settings') });
       this.renderSpeed();
-      return h('footer', {}, this.recapEl, this.raiseRow, this.speedEl, this.mainBtn, this.resumeBtn);
+      return h('section', { className: 'tab' }, this.speedEl);
     }
 
     // Réglages de vitesse : préréglages, délais (s), ralentissement après limite EA ; appliqués immédiatement
@@ -1548,12 +1562,13 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           ? `Rythme actuel ralenti ×${dec(pace)} (délais ${dec((c.minDelayMs * pace) / 1e3)}–${dec((c.maxDelayMs * pace) / 1e3)} s) jusqu’à ${hm(this.engine.guard.paceUntil(c))} sans nouvelle limite.`
           : 'Rythme normal.';
       const resetBtn = pace > 1 ? h('button', { className: 'small', textContent: 'Revenir au rythme normal', onclick: () => (this.engine.guard.resetPace(), this.engine.log('Rythme remis à la normale'), this.renderSpeed()) }) : null;
-      const open = this.speedEl.open;
+      const summary = `Vitesse : ${active ?? 'personnalisée'} (${dec(c.minDelayMs / 1e3)}–${dec(c.maxDelayMs / 1e3)} s entre recherches)${pace > 1 ? ` · ralenti ×${dec(pace)}` : ''}`;
+      this.speedLine.textContent = `${summary} ›`;
       this.speedEl.replaceChildren(
-        h('summary', { textContent: `Vitesse : ${active ?? 'personnalisée'} (${dec(c.minDelayMs / 1e3)}–${dec(c.maxDelayMs / 1e3)} s entre recherches)${pace > 1 ? ` · ralenti ×${dec(pace)}` : ''}` }),
         h(
           'div',
           { className: 'grid' },
+          h('h4', { textContent: 'Vitesse', style: 'grid-column:1 / -1;margin-top:4px' }),
           h('span', { textContent: 'Préréglage' }),
           h('span', { className: 'presets' }, ...presets),
           h('span', { textContent: 'Délai entre recherches' }),
@@ -1583,7 +1598,6 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         h('div', { className: 'row', style: 'margin-top:6px' }, h('span', { className: 'note grow', textContent: paceState }), resetBtn),
         h('div', { className: 'note', style: 'margin-top:4px', textContent: 'Plus rapide = plus de risque de limite EA ou de captcha.' }),
       );
-      this.speedEl.open = open;
       this.paceShown = pace;
     }
 
@@ -1861,6 +1875,13 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       if (this.tab === 'sales') this.renderSales(s);
     }
 
+    // Le panneau tient toujours dans la fenêtre : hauteur max = espace sous son bord haut
+    fit() {
+      const top = Math.min(Math.max(0, this.box.getBoundingClientRect().top), Math.max(0, window.innerHeight - 200));
+      this.box.style.top = `${top}px`;
+      this.box.style.maxHeight = `${Math.max(200, window.innerHeight - top - 12)}px`;
+    }
+
     draggable(header) {
       header.onpointerdown = (e) => {
         if (e.target.tagName === 'BUTTON') return;
@@ -1870,6 +1891,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         const move = (ev) => {
           this.box.style.left = `${Math.max(0, ev.clientX - dx)}px`;
           this.box.style.top = `${Math.max(0, ev.clientY - dy)}px`;
+          this.fit();
         };
         const up = () => {
           window.removeEventListener('pointermove', move);
