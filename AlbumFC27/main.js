@@ -7,13 +7,13 @@
   const SOFT_STATUS = new Set([426, 429, 512, 521]);
   const HOUR = 36e5;
   const DAY = 24 * HOUR;
-  const SOFT_PAUSE_MIN = 3;
-  const HARD_PAUSE_MIN = 30;
   const SOFT_CAP = 30 * 6e4;
   const HARD_CAP = 2 * HOUR;
   const CALM_MS = 30 * 6e4;
   // Quotas (0 = illimité), comptés avec SnipeFC27 ; désactivés par défaut
   const QUOTA_DEFAULTS = { quotaSearchHour: 0, quotaSearchDay: 0, quotaBuyDay: 0 };
+  // Pauses après un refus EA (min, 0 = aucune : reprise immédiate) ; doublées si ça se répète
+  const PAUSE_DEFAULTS = { softPauseMin: 0, captchaPauseMin: 0 };
   const CONFIG_VERSION = 3;
   const SPEED_DEFAULTS = { minDelayMs: 4e3, maxDelayMs: 8e3, buyDelayMinMs: 300, buyDelayMaxMs: 900 };
   // Ralentissement après une limite EA : délais × paceStep à chaque limite, plafond paceMax, retour à ×1 après paceResetMin sans limite
@@ -245,26 +245,26 @@
       this.s.lockedUntil = 0;
       this.persist();
     }
-    // Captcha : 30 min, doublée à chaque nouveau blocage dans les 24 h, plafond 2 h
-    lock() {
+    // Captcha : durée réglée, doublée à chaque nouveau blocage dans les 24 h, plafond 2 h
+    lock(baseMin) {
       const now = Date.now();
       this.s.lockStreak = now - this.s.lastLockAt < DAY ? this.s.lockStreak + 1 : 0;
       this.s.lastLockAt = now;
-      const ms = Math.min(HARD_CAP, HARD_PAUSE_MIN * 6e4 * 2 ** this.s.lockStreak);
-      this.s.lockedUntil = now + ms;
+      const ms = Math.min(HARD_CAP, baseMin * 6e4 * 2 ** this.s.lockStreak);
+      this.s.lockedUntil = ms > 0 ? now + ms : 0;
       this.s.lockKind = 'hard';
       this.persist();
       return ms;
     }
-    // Limite de débit : 3 min, doublée si ça se répète dans les 30 min (plafond 30 min), rythme ralenti selon les réglages
+    // Limite de débit : durée réglée, doublée si ça se répète dans les 30 min (plafond 30 min), rythme ralenti selon les réglages
     lockSoft(cfg) {
       const now = Date.now();
       const calm = now - (this.s.lastSoftAt ?? 0) > CALM_MS;
       this.s.softStreak = calm ? 0 : (this.s.softStreak ?? 0) + 1;
       this.s.pace = Math.min(cfg.paceMax, this.pace(cfg) * cfg.paceStep);
       this.s.lastSoftAt = now;
-      const ms = Math.min(SOFT_CAP, SOFT_PAUSE_MIN * 6e4 * 2 ** this.s.softStreak);
-      this.s.lockedUntil = now + ms;
+      const ms = Math.min(SOFT_CAP, cfg.softPauseMin * 6e4 * 2 ** this.s.softStreak);
+      this.s.lockedUntil = ms > 0 ? now + ms : 0;
       this.s.lockKind = 'soft';
       this.persist();
       return ms;
@@ -341,8 +341,9 @@
     // v3 : quota horaire désactivé par défaut (l'ancien défaut de 300 était enregistré avec les réglages)
     if (raw.cfgV !== CONFIG_VERSION) delete raw.quotaSearchHour;
     const pct = Number(raw.raisePct);
-    const cfg = { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE, ...SPEED_DEFAULTS, ...PACE_DEFAULTS, ...QUOTA_DEFAULTS, cfgV: CONFIG_VERSION };
+    const cfg = { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE, ...SPEED_DEFAULTS, ...PACE_DEFAULTS, ...QUOTA_DEFAULTS, ...PAUSE_DEFAULTS, cfgV: CONFIG_VERSION };
     for (const k of Object.keys(SPEED_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = raw[k];
+    for (const k of Object.keys(PAUSE_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = raw[k];
     for (const k of Object.keys(QUOTA_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = Math.floor(raw[k]);
     for (const k of Object.keys(PACE_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= (k === 'paceResetMin' ? 0 : 1)) cfg[k] = raw[k];
     return cfg;
@@ -601,12 +602,23 @@
     }
     lockout(msg, soft = false) {
       const mode = this.mode;
+      const cfg = this.getConfig();
       this.stopRequested = true;
       this.wake?.();
-      const ms = soft ? this.guard.lockSoft(this.getConfig()) : this.guard.lock();
+      const ms = soft ? this.guard.lockSoft(cfg) : this.guard.lock(cfg.captchaPauseMin);
       if (mode) {
         save(K_LOCK_RESUME, { mode });
         this.scheduleResume();
+      }
+      if (ms <= 0) {
+        // Aucune pause réglée : reprise après le délai normal entre recherches
+        const pace = this.guard.pace(cfg);
+        this.log(`${msg} : pas de pause${pace > 1 ? `, rythme ralenti ×${pace.toFixed(1).replace('.', ',')}` : ''}${mode ? ', reprise immédiate' : ''}${soft ? '' : '. Si EA affiche un captcha, le résoudre dans la Web App : le process continue seul ensuite'}`, 'lock');
+        if (!soft && Date.now() - (this.captchaNotifiedAt ?? 0) > 10 * 6e4) {
+          this.captchaNotifiedAt = Date.now();
+          this.notify('AlbumFC27 : captcha EA', `${msg}. Résous le captcha dans la Web App, le process reprend seul.`);
+        }
+        return;
       }
       if (soft) {
         const pace = this.guard.pace(this.getConfig());
@@ -619,7 +631,8 @@
     scheduleResume() {
       if (!load(K_LOCK_RESUME, null)) return;
       clearTimeout(this.resumeTimer);
-      const wait = Math.max(5e3, this.guard.lockedUntil() - Date.now() + (this.guard.lockKind() === 'soft' ? rand(5e3, 2e4) : rand(3e4, 9e4)));
+      const locked = this.guard.lockedUntil() > Date.now();
+      const wait = locked ? Math.max(5e3, this.guard.lockedUntil() - Date.now() + (this.guard.lockKind() === 'soft' ? rand(5e3, 2e4) : rand(3e4, 9e4))) : this.delay();
       this.resumeAt = Date.now() + wait;
       this.resumeTimer = setTimeout(() => void this.autoResume(), wait);
       this.emit();
@@ -635,9 +648,10 @@
       this.resumeAt = 0;
       if (!intent) return;
       if (this.guard.lockedUntil() > Date.now()) return this.scheduleResume();
-      if (this.running) return;
+      // Tâche interrompue encore en train de se terminer : nouvel essai dans 1 s
+      if (this.running) return void (this.resumeTimer = setTimeout(() => void this.autoResume(), 1e3));
       save(K_LOCK_RESUME, null);
-      this.log('Fin de la pause : reprise automatique');
+      this.log('Reprise automatique');
       if (intent.mode === 'buy' && this.queue.some(isOpen)) await this.runQueue();
       else if (intent.mode === 'relist') await this.relist();
     }
@@ -1553,6 +1567,11 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           h('span', { className: 'pair' }, '×', input('paceMax', 0.5, 1, 1)),
           h('span', { textContent: 'Retour au rythme normal après (sans limite)' }),
           h('span', { className: 'pair' }, input('paceResetMin', 5), 'min'),
+          h('h4', { textContent: 'Pauses après refus EA (0 = aucune, reprise immédiate)', style: 'grid-column:1 / -1;margin-top:4px' }),
+          h('span', { textContent: 'Après limite EA 426 / 429 / 512 / 521 (min)' }),
+          h('span', { className: 'pair' }, input('softPauseMin', 1), 'min'),
+          h('span', { textContent: 'Après captcha 458 / 460 / 494 (min)' }),
+          h('span', { className: 'pair' }, input('captchaPauseMin', 5), 'min'),
           h('h4', { textContent: 'Quotas (0 = illimité, cumulés avec SnipeFC27)', style: 'grid-column:1 / -1;margin-top:4px' }),
           h('span', { textContent: 'Recherches max par heure' }),
           h('span', { className: 'pair' }, input('quotaSearchHour', 50)),
@@ -1891,6 +1910,12 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
     const at = Number(load(K_RESUME, 0));
     save(K_RESUME, 0);
     const lockIntent = load(K_LOCK_RESUME, null);
+    const cfg0 = loadConfig();
+    const kind = engine.guard.lockKind();
+    if ((kind === 'soft' && cfg0.softPauseMin <= 0) || (kind === 'hard' && cfg0.captchaPauseMin <= 0)) {
+      engine.guard.unlock();
+      engine.log('Pause en cours levée (aucune pause réglée)');
+    }
     if (lockIntent) engine.scheduleResume();
     else if ((at && Date.now() - at < 9e5) || load(K_ACTIVE, false)) {
       if (engine.queue.some(isOpen)) {
