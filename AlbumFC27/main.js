@@ -5,7 +5,6 @@
   const BAD_STATUS = new Set([426, 429, 458, 460, 494, 512, 521]);
   const PILE_MAX = 100;
   const PAGE_SIZE = 20;
-  const MAINTAIN_EVERY_MS = 18e4;
   const LOCK_HOURS = 12;
   const MAX_MISSES = 8;
   const MAX_LIST_FAILS = 3;
@@ -14,42 +13,32 @@
   const DAY = 24 * HOUR;
 
   const DEFAULTS = {
-    mode: 'level10',
-    galleryScore: 0,
-    targetScore: 3e6,
-    sets: '[]',
-    minDelayMs: 6e3,
-    maxDelayMs: 12e3,
+    minDelayMs: 5e3,
+    maxDelayMs: 9e3,
     buyDelayMinMs: 300,
     buyDelayMaxMs: 900,
-    markupPct: 0,
-    maxBuysPerSearch: 3,
-    maxCoinsPerPoint: 0,
-    maxPagesPerStep: 5,
-    dropAfterExpiries: 0,
+    scanMaxPrice: 5e4,
+    scanMaxSearches: 30,
+    scanPagesPerSlice: 3,
+    pricePct: 10,
+    triesPerPlayer: 3,
     coinReserve: 0,
-    maxSpend: 0,
-    resweepMinutes: 30,
-    stopAfterHours: 0,
-    skipClubOwned: true,
-    autoScanClub: true,
+    watchMinutes: 5,
+    minSellPct: 0,
+    lockMinutes: 30,
+    autoRaisePct: 20,
     maxSearchesPerHour: 300,
     maxSearchesPerDay: 1500,
     maxPurchasesPerDay: 150,
-    sessionMinutes: 60,
-    breakMinutes: 8,
   };
-
-  // Score de base Galerie / SBC simplifiés (valeurs communautaires, hors bonus rareté et tags)
-  const GOLD_SCORE = { 75: 90, 76: 100, 77: 120, 78: 140, 79: 160, 80: 180, 81: 280, 82: 340, 83: 410, 84: 830, 85: 2100, 86: 4100, 87: 5500, 88: 8300, 89: 11000, 90: 14000 };
-  const itemScore = (r) => (r < 65 ? 20 : r < 75 ? 35 : GOLD_SCORE[Math.min(r, 90)]);
 
   const step = (p) => (p < 1e3 ? 50 : p < 1e4 ? 100 : p < 5e4 ? 250 : p < 1e5 ? 500 : 1e3);
   const priceDown = (p) => Math.max(150, p - step(p - 1));
   const roundUp = (p) => Math.max(200, Math.ceil(p / step(p)) * step(p));
-  const LADDER = [200, 300, 400, 500, 700, 1e3, 1500, 2e3, 3e3, 5e3, 7500, 1e4, 15e3, 2e4, 3e4, 5e4, 75e3, 1e5, 15e4, 2e5, 3e5, 5e5, 1e6, 15e6];
-  const ladder = (max, min = 0) => [...LADDER.filter((p) => p > min && p < max), max];
-  const sellPriceFor = (buy, markupPct) => (markupPct > 0 ? roundUp(buy * (1 + markupPct / 100)) : Math.max(200, buy));
+  // Hausse auto : +5 % arrondi au palier EA (au moins un palier), sans dépasser le plafond
+  const raisePrice = (p, cap) => Math.min(cap, Math.max(p + step(p), roundUp(p * 1.05)));
+  const capFor = (max, pct) => (pct > 0 ? Math.max(max, roundUp(max * (1 + pct / 100))) : max);
+  const BOUNDS = [400, 700, 1e3, 1500, 2500, 5e3, 1e4, 25e3, 5e4, 1e5, 2e5, 5e5, 1e6, 15e6];
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const rand = (a, b) => a + Math.random() * Math.max(0, b - a);
@@ -58,6 +47,7 @@
     return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`;
   };
   const fmtNum = (n) => Number(n || 0).toLocaleString('fr-FR');
+  const fmtSigned = (n) => (n < 0 ? `gain ${fmtNum(-n)}` : fmtNum(n));
   const clock = (ms) => new Date(Date.now() + ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const errText = (e) => {
     if (e == null || e === '') return '';
@@ -82,69 +72,29 @@
     } catch {}
   }
 
-  // ---------- Ensembles ----------
+  const tierOf = (p) => (p.rare > 1 ? 'special' : !p.rating ? 'unknown' : p.rating >= 75 ? 'gold' : p.rating >= 65 ? 'silver' : 'bronze');
+  const TIER_LABEL = { special: 'Spéciale', gold: 'Or', silver: 'Argent', bronze: 'Bronze', unknown: '' };
+  const tierText = (p) => (tierOf(p) === 'special' ? 'Spéciale' : `${TIER_LABEL[tierOf(p)]}${p.rare === 1 ? ' rare' : ''}`);
+  const setKey = (set) => (set ? (set.kind === 'futgg' ? `futgg:${set.slug}` : `club:${set.club}`) : null);
+  const FUTGG_GALLERY = 'https://www.fut.gg/fut-gallery/';
 
-  function parseSets(raw) {
-    let list;
-    try {
-      list = JSON.parse(raw || '[]');
-    } catch {
-      return { sets: [], error: 'Ensembles illisibles (JSON invalide)' };
-    }
-    if (!Array.isArray(list)) return { sets: [], error: 'Ensembles illisibles' };
-    const sets = [];
-    for (const s of list) {
-      if (!s || typeof s !== 'object' || typeof s.criteria !== 'object') continue;
-      sets.push({
-        id: String(s.id ?? Math.random().toString(36).slice(2)),
-        label: String(s.label || 'Ensemble'),
-        criteria: s.criteria ?? {},
-        maxPrice: Math.max(200, Math.floor(Number(s.maxPrice) || 0)),
-        minPrice: Math.max(0, Math.floor(Number(s.minPrice) || 0)),
-        minRating: Math.floor(Number(s.minRating) || 0),
-        maxRating: Math.floor(Number(s.maxRating) || 99),
-        enabled: s.enabled !== false,
-      });
-    }
-    return { sets, error: null };
-  }
+  // ---------- Interception réseau : isCollected, gradingScore, rareflag par definitionId ----------
 
-  // Mode niveau 10 : uniquement les cartes or 84+ au meilleur rapport points / crédits
-  const LEVEL10_SET = { id: 'level10', label: 'Niveau 10 · Or 84+', criteria: { level: 'gold' }, minPrice: 650, maxPrice: 15000, minRating: 84, maxRating: 99, enabled: true };
-  const LEVEL10_RATIO = 1.5;
-
-  const describeCriteria = (c) =>
-    Object.entries(c)
-      .map(([k, v]) => `${k.replace(/^_/, '')}=${Array.isArray(v) ? v.join('|') : v}`)
-      .join(' · ') || 'tous les joueurs';
-
-  // ---------- Interception réseau ----------
-
-  const NET_RE = /\/ut\/game\/|transfermarket|\/trade\//i;
   const PILE_RE = /\/tradepile(\?|$)/i;
-  const GALLERY_RE = /galler|collection|album/i;
   let lastPile = null;
-  let diagSink = null;
-  const galleryCaptures = [];
-
-  // Données Galerie lues dans les réponses EA brutes : isCollected et gradingScore par definitionId
   const netItems = new Map();
-  const clubCollected = new Set();
-  function recordItems(url, j) {
+
+  function recordItems(j) {
     const list = [...(Array.isArray(j.itemData) ? j.itemData : []), ...(Array.isArray(j.auctionInfo) ? j.auctionInfo.map((a) => a?.itemData) : [])];
-    const club = /\/club(\?|$)/i.test(url);
     for (const it of list) {
       const defId = Number(it?.resourceId ?? 0);
       if (!defId || it.itemType !== 'player') continue;
-      const collected = it.isCollected === true;
       const prev = netItems.get(defId);
       netItems.set(defId, {
-        collected: collected || !!prev?.collected,
+        collected: it.isCollected === true || !!prev?.collected,
         score: Number(it.gradingScore) || prev?.score || 0,
-        rating: Number(it.rating) || prev?.rating || 0,
-        avg: Number(it.marketAverage) || prev?.avg || 0,
+        rare: Number(it.rareflag ?? prev?.rare ?? 0),
       });
-      if (club && collected) clubCollected.add(defId);
     }
   }
 
@@ -152,64 +102,36 @@
     if (status !== 200) return;
     if (/\/ut\/game\//i.test(url) && /"itemData"/.test(text)) {
       try {
-        recordItems(url, JSON.parse(text));
+        recordItems(JSON.parse(text));
       } catch {}
     }
     if (PILE_RE.test(url)) {
       try {
         const j = JSON.parse(text);
-        if (Array.isArray(j.auctionInfo)) lastPile = { at: Date.now(), auctions: j.auctionInfo, credits: typeof j.credits === 'number' ? j.credits : null };
+        if (Array.isArray(j.auctionInfo)) lastPile = { at: Date.now(), auctions: j.auctionInfo };
       } catch {}
-    } else if (/\/ut\//i.test(url) && (GALLERY_RE.test(url) || /galler|collected/i.test(text))) {
-      galleryCaptures.unshift({ at: new Date().toISOString(), url, body: text.slice(0, 2e5) });
-      galleryCaptures.length = Math.min(galleryCaptures.length, 10);
-      diagSink?.(`[GALERIE] réponse captée ${shortUrl(url)} (${text.length} octets)`);
-    }
-  }
-
-  function shortUrl(u) {
-    try {
-      const x = new URL(u, location.href);
-      return x.host + x.pathname + x.search;
-    } catch {
-      return u;
     }
   }
 
   function installNetHooks() {
     const X = XMLHttpRequest.prototype;
     const open = X.open;
-    const send = X.send;
-    const meta = new WeakMap();
     X.open = function (method, url, ...rest) {
-      meta.set(this, { method, url: String(url), t0: 0 });
       this.addEventListener('readystatechange', () => {
         if (this.readyState === 4 && (this.responseType === '' || this.responseType === 'text')) onResponse(String(url), this.status, this.responseText);
       });
       return open.call(this, method, url, ...rest);
     };
-    X.send = function (body) {
-      const m = meta.get(this);
-      if (m && NET_RE.test(m.url) && diagSink) {
-        m.t0 = Date.now();
-        this.addEventListener('loadend', () => diagSink?.(`[NET] ${m.method} ${shortUrl(m.url)} → ${this.status} (${Date.now() - m.t0} ms)`));
-      }
-      return send.call(this, body);
-    };
     const f = window.fetch;
     window.fetch = async function (input, init) {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       const res = await f.call(this, input, init);
-      if (PILE_RE.test(url) || /\/ut\//i.test(url)) res.clone().text().then((t) => onResponse(url, res.status, t)).catch(() => {});
-      if (NET_RE.test(url)) diagSink?.(`[NET] fetch ${shortUrl(url)} → ${res.status}`);
+      if (/\/ut\//i.test(url)) res.clone().text().then((t) => onResponse(url, res.status, t)).catch(() => {});
       return res;
     };
   }
 
   // ---------- API Web App ----------
-
-  let botSearching = false;
-  let lastUiCriteria = null;
 
   function webAppReady() {
     try {
@@ -236,28 +158,20 @@
     }
   }
 
-  const SKIP_KEYS = /^_?(minBuy|maxBuy|minBid|maxBid|offset|count|sortBy|sort)$/i;
-  function criteriaDiff(c) {
-    const base = new UTSearchCriteriaDTO();
-    const out = {};
-    for (const k of Object.keys(c)) {
-      const v = c[k];
-      if (SKIP_KEYS.test(k)) continue;
-      const prim = (x) => x === null || ['string', 'number', 'boolean'].includes(typeof x);
-      if (!(prim(v) || (Array.isArray(v) && v.every(prim)))) continue;
-      if (JSON.stringify(v) !== JSON.stringify(base[k])) out[k] = Array.isArray(v) ? [...v] : v;
-    }
-    return out;
-  }
+  const validId = (v) => (Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : null);
 
+  // Club / championnat de la dernière recherche faite à la main dans le marché
+  let lastUiClub = null;
+  let botSearching = false;
   function hookUiSearch() {
     const svc = services.Item;
     const orig = svc.searchTransferMarket;
     if (typeof orig !== 'function' || orig.__album) return;
-    const wrapped = function (criteria, page) {
+    const wrapped = function (criteria) {
       if (!botSearching) {
         try {
-          lastUiCriteria = criteriaDiff(criteria);
+          const club = validId(criteria?.club ?? criteria?._club);
+          if (club) lastUiClub = { club, league: validId(criteria?.league ?? criteria?._league) };
         } catch {}
       }
       return orig.apply(this, arguments);
@@ -266,34 +180,35 @@
     svc.searchTransferMarket = wrapped;
   }
 
+  function staticName(i) {
+    const s = i?._staticData ?? i?.getStaticData?.() ?? {};
+    return String(s.name || [s.firstName, s.lastName].filter(Boolean).join(' ') || i?.definitionId || '?');
+  }
+
   function mapItem(i) {
     const a = i._auction ?? i.getAuctionData?.() ?? {};
+    const defId = Number(i.definitionId ?? 0);
+    const net = netItems.get(defId);
     return {
       raw: i,
       tradeId: Number(a.tradeId),
       buyNow: Number(a.buyNowPrice),
       expires: Number(a.expires ?? 0),
-      defId: Number(i.definitionId ?? 0),
+      defId,
       rating: Number(i.rating ?? 0),
-      name: String(i._staticData?.name ?? i.getStaticData?.()?.name ?? i.definitionId),
-      collected: netItems.get(Number(i.definitionId ?? 0))?.collected === true || collectedFlag(i) === true,
-      score: netItems.get(Number(i.definitionId ?? 0))?.score || Number(i.gradingScore) || itemScore(Number(i.rating ?? 0)),
-      duplicate: (() => {
-        try {
-          return i.isDuplicate?.() === true;
-        } catch {
-          return false;
-        }
-      })(),
+      rare: Number(net?.rare ?? i.rareflag ?? 0),
+      name: staticName(i),
+      collected: net?.collected === true,
+      score: net?.score || Number(i.gradingScore) || 0,
     };
   }
 
-  async function searchMarket(set, minBuy, maxBuy, page) {
+  async function searchMarket(criteria, minBuy, maxBuy, page = 1) {
     const c = new UTSearchCriteriaDTO();
-    Object.assign(c, set.criteria);
-    if (!('type' in set.criteria) && !('_type' in set.criteria)) c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
+    c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
+    Object.assign(c, criteria);
     if (minBuy > 0) c.minBuy = minBuy;
-    c.maxBuy = maxBuy;
+    if (maxBuy > 0) c.maxBuy = maxBuy;
     services.Item.clearTransferMarketCache?.();
     botSearching = true;
     let obs;
@@ -324,7 +239,6 @@
     const r = await observe(services.Item.requestTransferItems?.());
     const items = r.data?.items ?? [];
     const byId = new Map(items.map((i) => [Number(i.id), i]));
-    const nameOf = (i, d) => String(i?._staticData?.name ?? i?.getStaticData?.()?.name ?? d);
     let pile = lastPile;
     for (let n = 0; n < 10 && !(pile && pile.at >= t0); n++) {
       await sleep(50);
@@ -333,154 +247,134 @@
     if (pile && pile.at >= t0) {
       return {
         success: true,
-        status: 200,
-        source: 'serveur',
         data: pile.auctions.map((a) => {
           const id = Number(a.itemData?.id);
           const raw = byId.get(id);
-          const defId = Number(raw?.definitionId ?? a.itemData?.resourceId ?? a.itemData?.assetId ?? 0);
-          return { raw, id, defId, name: nameOf(raw, defId), state: tradeState(String(a.tradeState ?? ''), Number(a.currentBid ?? 0)), soldPrice: Number(a.currentBid ?? 0), buyNow: Number(a.buyNowPrice ?? 0) };
+          const defId = Number(raw?.definitionId ?? a.itemData?.resourceId ?? 0);
+          return { raw, id, defId, name: raw ? staticName(raw) : String(defId || id), state: tradeState(String(a.tradeState ?? ''), Number(a.currentBid ?? 0)), soldPrice: Number(a.currentBid ?? 0), buyNow: Number(a.buyNowPrice ?? 0) };
         }),
       };
     }
     return {
       ...r,
-      source: 'web app',
       data: items.map((i) => {
         const a = i._auction ?? i.getAuctionData?.() ?? {};
         const cur = Number(a.currentBid ?? 0);
-        return { raw: i, id: Number(i.id), defId: Number(i.definitionId), name: nameOf(i, i.definitionId), state: tradeState(String(a.tradeState ?? ''), cur), soldPrice: cur, buyNow: Number(a.buyNowPrice ?? 0) };
+        return { raw: i, id: Number(i.id), defId: Number(i.definitionId ?? 0), name: staticName(i), state: tradeState(String(a.tradeState ?? ''), cur), soldPrice: cur, buyNow: Number(a.buyNowPrice ?? 0) };
       }),
     };
   }
 
-  let clubScanShape = null;
-  async function scanClubDefIds(onProgress) {
-    if (typeof services.Club?.search !== 'function') throw Error('recherche club indisponible dans cette version de la Web App');
-    const ids = new Set();
-    const PAGE = 90;
-    for (let offset = 0, n = 0; n < 80; offset += PAGE, n++) {
-      const c = new UTSearchCriteriaDTO();
-      c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
-      c.offset = offset;
-      c.count = PAGE;
-      const r = await observe(services.Club.search(c));
-      if (!r.success) {
-        if (!ids.size) throw Error(`statut ${r.status}`);
-        break;
-      }
-      const d = r.data;
-      const items = Array.isArray(d) ? d : (d?.items ?? d?.itemData ?? Object.values(d ?? {}).find(Array.isArray) ?? []);
-      if (offset === 0) clubScanShape = { status: r.status, dataKeys: Object.keys(d ?? {}), count: items.length, firstItemKeys: Object.keys(items[0] ?? {}).slice(0, 60) };
-      const before = ids.size;
-      for (const i of items) {
-        const id = Number(i?.definitionId ?? i?.resourceId ?? i?.getDefinitionId?.() ?? 0);
-        if (id) ids.add(id);
-      }
-      onProgress?.(ids.size);
-      if (!items.length || ids.size === before) break;
-      await sleep(rand(800, 1600));
+  // ---------- Championnats et clubs (données de la Web App) ----------
+
+  // Sans eval (CSP de la Web App) : les globales déclarées en let/const ne sont pas sur window
+  const GLOBALS = {
+    factories: () => (typeof factories !== 'undefined' ? factories : undefined),
+    repositories: () => (typeof repositories !== 'undefined' ? repositories : undefined),
+  };
+  const globalObj = (name) => {
+    try {
+      return window[name] ?? GLOBALS[name]?.();
+    } catch {
+      return undefined;
     }
-    for (const id of clubCollected) ids.add(id);
-    if (!ids.size) throw Error(`aucun joueur lu (statut ${clubScanShape?.status}, clés réponse : ${clubScanShape?.dataKeys.join(', ') || 'aucune'}, ${clubScanShape?.count ?? 0} élément(s))`);
-    return ids;
-  }
-
-  // ---------- Détection Galerie ----------
-
-  const GAL_API_RE = /galler|album/i;
-  const COLLECTED_KEY_RE = /^_?(is)?(gallery)?collected$|^_?(is)?ingallery$/i;
-  const galleryReport = { probedAt: null, apis: [], calls: [], itemFlag: null, itemKeys: [], itemMethods: [] };
-  let flagKey;
+  };
 
   function methodNames(o) {
     const names = new Set();
     for (let p = o; p && p !== Object.prototype && p !== Function.prototype; p = Object.getPrototypeOf(p)) {
-      for (const k of Object.getOwnPropertyNames(p)) if (k !== 'constructor' && typeof Object.getOwnPropertyDescriptor(p, k)?.value === 'function') names.add(k);
+      for (const k of Object.getOwnPropertyNames(p)) {
+        try {
+          if (k !== 'constructor' && typeof Object.getOwnPropertyDescriptor(p, k)?.value === 'function') names.add(k);
+        } catch {}
+      }
     }
     return [...names];
   }
 
-  function safeJson(v, depth = 6, seen = new WeakSet()) {
-    if (typeof v === 'function') return undefined;
-    if (v === null || typeof v !== 'object') return v;
-    if (seen.has(v) || depth <= 0) return '[…]';
-    seen.add(v);
-    if (v instanceof Map) v = Object.fromEntries(v);
-    else if (v instanceof Set) v = [...v];
-    if (Array.isArray(v)) return [...v.slice(0, 40).map((x) => safeJson(x, depth - 1, seen)), ...(v.length > 40 ? [`… ${v.length - 40} de plus`] : [])];
-    const out = {};
-    for (const k of Object.keys(v).slice(0, 80)) {
-      const r = safeJson(v[k], depth - 1, seen);
-      if (r !== undefined) out[k] = r;
+  function asEntries(v) {
+    if (v instanceof Map) v = [...v.values()];
+    else if (v && typeof v === 'object' && !Array.isArray(v)) v = Object.values(v);
+    if (!Array.isArray(v)) return [];
+    const out = [];
+    for (const x of v) {
+      if (!x || typeof x !== 'object') continue;
+      const id = validId(x.id ?? x.value ?? x.teamId ?? x.leagueId ?? x.key);
+      let name = [x.label, x.name, x.longName, x.fullName, x.text, x.abbrName].find((s) => typeof s === 'string' && s.trim());
+      if (!name && typeof x.getName === 'function') {
+        try {
+          name = x.getName();
+        } catch {}
+      }
+      if (id && name) out.push({ id, name: String(name).trim(), league: validId(x.leagueId ?? x.league) });
     }
     return out;
   }
 
-  const withTimeout = (p) => Promise.race([p, sleep(1e4).then(() => ({ timeout: true }))]);
+  const dataSources = () =>
+    [
+      ['factories.DataProvider', globalObj('factories')?.DataProvider],
+      ['repositories.TeamConfig', globalObj('repositories')?.TeamConfig],
+    ].filter(([, o]) => o && typeof o === 'object');
 
-  // Cherche les services Galerie de la Web App et appelle leurs méthodes de lecture sans argument
-  async function probeGallery() {
-    const apis = [];
-    for (const rootName of ['services', 'repositories', 'factories']) {
-      let root;
-      try {
-        root = window[rootName];
-      } catch {}
-      if (!root || typeof root !== 'object') continue;
-      for (const k of Object.keys(root)) if (GAL_API_RE.test(k)) apis.push({ path: `${rootName}.${k}`, obj: root[k] });
-    }
-    for (const k of Object.getOwnPropertyNames(window)) {
-      if (!GAL_API_RE.test(k)) continue;
-      try {
-        apis.push({ path: k, obj: window[k] });
-      } catch {}
-    }
-    galleryReport.apis = apis.map((a) => ({ path: a.path, type: typeof a.obj, methods: methodNames(typeof a.obj === 'function' ? a.obj.prototype : a.obj) }));
-    galleryReport.calls = [];
-    for (const a of apis) {
-      if (!/^(services|repositories)\./.test(a.path) || !a.obj) continue;
-      for (const m of methodNames(a.obj).filter((n) => /^(request|get|fetch|load)/i.test(n)).slice(0, 12)) {
-        const fn = a.obj[m];
-        if (typeof fn !== 'function' || fn.length > 0) continue;
-        try {
-          let r = fn.call(a.obj);
-          if (typeof r?.observe === 'function') r = await withTimeout(observe(r));
-          else if (typeof r?.then === 'function') r = await withTimeout(r);
-          galleryReport.calls.push({ call: `${a.path}.${m}()`, result: safeJson(r) });
-        } catch (e) {
-          galleryReport.calls.push({ call: `${a.path}.${m}()`, error: String(e?.message ?? e) });
+  const discovery = { leagues: null, clubs: null, sources: [] };
+
+  // Essaie les accesseurs « get…League… » / « get…Club|Team… » sans effet de bord, garde la première liste plausible
+  function findList(kindRe, argSets, accept) {
+    for (const [path, obj] of dataSources()) {
+      for (const m of methodNames(obj).filter((n) => /^get/i.test(n) && kindRe.test(n))) {
+        for (const args of argSets) {
+          let list;
+          try {
+            list = asEntries(obj[m](...args));
+          } catch {
+            continue;
+          }
+          const ok = accept(list);
+          if (ok?.length) return { via: `${path}.${m}(${args.join(', ')})`, list: ok };
         }
-        await sleep(rand(300, 700));
+      }
+      for (const k of Object.keys(obj).filter((n) => kindRe.test(n))) {
+        const ok = accept(asEntries(obj[k]));
+        if (ok?.length) return { via: `${path}.${k}`, list: ok };
       }
     }
-    galleryReport.probedAt = new Date().toISOString();
-    return galleryReport;
+    return null;
   }
 
-  // Marqueur « déjà dans la Galerie » porté par les cartes, s'il existe : true / false / null (inconnu)
-  function collectedFlag(item) {
-    if (flagKey === undefined) {
-      const methods = methodNames(item);
-      galleryReport.itemKeys = Object.keys(item).slice(0, 120);
-      galleryReport.itemMethods = methods.slice(0, 250);
-      flagKey = [...Object.keys(item), ...methods].find((k) => COLLECTED_KEY_RE.test(k)) ?? null;
-      galleryReport.itemFlag = flagKey;
-    }
-    if (!flagKey) return null;
-    try {
-      const v = typeof item[flagKey] === 'function' ? item[flagKey]() : item[flagKey];
-      return typeof v === 'boolean' ? v : null;
-    } catch {
-      return null;
-    }
+  const byName = (a, b) => a.name.localeCompare(b.name, 'fr');
+
+  function loadLeagues() {
+    const r = findList(/league/i, [[], [true], [false]], (l) => (l.length >= 5 ? l : null));
+    discovery.leagues = r?.via ?? 'introuvable';
+    return r ? [...new Map(r.list.map((x) => [x.id, x])).values()].sort(byName) : [];
+  }
+
+  function loadClubs(leagueId) {
+    const r = findList(/club|team/i, [[leagueId], [leagueId, true], [leagueId, false], [true, leagueId], [], [true]], (l) => {
+      if (!l.length) return null;
+      if (l.some((x) => x.league)) return l.filter((x) => x.league === leagueId);
+      return l.length < 120 ? l : null;
+    });
+    discovery.clubs = r?.via ?? 'introuvable';
+    return r ? [...new Map(r.list.map((x) => [x.id, x])).values()].sort(byName) : [];
+  }
+
+  function diagnosticReport() {
+    return {
+      at: new Date().toISOString(),
+      url: location.href,
+      discovery,
+      lastUiClub,
+      sources: dataSources().map(([path, o]) => ({ path, methods: methodNames(o).slice(0, 200), keys: Object.keys(o).slice(0, 100) })),
+    };
   }
 
   // ---------- Garde-fous (quotas partagés avec SnipeFC27) ----------
 
   class Guard {
     key = `${NS}:guard`;
-    s = { searches: [], purchases: [], lockedUntil: 0, ...load(this.key, {}) };
+    s = { searches: [], purchases: [], lockedUntil: 0, lockStreak: 0, lastLockAt: 0, ...load(this.key, {}) };
     persist() {
       const now = Date.now();
       this.s.searches = this.s.searches.filter((t) => now - t < DAY);
@@ -499,16 +393,18 @@
       const o = this.other();
       if (o.lockedUntil) save(`${SNIPE_NS}:guard`, { ...o, lockedUntil: 0 });
     }
-    lock(hours) {
-      this.s.lockedUntil = Date.now() + hours * HOUR;
+    // Verrou progressif : durée de base doublée à chaque nouveau blocage dans les 24 h, plafond 12 h
+    lock(baseMinutes) {
+      const now = Date.now();
+      this.s.lockStreak = now - this.s.lastLockAt < DAY ? this.s.lockStreak + 1 : 0;
+      this.s.lastLockAt = now;
+      const ms = baseMinutes > 0 ? Math.min(LOCK_HOURS * HOUR, baseMinutes * 6e4 * 2 ** this.s.lockStreak) : LOCK_HOURS * HOUR;
+      this.s.lockedUntil = now + ms;
       this.persist();
+      return ms;
     }
-    recordSearch() {
-      this.s.searches.push(Date.now());
-      this.persist();
-    }
-    recordPurchase() {
-      this.s.purchases.push(Date.now());
+    record(kind) {
+      this.s[kind].push(Date.now());
       this.persist();
     }
     all(kind) {
@@ -516,21 +412,16 @@
     }
     check(cfg) {
       const lockMs = this.lockedUntil() - Date.now();
-      if (lockMs > 0) return { ok: false, stop: `Verrou anti-captcha actif encore ${fmtMin(lockMs)}` };
+      if (lockMs > 0) return { ok: false, locked: true, stop: `Verrou anti-captcha actif encore ${fmtMin(lockMs)}` };
       const now = Date.now();
       const searches = this.all('searches').filter((t) => now - t < DAY);
       const purchases = this.all('purchases').filter((t) => now - t < DAY);
-      const split = (kind) => {
-        const own = this.s[kind].filter((t) => now - t < DAY).length;
-        const snipe = (this.other()[kind] ?? []).filter((t) => now - t < DAY).length;
-        return `AlbumFC27 ${own} + SnipeFC27 ${snipe}`;
-      };
-      const dayWait = (arr, what, kind, max) => {
+      const dayWait = (arr, what, max) => {
         const w = Math.max(6e4, arr[arr.length - max] + DAY - now + 5e3);
-        return { ok: false, waitMs: w, reason: `Quota journalier ${what} atteint (${split(kind)} sur 24 h, max ${max}), reprise dans ${fmtMin(w)}` };
+        return { ok: false, waitMs: w, reason: `Quota journalier ${what} atteint (AlbumFC27 + SnipeFC27, max ${max}), reprise dans ${fmtMin(w)}` };
       };
-      if (searches.length >= cfg.maxSearchesPerDay) return dayWait(searches, 'de recherches', 'searches', cfg.maxSearchesPerDay);
-      if (purchases.length >= cfg.maxPurchasesPerDay) return dayWait(purchases, "d'achats", 'purchases', cfg.maxPurchasesPerDay);
+      if (searches.length >= cfg.maxSearchesPerDay) return dayWait(searches, 'de recherches', cfg.maxSearchesPerDay);
+      if (purchases.length >= cfg.maxPurchasesPerDay) return dayWait(purchases, "d'achats", cfg.maxPurchasesPerDay);
       const hour = searches.filter((t) => now - t < HOUR);
       if (hour.length >= cfg.maxSearchesPerHour) {
         const w = hour[0] + HOUR - now + 5e3;
@@ -542,129 +433,339 @@
 
   // ---------- Moteur ----------
 
-  const K_COLLECTED = `${NS}:collected`;
-  const K_CLUB = `${NS}:club`;
-  const K_CLUB_AT = `${NS}:clubAt`;
+  const K_CONFIG = `${NS}:config`;
+  const K_SETS = `${NS}:sets`;
+  const K_SEL = `${NS}:selection`;
+  const K_QUEUE = `${NS}:queue`;
+  const K_DONE = `${NS}:done`;
   const K_BOUGHT = `${NS}:bought`;
-  const K_EXPIRIES = `${NS}:expiries`;
-  const K_SETSTATS = `${NS}:setstats`;
-  const K_RESUME = `${NS}:resume`;
   const K_ACTIVE = `${NS}:active`;
+  const K_RESUME = `${NS}:resume`;
   const K_TOTAL = `${NS}:total`;
+  const K_WATCH = `${NS}:watch`;
+  const K_LOCK_RESUME = `${NS}:lockResume`;
 
-  const activeSets = (cfg) => (cfg.mode === 'level10' ? [LEVEL10_SET] : parseSets(cfg.sets).sets.filter((s) => s.enabled));
-  const maxRatio = (cfg) => (cfg.maxCoinsPerPoint > 0 ? cfg.maxCoinsPerPoint : cfg.mode === 'level10' ? LEVEL10_RATIO : 0);
+  function loadConfig() {
+    const raw = load(K_CONFIG, {});
+    const cfg = { ...DEFAULTS };
+    for (const k of Object.keys(DEFAULTS)) if (typeof raw[k] === 'number' && Number.isFinite(raw[k])) cfg[k] = raw[k];
+    return cfg;
+  }
 
-  const EMPTY_STATS = { running: false, searches: 0, purchases: 0, attempts: 0, spent: 0, scoreAdded: 0, sold: 0, revenue: 0, taxPaid: 0, netCost: 0, listed: null, startedAt: 0, activity: '', feed: [], coins: null, lastMessage: '' };
+  // Ancien format (un seul ensemble) vers la liste de sets
+  function loadSets() {
+    const sets = load(K_SETS, null);
+    if (sets && typeof sets === 'object') return sets;
+    const old = load(`${NS}:set`, null);
+    const scan = load(`${NS}:scan`, null);
+    const out = {};
+    if (old && scan?.players) {
+      const key = setKey(old.kind ? old : { ...old, kind: 'club' });
+      out[key] = { ...old, kind: old.kind ?? 'club', key, source: scan.source ?? 'market', at: scan.at ?? Date.now(), partial: !!scan.partial, players: scan.players };
+    }
+    return out;
+  }
 
-  class Collector {
-    stats = { ...EMPTY_STATS };
+  const STATUS_LABEL = {
+    pending: 'en attente',
+    searching: 'recherche…',
+    listed: 'acheté',
+    bought: 'acheté, non mis en vente',
+    notfound: 'introuvable au prix max',
+    nocoins: 'crédits insuffisants',
+  };
+  const isDone = (q) => q.status === 'listed' || q.status === 'bought';
+  const isFailed = (q) => q.status === 'notfound' || q.status === 'nocoins';
+  const isOpen = (q) => q.status === 'pending' || q.status === 'searching';
+
+  // Coût d'un aller-retour : achat au prix p, revente à p (seul en vente) ou un palier dessous (concurrence), taxe 5 %
+  const roundTrip = (p) => ({ low: p - Math.floor(p * (1 - EA_TAX)), high: p - Math.floor(Math.max(200, priceDown(p)) * (1 - EA_TAX)) });
+
+  class Engine {
+    mode = null; // 'scan' | 'buy' | 'watch' | null
     stopRequested = false;
+    activityText = '';
+    lastMessage = '';
+    feedLines = [];
     guard = new Guard();
-    collected = new Set(load(K_COLLECTED, []));
-    clubOwned = new Set(load(K_CLUB, []));
+    sets = loadSets();
+    selection = load(K_SEL, {});
+    queue = load(K_QUEUE, []);
+    done = new Set(load(K_DONE, []));
     bought = load(K_BOUGHT, {});
-    expiries = load(K_EXPIRIES, {});
-    setStats = load(K_SETSTATS, {});
-    total = { score: 0, bought: 0, tax: 0, ...load(K_TOTAL, {}) };
-    cooldown = new Map();
-    l10Cursor = { stepIdx: 0, page: 1 };
-    l10Iter = 0;
-    starting = false;
-    seen = new Set();
-    cursor = { setId: null, stepIdx: 0, page: 1 };
-    pileFull = false;
+    total = { bought: 0, spent: 0, tax: 0, lost: 0, sold: 0, ...load(K_TOTAL, {}) };
+    scanningKey = null;
+    pileCount = 0;
+    ownListed = 0;
     misses = 0;
     listFails = 0;
-    lastMaintain = 0;
-    lastThrottleWarn = 0;
-    releaseLock = null;
     wake = null;
+    releaseLock = null;
+    resumeTimer = null;
+    resumeAt = 0;
+    version = 0;
 
     constructor(getConfig, onUpdate) {
       this.getConfig = getConfig;
       this.onUpdate = onUpdate;
     }
     get running() {
-      return this.stats.running;
+      return this.mode !== null;
     }
+    get busy() {
+      return this.mode === 'scan' || this.mode === 'buy';
+    }
+
     snapshot() {
-      const cfg = this.getConfig();
-      return { ...this.stats, coins: coins(), total: { ...this.total }, progress: cfg.galleryScore + this.total.score, target: cfg.targetScore, mode: cfg.mode };
+      const q = this.queue;
+      return {
+        running: this.running,
+        mode: this.mode,
+        activity: this.activityText,
+        lastMessage: this.lastMessage,
+        feed: this.feedLines,
+        coins: coins(),
+        sets: Object.values(this.sets).map((s) => s.name),
+        queue: { total: q.length, listed: q.filter(isDone).length, failed: q.filter(isFailed).length, open: q.filter(isOpen).length },
+        total: { ...this.total },
+        pendingLoss: this.pendingLoss(),
+        onSale: Object.keys(this.bought).length,
+        lockedUntil: this.guard.lockedUntil(),
+        resumeAt: this.resumeAt,
+        version: this.version,
+      };
+    }
+    touch() {
+      this.version++;
+    }
+    emit(line) {
+      this.onUpdate(this.snapshot(), line);
+    }
+    log(msg) {
+      this.lastMessage = msg;
+      this.emit(`${new Date().toLocaleTimeString()} ${msg}`);
+    }
+    feed(msg) {
+      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      this.feedLines = [`${t} ${msg}`, ...this.feedLines].slice(0, FEED_SIZE);
+      this.emit();
+    }
+    activity(msg) {
+      this.activityText = msg;
+      this.emit();
     }
     addTotal(field, n) {
       this.total[field] = (this.total[field] ?? 0) + n;
       save(K_TOTAL, this.total);
     }
-    owns(defId) {
-      return this.collected.has(defId) || (this.getConfig().skipClubOwned && this.clubOwned.has(defId));
+    // Perte si les joueurs encore en vente partent au prix affiché
+    pendingLoss() {
+      let n = 0;
+      for (const b of Object.values(this.bought)) {
+        const price = typeof b === 'number' ? b : b.price;
+        const sell = typeof b === 'number' ? b : b.sell || b.price;
+        n += price - Math.floor(sell * (1 - EA_TAX));
+      }
+      return n;
     }
-    log(msg) {
-      this.stats.lastMessage = msg;
-      this.onUpdate(this.snapshot(), `${new Date().toLocaleTimeString()} ${msg}`);
+    resetTotals() {
+      this.total = { bought: 0, spent: 0, tax: 0, lost: 0, sold: 0 };
+      save(K_TOTAL, this.total);
+      this.log('Compteurs remis à zéro');
     }
-    feed(msg) {
-      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      this.stats.feed = [`${t} ${msg}`, ...this.stats.feed].slice(0, FEED_SIZE);
-      this.onUpdate(this.snapshot());
+
+    // --- Sets ---
+
+    saveSets() {
+      save(K_SETS, this.sets);
+      this.touch();
     }
-    activity(msg, toFeed = false) {
-      this.stats.activity = msg;
-      toFeed ? this.feed(msg) : this.onUpdate(this.snapshot());
+    setList() {
+      return Object.values(this.sets).sort((a, b) => b.at - a.at);
     }
+    refreshCollected(p) {
+      if (!p.collected && (netItems.get(p.defId)?.collected || this.done.has(p.defId))) p.collected = true;
+      return p;
+    }
+    setPlayers(set) {
+      return Object.values(set.players ?? {})
+        .map((p) => this.refreshCollected(p))
+        .sort((a, b) => (a.minPrice || Infinity) - (b.minPrice || Infinity) || b.rating - a.rating);
+    }
+    findPlayer(defId) {
+      for (const s of Object.values(this.sets)) if (s.players?.[defId]) return s.players[defId];
+      return null;
+    }
+    defaultMax(p) {
+      return p?.minPrice > 0 ? roundUp(p.minPrice * (1 + this.getConfig().pricePct / 100)) : 0;
+    }
+    setSelected(defId, on, max) {
+      if (on) this.selection[defId] = max || this.selection[defId] || this.defaultMax(this.findPlayer(defId));
+      else delete this.selection[defId];
+      save(K_SEL, this.selection);
+    }
+    removeSet(key) {
+      if (this.scanningKey === key) return this.log("Set en cours de scan : arrête le scan d'abord");
+      const set = this.sets[key];
+      if (!set) return;
+      delete this.sets[key];
+      const still = new Set(Object.values(this.sets).flatMap((s) => Object.keys(s.players ?? {})));
+      for (const id of Object.keys(this.selection)) if (!still.has(id)) delete this.selection[id];
+      save(K_SEL, this.selection);
+      this.saveSets();
+      this.log(`Set « ${set.name} » retiré`);
+    }
+
+    // Joueurs cochés, dédoublonnés entre sets, avec coût projeté
+    picks() {
+      const out = [];
+      let noPrice = 0;
+      for (const [id, max] of Object.entries(this.selection)) {
+        const p = this.findPlayer(id);
+        if (!p || this.refreshCollected(p).collected) continue;
+        if (!(Number(max) >= 200)) {
+          noPrice++;
+          continue;
+        }
+        const ref = p.minPrice > 0 ? Math.min(p.minPrice, Number(max)) : Number(max);
+        out.push({ p, max: Number(max), ref, ...roundTrip(ref) });
+      }
+      const sum = (k) => out.reduce((s, x) => s + x[k], 0);
+      const pct = this.getConfig().autoRaisePct;
+      const capEngaged = out.reduce((s, x) => s + capFor(x.max, pct), 0);
+      return { list: out, noPrice, engaged: sum('ref'), maxEngaged: sum('max'), capEngaged, low: sum('low'), high: sum('high') };
+    }
+
+    // Set envoyé depuis une page Galerie de fut.gg (joueurs, defId, prix fut.gg)
+    importSet(data) {
+      const list = Array.isArray(data?.players) ? data.players : [];
+      const players = {};
+      for (const x of list) {
+        const defId = validId(x?.defId);
+        if (!defId || players[defId]) continue;
+        const net = netItems.get(defId);
+        players[defId] = {
+          defId,
+          name: String(x.name || defId).slice(0, 60),
+          rating: Number(x.rating) || 0,
+          rare: Number(net?.rare ?? 0),
+          minPrice: Number(x.price) >= 150 ? Math.round(Number(x.price)) : 0,
+          listings: 0,
+          collected: net?.collected === true || this.done.has(defId),
+          score: net?.score || 0,
+        };
+      }
+      if (!Object.keys(players).length) return this.log('Import fut.gg : aucun joueur lu sur la page'), null;
+      const set = { kind: 'futgg', slug: String(data.slug || data.name || 'set'), name: String(data.name || 'Set fut.gg').slice(0, 60), url: String(data.url || ''), needed: Number(data.needed) || 0, source: 'futgg', at: Date.now(), partial: false };
+      set.key = setKey(set);
+      const again = !!this.sets[set.key];
+      this.sets[set.key] = { ...set, players };
+      this.saveSets();
+      const priced = Object.values(players).filter((p) => p.minPrice).length;
+      this.log(`Set « ${set.name} » ${again ? 'mis à jour' : 'ajouté'} depuis fut.gg : ${Object.keys(players).length} joueur(s), ${priced} avec prix${set.needed ? `, ${set.needed} requis` : ''}`);
+      return set.key;
+    }
+
+    // --- Contrôles communs ---
+
     stop(msg = 'Arrêt demandé', byUser = false) {
-      if (byUser) save(K_ACTIVE, false);
+      if (byUser) {
+        save(K_ACTIVE, false);
+        save(K_WATCH, false);
+        this.cancelResume();
+      }
       this.stopRequested = true;
       this.wake?.();
       this.log(msg);
     }
-    unlock() {
-      this.guard.unlock();
-      this.log('Verrou levé manuellement');
-    }
     lockout(msg) {
-      save(K_ACTIVE, false);
-      this.guard.lock(LOCK_HOURS);
+      const cfg = this.getConfig();
+      const ms = this.guard.lock(cfg.lockMinutes);
+      const mode = this.mode;
       this.stopRequested = true;
       this.wake?.();
-      this.log(`${msg} : arrêt et verrou ${LOCK_HOURS} h. Résoudre un éventuel captcha à la main, ne pas relancer tout de suite.`);
+      if (cfg.lockMinutes > 0 && (mode === 'buy' || mode === 'watch')) {
+        save(K_LOCK_RESUME, { mode });
+        this.log(`${msg} : pause de ${fmtMin(ms)}, reprise automatique ensuite. Si EA affiche un captcha, le résoudre dans la Web App.`);
+        this.scheduleResume();
+      } else {
+        save(K_ACTIVE, false);
+        save(K_WATCH, false);
+        this.log(`${msg} : arrêt et verrou ${fmtMin(ms)}. Résoudre un éventuel captcha à la main.`);
+      }
+    }
+    // Reprise automatique de la tâche interrompue à la fin du verrou
+    scheduleResume() {
+      const intent = load(K_LOCK_RESUME, null);
+      if (!intent) return;
+      clearTimeout(this.resumeTimer);
+      const wait = Math.max(5e3, this.guard.lockedUntil() - Date.now() + rand(3e4, 9e4));
+      this.resumeAt = Date.now() + wait;
+      this.resumeTimer = setTimeout(() => void this.autoResume(), wait);
+      this.emit();
+    }
+    cancelResume() {
+      clearTimeout(this.resumeTimer);
+      this.resumeTimer = null;
+      this.resumeAt = 0;
+      save(K_LOCK_RESUME, null);
+    }
+    async autoResume() {
+      const intent = load(K_LOCK_RESUME, null);
+      this.resumeAt = 0;
+      if (!intent) return;
+      if (this.guard.lockedUntil() > Date.now()) return this.scheduleResume();
+      if (this.running) return;
+      save(K_LOCK_RESUME, null);
+      this.log('Fin du verrou : reprise automatique');
+      if (intent.mode === 'buy' && this.queue.some(isOpen)) await this.runQueue();
+      else await this.watch();
+    }
+    deferResume(mode) {
+      if (mode !== 'buy' && mode !== 'watch') return;
+      save(K_LOCK_RESUME, { mode });
+      this.scheduleResume();
     }
     sessionExpired() {
       const d = rand(6e4, 12e4);
       this.stop(`Session expirée (401) : rechargement de la Web App dans ${Math.round(d / 1e3)} s puis reprise`);
-      try {
-        localStorage.setItem(K_RESUME, String(Date.now() + d));
-      } catch {}
+      if (this.mode === 'buy') save(K_RESUME, Date.now() + d);
       setTimeout(() => location.reload(), d);
     }
-    resetCollected() {
-      this.collected.clear();
-      save(K_COLLECTED, []);
-      this.setStats = {};
-      save(K_SETSTATS, {});
-      this.total = { score: 0, bought: 0, tax: 0 };
-      save(K_TOTAL, this.total);
-      this.log('Historique des joueurs collectés effacé');
-    }
-    async scanClub(force = true) {
-      if (this.running && force) return this.log("Scan du club impossible pendant que l'album tourne");
-      this.log('Scan du club en cours…');
-      try {
-        const ids = await scanClubDefIds((n) => this.activity(`Scan du club : ${n} joueurs`));
-        this.clubOwned = ids;
-        save(K_CLUB, [...ids]);
-        save(K_CLUB_AT, Date.now());
-        this.log(`Scan du club terminé : ${ids.size} joueurs déjà possédés seront ignorés`);
-      } catch (e) {
-        this.log(`Scan du club impossible : ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        this.activity('');
+    unlock() {
+      this.guard.unlock();
+      this.log('Verrou levé manuellement');
+      if (load(K_LOCK_RESUME, null)) {
+        clearTimeout(this.resumeTimer);
+        void this.autoResume();
       }
     }
-    bumpSet(setId, field, n) {
-      const s = (this.setStats[setId] ??= { bought: 0, score: 0, spent: 0, sweeps: 0 });
-      s[field] = (s[field] ?? 0) + n;
-      save(K_SETSTATS, this.setStats);
+
+    // Erreur EA commune : renvoie true si la tâche doit s'arrêter
+    fatal(r, what) {
+      if (r.status === 401) return this.sessionExpired(), true;
+      if (BAD_STATUS.has(r.status)) return this.lockout(`Statut EA ${r.status} (captcha ou limite)`), true;
+      if (r.status === 403 && what === 'search') return this.stop(`Recherche refusée (403)${errText(r.error)}`), true;
+      return false;
+    }
+
+    // Attend que les quotas le permettent ; false si arrêt
+    async waitGuard(cfg) {
+      while (!this.stopRequested) {
+        const g = this.guard.check(cfg);
+        if (g.ok) return true;
+        if (g.locked) {
+          const mode = this.mode;
+          this.stopRequested = true;
+          this.log(`${g.stop}${mode === 'buy' || mode === 'watch' ? ' : reprise automatique à la fin' : ''}`);
+          this.deferResume(mode);
+          return false;
+        }
+        this.log(g.reason);
+        this.activity(`Quota atteint, reprise à ${clock(g.waitMs)}`);
+        await this.sleep(g.waitMs);
+      }
+      return false;
     }
 
     async otherBotRunning() {
@@ -675,459 +776,321 @@
         return false;
       }
     }
-    holdWebLock() {
-      if (navigator.locks && !this.releaseLock) navigator.locks.request(`${NS}-running`, () => new Promise((r) => (this.releaseLock = r)));
-    }
-
-    goalReached(cfg) {
-      return cfg.mode === 'level10' && cfg.targetScore > 0 && cfg.galleryScore + this.total.score >= cfg.targetScore;
-    }
-
-    validate(cfg, sets) {
-      if (!sets.some((s) => s.enabled)) return 'Ajouter ou activer au moins un ensemble';
-      if (cfg.minDelayMs < 0 || cfg.maxDelayMs < cfg.minDelayMs) return 'Délais entre recherches invalides (max ≥ min)';
-      if (cfg.buyDelayMinMs < 0 || cfg.buyDelayMaxMs < cfg.buyDelayMinMs) return 'Délais avant achat invalides (max ≥ min)';
-      if (cfg.maxSearchesPerHour < 1 || cfg.maxSearchesPerDay < 1 || cfg.maxPurchasesPerDay < 1) return 'Quotas invalides (≥ 1)';
-      if (cfg.maxBuysPerSearch < 1 || cfg.maxPagesPerStep < 1) return 'Achats par recherche et pages par palier ≥ 1';
-      return null;
-    }
-
-    async start() {
-      if (this.running || this.starting) return;
-      this.starting = true;
-      try {
-        await this.begin();
-      } finally {
-        this.starting = false;
-      }
-    }
-
-    async begin() {
-      let cfg = this.getConfig();
-      const err = (cfg.mode === 'level10' ? null : parseSets(cfg.sets).error) ?? this.validate(cfg, activeSets(cfg));
-      if (err) return this.log(err);
-      if (this.goalReached(cfg)) return save(K_ACTIVE, false), this.log(`Objectif déjà atteint (${cfg.galleryScore + this.total.score} pts estimés) : vérifie le niveau dans la Galerie`);
-      save(K_ACTIVE, true);
+    async enter(mode) {
+      if (this.running) return false;
       if (await this.otherBotRunning()) {
-        this.log('SnipeFC27 tourne : nouvel essai dans 5 min (quotas EA partagés)');
-        setTimeout(() => load(K_ACTIVE, false) && this.start(), 3e5);
-        return;
+        this.log('SnipeFC27 tourne : arrête-le avant (quotas EA partagés)');
+        return false;
       }
-      const g = this.guard.check(cfg);
-      if (!g.ok && 'stop' in g) return this.log(g.stop);
-
-      this.stats = { ...EMPTY_STATS, running: true, startedAt: Date.now(), feed: this.stats.feed };
+      const g = this.guard.check(this.getConfig());
+      if (g.locked) {
+        this.deferResume(mode);
+        this.log(`${g.stop}${mode === 'buy' || mode === 'watch' ? ' : démarrage automatique à la fin' : ''}`);
+        return false;
+      }
+      this.mode = mode;
       this.stopRequested = false;
-      this.seen.clear();
       this.misses = 0;
       this.listFails = 0;
-      this.cursor = { setId: null, stepIdx: 0, page: 1 };
-      this.holdWebLock();
-      const active = activeSets(cfg).length;
-      this.log(
-        cfg.mode === 'level10'
-          ? `Démarrage niveau 10 automatique (${cfg.galleryScore + this.total.score} / ${cfg.targetScore} pts estimés)`
-          : `Démarrage album (${active} ensemble${active > 1 ? 's' : ''}, revente ${cfg.markupPct > 0 ? `+${cfg.markupPct} %` : "au prix d'achat"})`,
-      );
-      if (cfg.skipClubOwned && cfg.autoScanClub && Date.now() - load(K_CLUB_AT, 0) > 12 * HOUR) await this.scanClub(false);
-      if (!galleryReport.probedAt) await this.reportGallery();
-      if (this.stopRequested) return this.finish();
-      await this.maintain();
-
-      let sessionStart = Date.now();
-      let sessionLen = cfg.sessionMinutes * 6e4 * rand(0.85, 1.15);
-      try {
-        while (!this.stopRequested) {
-          cfg = this.getConfig();
-          const sets = activeSets(cfg);
-          if (!sets.length) {
-            this.log('Aucun ensemble actif');
-            break;
-          }
-          if (this.goalReached(cfg)) {
-            save(K_ACTIVE, false);
-            this.log(`Objectif atteint : ${cfg.galleryScore + this.total.score} pts estimés. Vérifie le niveau 10 dans la Galerie et récupère la récompense`);
-            break;
-          }
-          if (cfg.stopAfterHours > 0 && Date.now() - this.stats.startedAt > cfg.stopAfterHours * HOUR) {
-            this.log(`Arrêt automatique après ${cfg.stopAfterHours} h`);
-            break;
-          }
-          if (cfg.maxSpend > 0 && this.stats.spent >= cfg.maxSpend) {
-            this.log(`Budget de la session atteint (${this.stats.spent} dépensés)`);
-            break;
-          }
-          if (this.pileFull) {
-            this.log('Liste de transferts pleine : attente de ventes (2 min)');
-            this.activity('Attente de ventes (liste de transferts pleine)');
-            await this.sleep(12e4);
-            await this.maintain();
-            continue;
-          }
-          const wallet = coins();
-          const available = wallet === null ? Infinity : wallet - cfg.coinReserve;
-          if (available < 200) {
-            this.log(`Crédits disponibles insuffisants (${wallet}) : attente de ventes (5 min)`);
-            this.activity('Attente de crédits (ventes en cours)');
-            await this.sleep(3e5);
-            await this.maintain();
-            continue;
-          }
-          const gc = this.guard.check(cfg);
-          if (!gc.ok) {
-            if ('stop' in gc) {
-              this.log(gc.stop);
-              break;
-            }
-            this.log(gc.reason);
-            this.activity(`Quota atteint, reprise à ${clock(gc.waitMs)}`);
-            await this.sleep(gc.waitMs);
-            continue;
-          }
-          if (cfg.sessionMinutes > 0 && Date.now() - sessionStart > sessionLen) {
-            const b = cfg.breakMinutes * 6e4 * rand(0.6, 1.4);
-            this.log(`Fin de session, pause de ${fmtMin(b)}`);
-            this.activity(`Pause de session jusqu'à ${clock(b)}`);
-            await this.sleep(b);
-            sessionStart = Date.now();
-            sessionLen = cfg.sessionMinutes * 6e4 * rand(0.85, 1.15);
-            continue;
-          }
-
-          if (cfg.mode === 'level10') {
-            const r = await this.level10Step(cfg, available);
-            if (r === 'stop') break;
-            if (r === 'idle') {
-              const w = 10 * 6e4 * rand(0.8, 1.2);
-              this.activity(`Aucun joueur manquant rentable pour l'instant, nouveau repérage à ${clock(w)}`);
-              await this.sleep(w);
-              await this.maintain();
-              continue;
-            }
-          } else if (await this.customStep(sets, cfg, available)) break;
-          if (this.stopRequested) break;
-          if (Date.now() - this.lastMaintain > MAINTAIN_EVERY_MS) {
-            await sleep(rand(600, 1400));
-            await this.maintain();
-          }
-          const d = rand(cfg.minDelayMs, cfg.maxDelayMs);
-          this.activity(`Prochaine recherche dans ${Math.round(d / 1e3)} s`);
-          await this.sleep(d);
-        }
-      } catch (e) {
-        this.log(`Erreur : ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        this.finish();
-      }
+      if (navigator.locks && !this.releaseLock) navigator.locks.request(`${NS}-running`, () => new Promise((r) => (this.releaseLock = r)));
+      this.touch();
+      this.emit();
+      return true;
     }
-
-    finish() {
-      this.stats.running = false;
-      this.stats.activity = '';
+    leave() {
+      this.mode = null;
+      this.scanningKey = null;
+      this.activityText = '';
       this.releaseLock?.();
       this.releaseLock = null;
-      this.log('Arrêté');
+      this.touch();
+      this.emit();
+    }
+    // Interrompt le suivi des ventes pour laisser la place à une autre tâche
+    async stopWatch() {
+      if (this.mode !== 'watch') return;
+      this.stopRequested = true;
+      this.wake?.();
+      while (this.mode === 'watch') await sleep(200);
     }
 
-    async reportGallery() {
-      this.activity('Détection de la Galerie');
+    // --- Scan du marché d'un club (secours) ---
+
+    async scanClub(club) {
+      await this.stopWatch();
+      if (!club?.club) return this.log("Choisis d'abord un club");
+      const base = { kind: 'club', club: club.club, league: club.league ?? null, name: club.name, source: 'market', needed: 0 };
+      const key = setKey(base);
+      if (!(await this.enter('scan'))) return;
+      const cfg = this.getConfig();
+      const players = {};
+      this.sets[key] = { ...base, key, at: Date.now(), partial: true, searches: 0, players };
+      this.scanningKey = key;
+      this.saveSets();
+      const bounds = [...BOUNDS.filter((b) => b < cfg.scanMaxPrice), cfg.scanMaxPrice];
+      this.log(`Scan du club « ${club.name} » (${bounds.length} tranches de prix, ${cfg.scanMaxSearches} recherches max)`);
+      let searches = 0;
       try {
-        const r = await probeGallery();
-        const ok = r.calls.filter((c) => !c.error && !c.result?.timeout).length;
-        this.log(
-          r.apis.length
-            ? `Galerie : ${r.apis.length} module(s) détecté(s) (${r.apis.map((a) => a.path).join(', ')}), ${ok} lecture(s) réussie(s)`
-            : 'Galerie : statut collecté et score lus dans les réponses EA de chaque carte',
-        );
+        outer: for (let s = 0; s < bounds.length; s++) {
+          const lo = s === 0 ? 0 : bounds[s - 1];
+          const hi = bounds[s];
+          for (let page = 1; page <= cfg.scanPagesPerSlice; page++) {
+            if (this.stopRequested || searches >= cfg.scanMaxSearches) break outer;
+            if (!(await this.waitGuard(cfg))) break outer;
+            this.activity(`Scan ${club.name} : ${lo}–${hi}, page ${page} (${searches + 1}/${cfg.scanMaxSearches})`);
+            const res = await searchMarket({ club: club.club }, lo, hi, page);
+            searches++;
+            this.guard.record('searches');
+            if (!res.success) {
+              if (this.fatal(res, 'search')) break outer;
+              this.log(`Recherche en échec (statut ${res.status})${errText(res.error)}`);
+              break;
+            }
+            let fresh = 0;
+            for (const it of res.data) {
+              if (!it.defId || !(it.buyNow > 0)) continue;
+              const p = players[it.defId];
+              if (!p) {
+                fresh++;
+                players[it.defId] = { defId: it.defId, name: it.name, rating: it.rating, rare: it.rare, minPrice: it.buyNow, listings: 1, collected: it.collected, score: it.score };
+              } else {
+                p.minPrice = Math.min(p.minPrice, it.buyNow);
+                p.listings++;
+                p.collected ||= it.collected;
+                p.score ||= it.score;
+              }
+            }
+            this.sets[key].searches = searches;
+            this.saveSets();
+            this.feed(`${lo}–${hi} p.${page} : ${res.data.length} annonce(s), ${fresh} nouvelle(s) carte(s)`);
+            if (res.data.length < PAGE_SIZE) break;
+            await this.sleep(rand(cfg.minDelayMs, cfg.maxDelayMs));
+          }
+          if (s + 1 < bounds.length && searches < cfg.scanMaxSearches) await this.sleep(rand(cfg.minDelayMs, cfg.maxDelayMs));
+        }
+        this.sets[key].partial = this.stopRequested || searches >= cfg.scanMaxSearches;
+        this.saveSets();
+        const list = this.setPlayers(this.sets[key]);
+        this.log(`Scan terminé : ${list.length} carte(s) du club sur le marché, ${list.filter((p) => !p.collected).length} manquante(s)${this.sets[key].partial ? ' (scan partiel)' : ''}`);
       } catch (e) {
-        this.log(`Détection Galerie impossible : ${e instanceof Error ? e.message : String(e)}`);
+        this.log(`Erreur scan : ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        this.leave();
       }
     }
 
-    // true = arrêter la boucle
-    searchFailed(res, label) {
-      if (res.status === 401) {
-        this.sessionExpired();
-        return true;
-      }
-      if (BAD_STATUS.has(res.status)) {
-        this.lockout(`Statut EA ${res.status} (captcha ou limite)`);
-        return true;
-      }
-      if (res.status === 403) {
-        this.stop(`Recherche refusée (403)${errText(res.error)} (${label})`);
-        return true;
-      }
-      this.log(`Recherche en échec (statut ${res.status})${errText(res.error)}`);
-      return false;
+    // --- Achat puis remise en vente immédiate, tous sets confondus ---
+
+    async validate() {
+      await this.stopWatch();
+      if (this.running) return;
+      const { list } = this.picks();
+      if (!list.length) return this.log('Aucun joueur coché avec un prix max');
+      const setOf = (defId) => this.setList().find((s) => s.players?.[defId])?.name ?? '';
+      const pct = this.getConfig().autoRaisePct;
+      this.queue = list.map(({ p, max }) => ({ defId: p.defId, name: p.name, rating: p.rating, max, max0: max, cap: capFor(max, pct), set: setOf(p.defId), status: 'pending', tries: 0, price: 0, sell: 0 }));
+      save(K_QUEUE, this.queue);
+      this.touch();
+      await this.runQueue();
     }
 
-    // Joueurs 84+ repérés dans les réponses EA, pas encore dans la Galerie, au meilleur rapport points / crédits
-    level10Candidates(cfg, available) {
-      const ratio = maxRatio(cfg);
-      const now = Date.now();
-      const out = [];
-      for (const [defId, it] of netItems) {
-        if (it.collected || this.owns(defId) || (this.cooldown.get(defId) ?? 0) > now) continue;
-        if (it.rating < LEVEL10_SET.minRating || !(it.score > 0) || !(it.avg > 0)) continue;
-        const price = roundUp(it.avg);
-        if (price > available || price > LEVEL10_SET.maxPrice || (ratio > 0 && price / it.score > ratio)) continue;
-        out.push({ defId, rating: it.rating, score: it.score, price });
+    async runQueue() {
+      await this.stopWatch();
+      if (!this.queue.some(isOpen)) return this.log('Rien à acheter');
+      if (!(await this.enter('buy'))) return;
+      save(K_ACTIVE, true);
+      const n = this.queue.length;
+      const cfg = this.getConfig();
+      const sets = new Set(this.queue.map((q) => q.set).filter(Boolean));
+      this.log(`Achat et revente de ${n} joueur(s)${sets.size ? ` (${sets.size} set${sets.size > 1 ? 's' : ''})` : ''}`);
+      let completed = false;
+      try {
+        await this.maintain();
+        for (const e of this.queue) {
+          if (this.stopRequested) break;
+          if (e.status === 'searching') e.status = 'pending';
+          if (e.status !== 'pending') continue;
+          await this.buyOne(e);
+          save(K_QUEUE, this.queue);
+          this.touch();
+          this.emit();
+          await this.sleep(rand(cfg.minDelayMs, cfg.maxDelayMs));
+        }
+        if (!this.stopRequested) {
+          save(K_ACTIVE, false);
+          const ok = this.queue.filter(isDone).length;
+          this.log(`Achats terminés : ${ok}/${n} joueur(s) achetés et remis en vente. Vérifie les sets dans la Galerie.`);
+          completed = true;
+        }
+      } catch (err) {
+        this.log(`Erreur : ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        for (const e of this.queue) if (e.status === 'searching') e.status = 'pending';
+        save(K_QUEUE, this.queue);
+        this.leave();
       }
-      return out.sort((a, b) => b.score / b.price - a.score / a.price);
+      if (completed) await this.watch();
     }
 
-    async level10Step(cfg, available) {
-      this.l10Iter++;
-      const cands = this.level10Candidates(cfg, available);
-      if (cands.length && this.l10Iter % 4 !== 0) return this.level10Target(cands[0], cands.length, cfg, available);
-      return this.level10Discover(cfg, available, cands.length);
+    async buyOne(e) {
+      const cfg = this.getConfig();
+      e.max0 ??= e.max;
+      e.cap ??= e.max;
+      let raised = false;
+      // Essais au prix max courant ; chaque recherche vide relève le max (plafond e.cap) et accorde un essai de plus
+      while (!this.stopRequested && (e.tries < cfg.triesPerPlayer || raised)) {
+        raised = false;
+        if (this.pileCount >= PILE_MAX) {
+          this.activity('Liste de transferts pleine : attente de ventes');
+          this.log('Liste de transferts pleine (100) : attente de ventes, nouvel essai dans 2 min');
+          await this.sleep(12e4);
+          await this.maintain();
+          continue;
+        }
+        const wallet = coins();
+        const available = wallet === null ? Infinity : wallet - cfg.coinReserve;
+        if (available < 200) {
+          e.status = 'nocoins';
+          return this.feed(`${e.name} : crédits insuffisants (${fmtNum(wallet)})`);
+        }
+        if (!(await this.waitGuard(cfg))) return;
+        e.status = 'searching';
+        e.tries++;
+        this.activity(`Recherche ${e.name} ≤ ${fmtNum(e.max)}${e.max > e.max0 ? ` (relevé, plafond ${fmtNum(e.cap)})` : ''}, essai ${e.tries}`);
+        // minBuy alterné : contourne le cache EA sans exclure d'annonce (prix mini 200)
+        const res = await searchMarket({ defId: [e.defId] }, e.tries % 2 ? 0 : 150, e.max);
+        this.guard.record('searches');
+        if (!res.success) {
+          if (this.fatal(res, 'search')) return;
+          this.feed(`${e.name} : recherche en échec (statut ${res.status})`);
+        } else {
+          if (res.data[0]?.collected) {
+            e.status = 'notfound';
+            this.markCollected(e.defId);
+            return this.feed(`${e.name} : déjà dans la Galerie, ignoré`);
+          }
+          const cands = res.data
+            .filter((it) => it.defId === e.defId && it.buyNow > 0 && it.buyNow <= e.max && it.buyNow <= available && !(it.expires > 0 && it.expires <= 3))
+            .sort((a, b) => a.buyNow - b.buyNow)
+            .slice(0, 2);
+          const missed = new Set();
+          for (const it of cands) {
+            // Autres annonces encore en vente (hors carte achetée et annonces ratées, parties chez un autre)
+            const others = res.data.filter((x) => x.defId === e.defId && x.buyNow > 0 && x.tradeId !== it.tradeId && !missed.has(x.tradeId));
+            const r = await this.buyAndList(it, e, cfg, others);
+            if (r === 'stop' || r === 'ok') return;
+            missed.add(it.tradeId);
+          }
+          const listed = res.data.some((x) => x.defId === e.defId && x.buyNow > 0 && x.buyNow <= e.max);
+          if (!listed && e.max < e.cap) {
+            const prev = e.max;
+            e.max = raisePrice(e.max, e.cap);
+            raised = true;
+            this.feed(`${e.name} : aucune annonce ≤ ${fmtNum(prev)}, prix max relevé à ${fmtNum(e.max)}${e.max >= e.cap ? ' (plafond)' : ''}`);
+          } else if (!cands.length) this.feed(`${e.name} : aucune annonce ≤ ${fmtNum(e.max)}${listed ? ' achetable (crédits)' : ''}`);
+        }
+        if (e.tries < cfg.triesPerPlayer || raised) await this.sleep(rand(cfg.minDelayMs, cfg.maxDelayMs));
+      }
+      if (!this.stopRequested && isOpen(e)) {
+        e.status = 'notfound';
+        this.log(`${e.name} introuvable ≤ ${fmtNum(e.max)} après ${e.tries} recherche(s)`);
+      }
     }
 
-    // Recherche ciblée d'un joueur manquant, achat au prix moyen du marché au plus
-    async level10Target(c, n, cfg, available) {
-      this.activity(`Niveau 10 : joueur ${c.rating} manquant (+${c.score} pts) ≤ ${c.price}, ${n} repéré${n > 1 ? 's' : ''}`);
-      const res = await searchMarket({ criteria: { defId: [c.defId] } }, 0, c.price, 1);
-      this.stats.searches++;
-      this.guard.recordSearch();
-      if (!res.success) return this.searchFailed(res, 'recherche ciblée') ? 'stop' : 'ok';
-      const offers = res.data
-        .filter((it) => it.defId === c.defId && it.buyNow > 0 && it.buyNow <= c.price && it.buyNow <= available && !this.seen.has(it.tradeId) && !(it.expires > 0 && it.expires <= 3) && !it.collected)
-        .sort((a, b) => a.buyNow - b.buyNow);
-      if (!offers.length) {
-        this.cooldown.set(c.defId, Date.now() + 30 * 6e4);
-        this.feed(`Joueur ${c.rating} (+${c.score} pts) : aucune annonce ≤ ${c.price}, réessai dans 30 min`);
-        return 'ok';
-      }
-      const it = offers[0];
-      it.score = c.score;
-      this.seen.add(it.tradeId);
-      const r = await this.buyAndList(it, LEVEL10_SET, cfg);
-      if (r === 'stopped') return 'stop';
-      if (r === 'missed') {
-        this.cooldown.set(c.defId, Date.now() + 5 * 6e4);
+    markCollected(defId) {
+      this.done.add(defId);
+      save(K_DONE, [...this.done]);
+      for (const s of Object.values(this.sets)) if (s.players?.[defId]) s.players[defId].collected = true;
+      this.saveSets();
+    }
+
+    // Revente : un palier sous la moins chère des autres annonces (50 sous 1 000), sinon prix d'achat
+    sellPrice(it, others) {
+      if (!others.length) return it.buyNow;
+      return Math.max(200, priceDown(Math.min(...others.map((x) => x.buyNow))));
+    }
+
+    async buyAndList(it, e, cfg, others = []) {
+      await sleep(rand(cfg.buyDelayMinMs, cfg.buyDelayMaxMs));
+      if (this.stopRequested) return 'stop';
+      this.activity(`Achat de ${it.name} à ${fmtNum(it.buyNow)}…`);
+      const r = await bid(it);
+      if (!r.success) {
+        if (this.fatal(r, 'bid')) return 'stop';
+        this.feed(`Raté ${it.name} à ${fmtNum(it.buyNow)} (${r.status === 403 ? 'déjà acheté par un autre' : `statut ${r.status}`})`);
         if (++this.misses >= MAX_MISSES) {
           this.lockout(`${this.misses} achats ratés d'affilée, soft ban probable`);
           return 'stop';
         }
-      } else this.misses = 0;
-      return 'ok';
-    }
-
-    // Balayage du marché or (1 000 à 15 000) pour repérer les joueurs 84+ manquants et leur prix moyen
-    async level10Discover(cfg, available, known) {
-      const set = { ...LEVEL10_SET, minPrice: 1000 };
-      const steps = ladder(set.maxPrice, set.minPrice);
-      const cur = this.l10Cursor;
-      if (cur.stepIdx >= steps.length) Object.assign(cur, { stepIdx: 0, page: 1 });
-      const lo = cur.stepIdx > 0 ? steps[cur.stepIdx - 1] : set.minPrice;
-      const hi = steps[cur.stepIdx];
-      this.activity(`Niveau 10 : repérage ${lo}–${hi}, page ${cur.page} (${known} joueur${known > 1 ? 's' : ''} repéré${known > 1 ? 's' : ''})`);
-      const res = await searchMarket(set, lo, hi, cur.page);
-      this.stats.searches++;
-      this.guard.recordSearch();
-      if (!res.success) return this.searchFailed(res, 'repérage') ? 'stop' : 'ok';
-      const outcome = await this.handleResults(set, res.data, available, cfg);
-      if (outcome === 'stopped') return 'stop';
-      if (outcome !== 'again') {
-        if (res.data.length >= PAGE_SIZE && cur.page < cfg.maxPagesPerStep) cur.page++;
-        else if (cur.stepIdx + 1 < steps.length) Object.assign(cur, { stepIdx: cur.stepIdx + 1, page: 1 });
-        else {
-          Object.assign(cur, { stepIdx: 0, page: 1 });
-          const n = this.level10Candidates(cfg, available).length;
-          this.log(`Repérage complet : ${n} joueurs 84+ manquants achetables repérés`);
-          if (!n) return 'idle';
-        }
+        return 'miss';
       }
-      return 'ok';
-    }
-
-    // Ensembles personnalisés : balayage par paliers ; renvoie true s'il faut arrêter la boucle
-    async customStep(sets, cfg, available) {
-      let idx = sets.findIndex((s) => s.id === this.cursor.setId);
-      if (idx < 0) {
-        idx = 0;
-        this.cursor = { setId: sets[0].id, stepIdx: 0, page: 1 };
-      }
-      const set = sets[idx];
-      const steps = ladder(set.maxPrice, set.minPrice ?? 0);
-      const lo = this.cursor.stepIdx > 0 ? steps[this.cursor.stepIdx - 1] : (set.minPrice ?? 0);
-      if (lo >= available) {
-        this.feed(`${set.label} : paliers suivants au-dessus des crédits disponibles (${Math.floor(available)})`);
-        if (await this.nextSet(sets, idx, cfg)) return true;
-        return false;
-      }
-      const hi = steps[this.cursor.stepIdx];
-      this.activity(`${set.label} : ${lo}–${hi}, page ${this.cursor.page}`);
-      const res = await searchMarket(set, lo, hi, this.cursor.page);
-      this.stats.searches++;
-      this.guard.recordSearch();
-
-      if (!res.success) {
-        if (this.searchFailed(res, set.label)) return true;
-      } else {
-        const outcome = await this.handleResults(set, res.data, available, cfg);
-        if (outcome === 'stopped' || this.stopRequested) return true;
-        const more = res.data.length >= PAGE_SIZE && this.cursor.page < cfg.maxPagesPerStep;
-        if (outcome === 'again') this.feed(`${set.label} : joueurs manquants restants, même page`);
-        else if (more) this.cursor.page++;
-        else if (this.cursor.stepIdx + 1 < steps.length) this.cursor = { ...this.cursor, stepIdx: this.cursor.stepIdx + 1, page: 1 };
-        else if (await this.nextSet(sets, idx, cfg)) return true;
-      }
-      return false;
-    }
-
-    // Passe à l'ensemble suivant ; renvoie true s'il faut arrêter la boucle.
-    async nextSet(sets, idx, cfg) {
-      const set = sets[idx];
-      this.bumpSet(set.id, 'sweeps', 1);
-      const s = this.setStats[set.id] ?? {};
-      this.log(`Ensemble « ${set.label} » balayé (${s.bought ?? 0} joueurs collectés au total, score Galerie +${s.score ?? 0})`);
-      if (idx + 1 < sets.length) {
-        this.cursor = { setId: sets[idx + 1].id, stepIdx: 0, page: 1 };
-        return false;
-      }
-      if (cfg.resweepMinutes <= 0) {
-        this.log('Tous les ensembles ont été balayés');
-        return true;
-      }
-      const w = cfg.resweepMinutes * 6e4 * rand(0.85, 1.15);
-      this.log(`Tous les ensembles balayés, nouveau passage à ${clock(w)} (nouvelles annonces)`);
-      this.activity(`Nouveau passage à ${clock(w)}`);
-      this.seen.clear();
-      this.cursor = { setId: sets[0].id, stepIdx: 0, page: 1 };
-      await this.sleep(w);
-      await this.maintain();
-      return false;
-    }
-
-    async handleResults(set, items, available, cfg) {
-      const best = new Map();
-      for (const it of items) {
-        if (this.seen.has(it.tradeId) || !(it.buyNow > 0) || it.buyNow > set.maxPrice || it.buyNow > available) continue;
-        if (it.expires > 0 && it.expires <= 3) continue;
-        if (it.rating < set.minRating || it.rating > set.maxRating) continue;
-        if (!it.defId || this.owns(it.defId)) continue;
-        if (it.collected === true) {
-          this.collected.add(it.defId);
-          continue;
-        }
-        if (cfg.skipClubOwned && it.duplicate) {
-          this.clubOwned.add(it.defId);
-          continue;
-        }
-        const ratio = maxRatio(cfg);
-        if (ratio > 0 && it.buyNow / it.score > ratio) continue;
-        const prev = best.get(it.defId);
-        if (!prev || it.buyNow < prev.buyNow) best.set(it.defId, it);
-      }
-      if (flagKey && !this.flagLogged) {
-        this.flagLogged = true;
-        this.log(`Marqueur Galerie détecté sur les cartes (${flagKey}) : joueurs déjà dans la Galerie ignorés`);
-      }
-      const picks = [...best.values()].sort((a, b) => b.score / b.buyNow - a.score / a.buyNow).slice(0, cfg.maxBuysPerSearch);
-      this.feed(`${set.label} : ${items.length} annonce${items.length > 1 ? 's' : ''}, ${best.size} joueur${best.size > 1 ? 's' : ''} manquant${best.size > 1 ? 's' : ''}${picks.length ? ' → achat' : ''}`);
-      let budget = available;
-      let tried = 0;
-      for (const it of picks) {
-        if (this.stopRequested) return 'stopped';
-        if (it.buyNow > budget) continue;
-        if (cfg.maxSpend > 0 && this.stats.spent + it.buyNow > cfg.maxSpend) break;
-        this.seen.add(it.tradeId);
-        tried++;
-        const r = await this.buyAndList(it, set, cfg);
-        if (r === 'stopped') return 'stopped';
-        if (r === 'bought') {
-          budget -= it.buyNow;
-          this.misses = 0;
-        } else if (r === 'missed' && ++this.misses >= MAX_MISSES) {
-          this.lockout(`${this.misses} achats ratés d'affilée, soft ban probable`);
-          return 'stopped';
-        }
-        await sleep(rand(cfg.buyDelayMinMs, cfg.buyDelayMaxMs));
-      }
-      // Joueurs manquants restants sur cette page : on la refait avant d'avancer
-      return tried > 0 && best.size > tried ? 'again' : 'ok';
-    }
-
-    async buyAndList(it, set, cfg) {
-      this.activity(`Achat de ${it.name} (${it.rating}) à ${it.buyNow}…`);
-      await sleep(rand(cfg.buyDelayMinMs, cfg.buyDelayMaxMs));
-      if (this.stopRequested) return 'stopped';
-      this.stats.attempts++;
-      const r = await bid(it);
-      if (!r.success) {
-        if (r.status === 401) {
-          this.sessionExpired();
-          return 'stopped';
-        }
-        if (BAD_STATUS.has(r.status)) {
-          this.lockout(`Statut EA ${r.status} (captcha ou limite)`);
-          return 'stopped';
-        }
-        const why = r.status === 403 ? 'déjà achetée par un autre' : `statut ${r.status}`;
-        this.feed(`Raté ${it.name} à ${it.buyNow} (${why})`);
-        return 'missed';
-      }
-      const score = it.score;
-      this.stats.purchases++;
-      this.stats.spent += it.buyNow;
-      this.stats.scoreAdded += score;
-      this.addTotal('score', score);
+      this.misses = 0;
+      this.guard.record('purchases');
+      e.price = it.buyNow;
+      e.status = 'bought';
+      this.markCollected(e.defId);
+      this.setSelected(e.defId, false);
       this.addTotal('bought', 1);
-      this.guard.recordPurchase();
-      this.collected.add(it.defId);
-      save(K_COLLECTED, [...this.collected]);
-      const known = netItems.get(it.defId);
-      if (known) known.collected = true;
-      this.bumpSet(set.id, 'bought', 1);
-      this.bumpSet(set.id, 'score', score);
-      this.bumpSet(set.id, 'spent', it.buyNow);
-      this.log(`Collecté ${it.name} (${it.rating}) à ${it.buyNow}, +${score} pts Galerie, pour « ${set.label} »`);
+      this.addTotal('spent', it.buyNow);
+      this.log(`Acheté ${it.name} à ${fmtNum(it.buyNow)}${e.set ? ` (${e.set})` : ''}`);
 
       const id = Number(it.raw?.id);
-      const sell = sellPriceFor(it.buyNow, cfg.markupPct);
       if (id) {
-        this.bought[id] = { price: it.buyNow, defId: it.defId, sell };
+        this.bought[id] = { price: it.buyNow, sell: 0, defId: e.defId, name: it.name };
         save(K_BOUGHT, this.bought);
       }
-      if (this.pileFull) {
-        this.log('Liste de transferts pleine : joueur laissé dans les non-assignés (il compte déjà pour la Galerie)');
-        return 'bought';
-      }
       await sleep(rand(800, 1600));
+      if (this.stopRequested) return 'ok';
+      const sell = this.sellPrice(it, others);
       const l = await moveAndList(it.raw, sell);
       if (l.success) {
         this.listFails = 0;
-        this.feed(`${it.name} remis en vente à ${sell}`);
+        this.pileCount++;
+        e.status = 'listed';
+        e.sell = sell;
+        if (this.bought[id]) {
+          this.bought[id].sell = sell;
+          save(K_BOUGHT, this.bought);
+        }
+        this.feed(`${it.name} remis en vente à ${fmtNum(sell)} (${others.length ? `${others.length} autre(s) annonce(s), plus basse ${fmtNum(Math.min(...others.map((x) => x.buyNow)))}` : "aucune autre annonce : prix d'achat"})`);
       } else {
-        this.log(`Mise en vente de ${it.name} échouée (statut ${l.status}), joueur dans les non-assignés`);
-        if (++this.listFails >= MAX_LIST_FAILS) this.stop(`${this.listFails} mises en vente échouées d'affilée : non-assignés probablement pleins, arrêt`);
+        if (this.fatal(l, 'list')) return 'stop';
+        this.log(`Mise en vente de ${it.name} échouée (statut ${l.status})${errText(l.error)} : joueur dans les non-assignés`);
+        if (++this.listFails >= MAX_LIST_FAILS) {
+          this.stop(`${this.listFails} mises en vente échouées d'affilée, arrêt`);
+          return 'stop';
+        }
       }
-      return 'bought';
+      return 'ok';
     }
+
+    // --- Ventes : encaissement, réajustement des invendus ---
 
     async maintain() {
       this.activity('Lecture de la liste de transferts');
-      this.lastMaintain = Date.now();
       try {
         const pile = await readTransferPile();
-        if (!pile.success) return this.log(`Lecture de la liste de transferts impossible (statut ${pile.status})${errText(pile.error)}`);
+        if (!pile.success) {
+          if (pile.status === 401) return this.sessionExpired();
+          return this.log(`Lecture de la liste de transferts impossible (statut ${pile.status})${errText(pile.error)}`);
+        }
         const sold = pile.data.filter((i) => i.state === 'sold');
         const expired = pile.data.filter((i) => i.state === 'expired');
         for (const i of sold) {
           const net = Math.floor(i.soldPrice * (1 - EA_TAX));
-          this.stats.sold++;
-          this.stats.revenue += net;
-          this.stats.taxPaid += i.soldPrice - net;
-          if (this.bought[i.id]) this.addTotal('tax', i.soldPrice - net);
+          const tax = i.soldPrice - net;
           const b = this.bought[i.id];
-          if (b) {
-            this.stats.netCost += b.price - net;
+          let result = '';
+          if (b !== undefined) {
+            // Perte = prix d'achat - montant net encaissé (négatif = gain)
+            const loss = (typeof b === 'number' ? b : b.price) - net;
+            this.addTotal('tax', tax);
+            this.addTotal('lost', loss);
+            this.addTotal('sold', 1);
             delete this.bought[i.id];
-            delete this.expiries[i.id];
+            result = loss >= 0 ? `, perte ${fmtNum(loss)}` : `, gain ${fmtNum(-loss)}`;
           }
-          this.log(`Vendu ${i.name} à ${i.soldPrice} (net ${net}${b ? `, coût de l'opération ${b.price - net}` : ''})`);
+          this.feed(`Vendu ${i.name} à ${fmtNum(i.soldPrice)} (taxe ${fmtNum(tax)}${result})`);
         }
         save(K_BOUGHT, this.bought);
         if (sold.length) {
@@ -1135,42 +1098,103 @@
           const c = await observe(services.Item.clearSoldItems?.());
           if (!c.success) this.log(`Encaissement des ventes échoué (statut ${c.status})${errText(c.error)}`);
         }
-
         const cfg = this.getConfig();
-        let bulk = 0;
+        const adjusted = new Set();
         for (const i of expired) {
+          if (this.stopRequested) break;
           const b = this.bought[i.id];
-          const n = b ? (this.expiries[i.id] = (this.expiries[i.id] ?? 0) + 1) : 0;
-          if (b && i.raw && cfg.dropAfterExpiries > 0 && n >= cfg.dropAfterExpiries) {
-            const cur = i.buyNow || b.sell || b.price;
-            const price = Math.max(200, priceDown(cur));
-            await sleep(rand(500, 1200));
-            const r = await listItem(i.raw, price);
-            this.feed(r.success ? `${i.name} invendu ${n} fois, remis à ${price}` : `Remise en vente de ${i.name} échouée (statut ${r.status})`);
-            if (r.success) b.sell = price;
-          } else bulk++;
+          if (!b || !i.raw) continue;
+          const rec = typeof b === 'number' ? (this.bought[i.id] = { price: b, sell: 0, defId: i.defId, name: i.name }) : b;
+          const r = await this.readjust(i, rec, cfg);
+          if (r === 'stop') return;
+          if (r === 'ok') adjusted.add(i.id);
         }
-        save(K_EXPIRIES, this.expiries);
         save(K_BOUGHT, this.bought);
-        if (bulk) {
+        if (this.stopRequested) return;
+        const rest = expired.length - adjusted.size;
+        if (rest > 0) {
           await sleep(rand(500, 1200));
           const r = await observe(services.Item.relistExpiredAuctions?.());
-          this.log(r.success ? `${bulk} annonce(s) expirée(s) remise(s) en vente au même prix` : `Remise en vente des expirés échouée (statut ${r.status})${errText(r.error)}`);
+          this.feed(r.success ? `${rest} invendu(s) remis en vente au même prix` : `Remise en vente des invendus échouée (statut ${r.status})`);
         }
-        const remaining = pile.data.length - sold.length;
-        this.stats.listed = pile.data.filter((i) => i.state === 'active' || i.state === 'expired').length;
-        this.pileFull = remaining >= PILE_MAX;
-        this.feed(`Liste de transferts : ${pile.data.filter((i) => i.state === 'active').length} en vente, ${sold.length} vendu(s), ${expired.length} expiré(s)`);
+        this.pileCount = pile.data.length - sold.length;
+        const inPile = new Set(pile.data.filter((i) => i.state !== 'sold').map((i) => String(i.id)));
+        // Joueurs vendus ou retirés hors extension : plus suivis
+        for (const id of Object.keys(this.bought)) if (!inPile.has(id)) delete this.bought[id];
+        save(K_BOUGHT, this.bought);
+        this.ownListed = Object.keys(this.bought).length;
+        this.feed(`Liste de transferts : ${pile.data.filter((i) => i.state === 'active').length} en vente, ${sold.length} vendu(s), ${expired.length} invendu(s)`);
         await observe(services.User.requestCurrencies?.());
-        this.onUpdate(this.snapshot());
       } catch (e) {
-        this.log(`Maintenance liste de transferts : ${e instanceof Error ? e.message : String(e)}`);
+        this.log(`Liste de transferts : ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        this.activity('');
+      }
+    }
+
+    // Invendu acheté par l'extension : un palier sous la moins chère des annonces concurrentes, sinon même prix
+    async readjust(i, b, cfg) {
+      const cur = i.buyNow || b.sell || b.price;
+      const defId = b.defId || i.defId;
+      let price = cur;
+      let others = 0;
+      if (defId) {
+        if (!(await this.waitGuard(cfg))) return 'stop';
+        await this.sleep(rand(cfg.minDelayMs, cfg.maxDelayMs));
+        if (this.stopRequested) return 'stop';
+        this.activity(`Prix de ${i.name} (invendu à ${fmtNum(cur)})`);
+        b.checks = (b.checks ?? 0) + 1;
+        const res = await searchMarket({ defId: [defId] }, b.checks % 2 ? 0 : 150, cur);
+        this.guard.record('searches');
+        if (!res.success) {
+          if (this.fatal(res, 'search')) return 'stop';
+        } else {
+          const lows = res.data.filter((x) => x.defId === defId && x.buyNow > 0).map((x) => x.buyNow);
+          others = lows.length;
+          if (others) price = Math.min(cur, Math.max(200, priceDown(Math.min(...lows))));
+        }
+      }
+      if (cfg.minSellPct > 0) price = Math.max(price, Math.min(cur, roundUp((b.price * cfg.minSellPct) / 100)));
+      await sleep(rand(500, 1200));
+      const r = await listItem(i.raw, price);
+      if (!r.success) {
+        if (this.fatal(r, 'list')) return 'stop';
+        this.feed(`Remise en vente de ${i.name} échouée (statut ${r.status})`);
+        return 'fail';
+      }
+      b.sell = price;
+      this.feed(price < cur ? `${i.name} invendu : ${fmtNum(cur)} → ${fmtNum(price)} (${others} annonce(s) moins chère(s) ou égale(s))` : `${i.name} invendu : remis à ${fmtNum(price)} (personne en dessous)`);
+      return 'ok';
+    }
+
+    // Suivi des ventes : encaisse et réajuste les invendus jusqu'à ce que tout soit vendu
+    async watch() {
+      if (this.busy) return;
+      if (!(await this.enter('watch'))) return;
+      save(K_WATCH, true);
+      this.log(`Suivi des ventes : encaissement et réajustement des invendus toutes les ${this.getConfig().watchMinutes} min`);
+      try {
+        while (!this.stopRequested) {
+          await this.maintain();
+          if (this.stopRequested) break;
+          if (!this.ownListed) {
+            save(K_WATCH, false);
+            this.log('Plus aucun joueur acheté en vente : suivi terminé');
+            break;
+          }
+          const d = Math.max(1, this.getConfig().watchMinutes) * 6e4 * rand(0.8, 1.2);
+          this.activity(`${this.ownListed} joueur(s) en vente, prochain contrôle à ${clock(d)}`);
+          await this.sleep(d);
+        }
+      } catch (e) {
+        this.log(`Suivi des ventes : ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        this.leave();
       }
     }
 
     async sleep(ms) {
       if (this.stopRequested) return;
-      const end = Date.now() + ms;
       await new Promise((resolve) => {
         const done = () => {
           clearTimeout(t);
@@ -1180,22 +1204,7 @@
         const t = setTimeout(done, ms);
         this.wake = done;
       });
-      const late = Date.now() - end;
-      if (late > 2e4 && Date.now() - this.lastThrottleWarn > 6e5) {
-        this.lastThrottleWarn = Date.now();
-        this.log(`Attention : pause rallongée de ${Math.round(late / 1e3)} s (onglet en arrière-plan ralenti ou ordinateur en veille)`);
-      }
     }
-  }
-
-  // ---------- Configuration ----------
-
-  const K_CONFIG = `${NS}:config`;
-  function loadConfig() {
-    const raw = load(K_CONFIG, {});
-    const cfg = { ...DEFAULTS };
-    for (const k of Object.keys(DEFAULTS)) if (typeof raw[k] === typeof DEFAULTS[k]) cfg[k] = raw[k];
-    return cfg;
   }
 
   // ---------- Panneau ----------
@@ -1203,90 +1212,140 @@
   const CSS = `
 :host { all: initial; }
 * { box-sizing: border-box; }
-.box { position: fixed; top: 80px; left: 16px; z-index: 2147483647; width: 320px; max-height: 85vh;
-  display: flex; flex-direction: column; font: 12px/1.4 system-ui, sans-serif; color: #e8e8e8;
-  background: #15171c; border: 1px solid #2c303a; border-radius: 10px; box-shadow: 0 8px 24px #0008; overflow: hidden; }
+.box { position: fixed; top: 64px; left: 16px; z-index: 2147483647; width: 400px; max-height: min(780px, 90vh);
+  display: flex; flex-direction: column; font: 12px/1.4 system-ui, sans-serif; color: #e6e7eb;
+  background: #14161b; border: 1px solid #2a2e38; border-radius: 12px; box-shadow: 0 10px 30px #000a; overflow: hidden; }
 .box.hidden { display: none; }
-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; font-weight: 600; cursor: move; user-select: none; }
-.activity { display: flex; align-items: center; gap: 6px; padding: 6px 12px; font-size: 11px; color: #889; cursor: pointer;
-  background: #101216; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.activity::before { content: ''; flex: 0 0 8px; height: 8px; border-radius: 50%; background: #555; }
-.activity.on { color: #e8e8e8; }
-.activity.on::before { background: #51cf66; animation: pulse 1.2s ease-in-out infinite; }
+header { display: flex; align-items: center; gap: 8px; padding: 10px 12px 8px; cursor: move; user-select: none; }
+header .title { font-weight: 700; font-size: 13px; }
+header .coins { margin-left: auto; font-size: 11px; color: #c9ccd4; background: #1e2129; padding: 2px 8px; border-radius: 10px; }
+.pill { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: #9aa0ad; }
+.pill::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: #5c6170; }
+.pill.on { color: #d3f9d8; } .pill.on::before { background: #51cf66; animation: pulse 1.2s ease-in-out infinite; }
+.pill.lock { color: #ffd8a8; } .pill.lock::before { background: #fd7e14; }
 @keyframes pulse { 50% { opacity: .3; } }
-.feed { max-height: 120px; overflow-y: auto; padding: 4px 12px 6px; background: #101216; border-bottom: 1px solid #2c303a;
-  font: 11px/1.45 ui-monospace, monospace; color: #99a; }
-.feed:empty, .feed.hidden { display: none; }
-.feed div:first-child { color: #e8e8e8; }
-.body { padding: 10px 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
-h4 { margin: 0 0 4px; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: #778; }
-input, textarea { background: #0e0f12; color: inherit; border: 1px solid #2c303a; border-radius: 6px; padding: 5px 7px; font: inherit; min-width: 0; }
-textarea { width: 100%; resize: vertical; font: 11px/1.35 ui-monospace, monospace; }
-input:focus, textarea:focus { outline: none; border-color: #4c6ef5; }
-button { border: 0; border-radius: 6px; padding: 6px 10px; font: inherit; font-weight: 600; cursor: pointer; background: #2c303a; color: #e8e8e8; }
-button:hover:not(:disabled) { filter: brightness(1.15); }
+.x { background: none; color: #8a8f9c; padding: 0 4px; font-size: 16px; line-height: 1; }
+.activity { padding: 0 12px 8px; font-size: 11px; color: #9aa0ad; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 15px; }
+.banner { margin: 0 12px 8px; padding: 6px 8px; border-radius: 8px; background: #3b2a12; color: #ffd8a8; font-size: 11px; display: flex; gap: 8px; align-items: center; }
+.banner button { margin-left: auto; padding: 3px 8px; font-size: 11px; background: #5c4012; }
+.banner:empty { display: none; }
+nav { display: flex; gap: 2px; padding: 0 8px; border-bottom: 1px solid #2a2e38; }
+nav button { background: none; border-radius: 0; padding: 7px 10px; color: #8a8f9c; font-weight: 600; border-bottom: 2px solid transparent; }
+nav button.on { color: #e6e7eb; border-bottom-color: #4c6ef5; }
+.body { flex: 1 1 auto; min-height: 120px; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+.tab { display: none; flex-direction: column; gap: 10px; } .tab.on { display: flex; }
+h4 { margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #7c8190; }
+input, select { background: #0d0f13; color: inherit; border: 1px solid #2a2e38; border-radius: 6px; padding: 5px 7px; font: inherit; min-width: 0; }
+input:focus, select:focus { outline: none; border-color: #4c6ef5; }
+button { border: 0; border-radius: 6px; padding: 6px 10px; font: inherit; font-weight: 600; cursor: pointer; background: #262a33; color: #e6e7eb; }
+button:hover:not(:disabled) { filter: brightness(1.18); }
 button:disabled { opacity: .4; cursor: default; }
-.x { background: none; color: #889; padding: 0 4px; font-size: 14px; }
-.row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
-.row > input { flex: 1; width: 0; }
-.row > button { flex: 1; }
-.hint { font-size: 11px; color: #889; margin-top: 4px; }
-.hint:empty { display: none; }
-.sets { display: flex; flex-direction: column; gap: 4px; }
-.set { display: grid; grid-template-columns: auto 1fr auto; align-items: center; column-gap: 6px; padding: 6px 8px; background: #1d2027; border-radius: 6px; }
-.set.off { opacity: .5; }
-.set .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.set .meta { grid-column: 2; font-size: 11px; color: #889; overflow-wrap: anywhere; }
-.set input[type=checkbox] { grid-row: 1 / span 2; }
-.set .x { grid-row: 1 / span 2; grid-column: 3; }
-.empty { color: #778; font-size: 11px; }
-.setting { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 3px 0; }
-.setting input[type=number] { width: 64px; text-align: right; }
-.pair { display: flex; align-items: center; gap: 4px; color: #778; }
-.actions { display: flex; gap: 6px; flex-wrap: wrap; }
-.actions button { flex: 1; padding: 8px; }
-.start { background: #2f9e44; color: #fff; } .stop { background: #c92a2a; color: #fff; }
-.stats { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; }
-.stats b { text-align: right; }
-.loghead { display: flex; justify-content: space-between; align-items: center; }
-.loghead button { padding: 2px 8px; font-size: 11px; font-weight: 500; }
-.log { font: 11px/1.35 ui-monospace, monospace; background: #0e0f12; border-radius: 6px; padding: 6px;
-  height: 130px; overflow-y: auto; white-space: pre-wrap; color: #aab; }
-details summary { cursor: pointer; color: #889; font-size: 11px; }
-details[open] summary { margin-bottom: 6px; }
-details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
-.neg { color: #ff6b6b; }
-button.big { width: 100%; padding: 12px; font-size: 14px; }
-.bar { height: 10px; background: #0e0f12; border-radius: 5px; overflow: hidden; margin: 4px 0; }
+.row { display: flex; gap: 6px; align-items: center; }
+.row > .grow { flex: 1; width: 0; }
+.blue { background: #364fc7; color: #fff; } .go { background: #2f9e44; color: #fff; } .stop { background: #c92a2a; color: #fff; }
+.small { padding: 3px 8px; font-size: 11px; font-weight: 500; }
+.hint { font-size: 11px; color: #8a8f9c; } .hint:empty { display: none; }
+.card { background: #1b1e25; border-radius: 8px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.card.hidden { display: none; }
+.empty { color: #8a8f9c; font-size: 12px; line-height: 1.6; padding: 6px 2px; }
+.empty b { color: #e6e7eb; }
+.filters { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 11px; color: #a9aebb; }
+.filters input[type=search] { flex: 1; min-width: 120px; }
+.filters label { display: flex; gap: 4px; align-items: center; }
+.set { border: 1px solid #2a2e38; border-radius: 8px; overflow: hidden; }
+.shead { display: grid; grid-template-columns: auto auto 1fr auto auto; align-items: center; gap: 6px; padding: 6px 8px; background: #1b1e25; cursor: pointer; user-select: none; }
+.shead .caret { color: #7c8190; width: 10px; transition: transform .15s; }
+.set.open .shead .caret { transform: rotate(90deg); }
+.shead .nm { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shead .mt { grid-column: 3; font-size: 11px; color: #8a8f9c; }
+.shead .src { font-size: 10px; color: #a5b4fc; background: #22284a; padding: 1px 6px; border-radius: 8px; }
+.shead button { grid-row: 1 / span 2; }
+.shead input[type=checkbox] { grid-row: 1 / span 2; }
+.sbody { display: none; padding: 4px; flex-direction: column; gap: 2px; }
+.set.open .sbody { display: flex; }
+.p { display: grid; grid-template-columns: auto 1fr auto; align-items: center; column-gap: 8px; padding: 5px 6px; border-radius: 6px; }
+.p:hover { background: #1b1e25; }
+.p.got { opacity: .45; }
+.p.sel { background: #18233a; }
+.p .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.p .n i { font-style: normal; color: #ffd43b; margin-right: 4px; }
+.p .m { grid-column: 2; font-size: 11px; color: #8a8f9c; }
+.p .st { grid-column: 2; font-size: 11px; color: #74c0fc; }
+.p .st.ok { color: #51cf66; } .p .st.ko { color: #ff8787; }
+.p input[type=checkbox] { grid-row: 1 / span 3; }
+.p input[type=number] { grid-row: 1 / span 3; grid-column: 3; width: 80px; text-align: right; }
+footer { border-top: 1px solid #2a2e38; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; background: #171a20; }
+footer.hidden { display: none; }
+.cost { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.cost div { background: #1e2129; border-radius: 6px; padding: 5px 6px; }
+.cost span { display: block; font-size: 10px; color: #8a8f9c; }
+.cost b { font-size: 12px; }
+.cost .warn b { color: #ffa94d; }
+.note { font-size: 11px; color: #8a8f9c; } .note:empty { display: none; }
+.note.warn { color: #ffa94d; }
+.bar { height: 6px; background: #0d0f13; border-radius: 3px; overflow: hidden; }
 .bar .fill { height: 100%; width: 0; background: #2f9e44; transition: width .4s; }
-.goaltext { font-size: 11px; color: #aab; }
-details { border-top: 1px solid #2c303a; padding-top: 6px; }
-details > * + * { margin-top: 6px; }
+.bar.hidden { display: none; }
+button.big { width: 100%; padding: 10px; font-size: 13px; }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.stat { background: #1b1e25; border-radius: 8px; padding: 8px; }
+.stat span { display: block; font-size: 10px; color: #8a8f9c; text-transform: uppercase; letter-spacing: .04em; }
+.stat b { font-size: 15px; }
+.stat b.neg { color: #ff8787; } .stat b.pos { color: #51cf66; }
+.sale { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 5px 6px; border-radius: 6px; background: #1b1e25; }
+.sale .m { font-size: 11px; color: #8a8f9c; }
+.feed { font: 11px/1.5 ui-monospace, monospace; color: #a9aebb; background: #0d0f13; border-radius: 6px; padding: 6px; max-height: 160px; overflow-y: auto; }
+.feed div:first-child { color: #e6e7eb; }
+.log { font: 11px/1.4 ui-monospace, monospace; background: #0d0f13; border-radius: 6px; padding: 6px; height: 220px; overflow-y: auto; white-space: pre-wrap; color: #a9aebb; }
+.setting { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 2px 0; }
+.setting input { width: 74px; text-align: right; }
+.pair { display: flex; align-items: center; gap: 4px; color: #7c8190; }
+.pair input { width: 54px; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.actions button { flex: 1; padding: 6px; font-weight: 500; font-size: 11px; }
 `;
 
-  const FLOAT_KEYS = new Set(['markupPct', 'maxCoinsPerPoint']);
-  const SETTINGS = [
-    { key: 'markupPct', label: 'Majoration revente (%, 0 = prix d’achat)' },
-    { key: 'maxBuysPerSearch', label: 'Achats max par recherche' },
-    { key: 'maxCoinsPerPoint', label: 'Crédits max par point Galerie (0 = sans limite)' },
-    { key: 'maxPagesPerStep', label: 'Pages max par palier de prix' },
-    { key: 'coinReserve', label: 'Crédits à garder' },
-    { key: 'maxSpend', label: 'Dépense max par session (0 = illimitée)' },
-    { key: 'resweepMinutes', label: 'Nouveau passage après (min, 0 = arrêt)' },
-    { key: 'stopAfterHours', label: 'Arrêt auto après (h, 0 = jamais)' },
-  ];
-  const ADVANCED = [
-    { key: 'dropAfterExpiries', label: 'Baisser d’un palier après N invendus (0 = jamais)' },
-    { key: 'maxSearchesPerHour', label: 'Recherches max / heure' },
-    { key: 'maxSearchesPerDay', label: 'Recherches max / 24 h' },
-    { key: 'maxPurchasesPerDay', label: 'Achats max / 24 h' },
-    { key: 'sessionMinutes', label: 'Pause toutes les (min, 0 = jamais)' },
-    { key: 'breakMinutes', label: 'Durée de la pause (min)' },
+  const SETTING_GROUPS = [
+    {
+      title: 'Achat',
+      items: [
+        { key: 'pricePct', label: 'Prix max proposé (% au-dessus du prix de référence)' },
+        { key: 'autoRaisePct', label: 'Hausse auto si introuvable (% max au-dessus du prix max, 0 = non)' },
+        { key: 'triesPerPlayer', label: 'Recherches max par joueur' },
+        { key: 'coinReserve', label: 'Crédits à garder' },
+        { delay: ['minDelayMs', 'maxDelayMs'], label: 'Délai entre recherches (s)' },
+        { delay: ['buyDelayMinMs', 'buyDelayMaxMs'], label: 'Délai avant achat (s)', step: 0.1 },
+      ],
+    },
+    {
+      title: 'Ventes',
+      items: [
+        { key: 'watchMinutes', label: 'Contrôle des ventes toutes les (min)' },
+        { key: 'minSellPct', label: 'Revente plancher (% du prix d’achat, 0 = aucun)' },
+      ],
+    },
+    {
+      title: 'Sécurité',
+      items: [
+        { key: 'lockMinutes', label: 'Pause après captcha / limite (min, doublée si ça se répète, 0 = arrêt 12 h)' },
+        { key: 'maxSearchesPerHour', label: 'Recherches max / heure' },
+        { key: 'maxSearchesPerDay', label: 'Recherches max / 24 h' },
+        { key: 'maxPurchasesPerDay', label: 'Achats max / 24 h' },
+      ],
+    },
+    {
+      title: 'Scan marché (secours)',
+      items: [
+        { key: 'scanMaxPrice', label: 'Prix max des cartes' },
+        { key: 'scanMaxSearches', label: 'Recherches max par scan' },
+        { key: 'scanPagesPerSlice', label: 'Pages par tranche de prix' },
+      ],
+    },
   ];
 
   function h(tag, props = {}, ...children) {
     const n = Object.assign(document.createElement(tag), props);
-    n.append(...children);
+    n.append(...children.filter((c) => c !== null && c !== undefined && c !== false));
     return n;
   }
 
@@ -1305,11 +1364,23 @@ details > * + * { margin-top: 6px; }
     }
   }
 
+  function flash(btn, ok) {
+    const t = btn.textContent;
+    btn.textContent = ok ? 'Copié' : 'Échec';
+    setTimeout(() => (btn.textContent = t), 1500);
+  }
+
   class Panel {
     config = loadConfig();
-    diagOn = false;
-    constructor(handlers) {
-      this.handlers = handlers;
+    filter = { text: '', tier: 'all', showCollected: false };
+    open = new Set();
+    tab = 'sets';
+    leagues = [];
+    clubs = [];
+    lastSig = '';
+
+    constructor(engine) {
+      this.engine = engine;
       const host = document.createElement('div');
       host.id = `${NS}-host`;
       for (const ev of ['keydown', 'keyup', 'keypress']) host.addEventListener(ev, (e) => e.stopPropagation());
@@ -1317,241 +1388,427 @@ details > * + * { margin-top: 6px; }
       const shadow = host.attachShadow({ mode: 'open' });
       this.box = h('div', { className: 'box' });
       shadow.append(h('style', { textContent: CSS }), this.box);
-      this.render();
+      const first = engine.setList()[0];
+      if (first) this.open.add(first.key);
+      this.build();
     }
     toggle() {
       this.box.classList.toggle('hidden');
+    }
+    show() {
+      this.box.classList.remove('hidden');
     }
     setConfig(patch) {
       this.config = { ...this.config, ...patch };
       save(K_CONFIG, this.config);
     }
-    sets() {
-      return parseSets(this.config.sets);
-    }
-    saveSets(sets) {
-      this.setConfig({ sets: JSON.stringify(sets) });
-      this.renderSets();
-    }
 
-    render() {
-      const header = h('header', {}, 'AlbumFC27', h('button', { className: 'x', textContent: '×', onclick: () => this.toggle() }));
+    build() {
+      this.pill = h('span', { className: 'pill' });
+      this.coinsEl = h('span', { className: 'coins' });
+      const header = h('header', {}, h('span', { className: 'title', textContent: 'AlbumFC27' }), this.pill, this.coinsEl, h('button', { className: 'x', textContent: '×', title: 'Masquer', onclick: () => this.toggle() }));
       this.draggable(header);
-      this.activityEl = h('div', { className: 'activity', title: "Afficher / masquer l'historique" });
-      this.feedEl = h('div', { className: 'feed hidden' });
-      this.activityEl.onclick = () => this.feedEl.classList.toggle('hidden');
-      this.setsEl = h('div', { className: 'sets' });
-      this.mainBtn = h('button', { className: 'start big', textContent: 'Lancer le niveau 10 automatique', onclick: () => (this.running ? this.handlers.onStop() : this.handlers.onStart()) });
-      this.goalTitle = h('h4', { textContent: 'Objectif : Galerie niveau 10' });
-      this.barFill = h('div', { className: 'fill' });
-      this.goalText = h('div', { className: 'goaltext' });
-      this.statsEl = h('div', { className: 'stats' });
-      this.logEl = h('div', { className: 'log' });
-      const copy = h('button', { textContent: 'Copier' });
-      copy.onclick = async () => {
-        copy.textContent = (await copyText(this.logEl.textContent ?? '')) ? 'Copié' : 'Échec';
-        setTimeout(() => (copy.textContent = 'Copier'), 1500);
-      };
-      const score = this.numInput('galleryScore');
-      score.placeholder = '0';
-      const body = h(
-        'div',
-        { className: 'body' },
-        h('div', {}, this.goalTitle, h('div', { className: 'bar' }, this.barFill), this.goalText),
-        this.mainBtn,
-        h('div', { className: 'setting' }, h('span', { textContent: 'Score Galerie actuel (facultatif, lu dans le jeu)' }), score),
-        this.statsEl,
-        h('details', {}, h('summary', { textContent: 'Journal' }), h('div', { className: 'loghead' }, h('span'), copy), this.logEl),
-        h(
-          'details',
-          {},
-          h('summary', { textContent: 'Avancé' }),
-          this.checkSetting('mode', 'Utiliser mes propres ensembles (au lieu du niveau 10)', (on) => (on ? 'custom' : 'level10')),
-          this.numSetting({ key: 'targetScore', label: 'Objectif niveau 10 (points)' }),
-          h('h4', { textContent: 'Mes ensembles' }),
-          this.setsEl,
-          this.addForm(),
-          h('h4', { textContent: 'Réglages' }),
-          this.delayRow('Délai recherches (s)', 'minDelayMs', 'maxDelayMs'),
-          this.delayRow('Délai avant achat (s)', 'buyDelayMinMs', 'buyDelayMaxMs', 0.1),
-          ...SETTINGS.map((s) => this.numSetting(s)),
-          this.checkSetting('skipClubOwned', 'Ignorer les joueurs déjà possédés (club)'),
-          this.checkSetting('autoScanClub', 'Scanner le club au démarrage (toutes les 12 h)'),
-          this.advanced(),
-        ),
-      );
-      this.box.append(header, this.activityEl, this.feedEl, body);
-      this.renderSets();
+      this.activityEl = h('div', { className: 'activity' });
+      this.bannerEl = h('div', { className: 'banner' });
+
+      this.tabs = {};
+      this.tabBtns = {};
+      const nav = h('nav');
+      for (const [id, label] of [['sets', 'Sets'], ['sales', 'Ventes'], ['log', 'Journal'], ['settings', 'Réglages']]) {
+        this.tabBtns[id] = h('button', { textContent: label, onclick: () => this.showTab(id) });
+        nav.append(this.tabBtns[id]);
+      }
+      this.tabs.sets = this.buildSetsTab();
+      this.tabs.sales = this.buildSalesTab();
+      this.tabs.log = this.buildLogTab();
+      this.tabs.settings = this.buildSettingsTab();
+      const body = h('div', { className: 'body' }, ...Object.values(this.tabs));
+      this.footer = this.buildFooter();
+      this.box.append(header, this.activityEl, this.bannerEl, nav, body, this.footer);
+      this.showTab('sets');
     }
 
-    addForm() {
-      const label = h('input', { placeholder: 'Nom (ex : Ligue 1 or)' });
-      const maxPrice = h('input', { type: 'number', min: '200', step: '100', placeholder: 'Prix max / carte' });
-      const minR = h('input', { type: 'number', min: '0', max: '99', placeholder: 'Note min' });
-      const maxR = h('input', { type: 'number', min: '0', max: '99', placeholder: 'Note max' });
-      const crit = h('textarea', { rows: 3, placeholder: 'Critères (remplis par « Capturer »), ex : {"league":16,"level":"gold"}' });
-      const hint = h('div', { className: 'hint' });
-      const capture = h('button', { textContent: 'Capturer la recherche du marché' });
-      capture.onclick = () => {
-        const c = this.handlers.lastUiCriteria();
-        if (!c) return void (hint.textContent = "Fais d'abord une recherche dans Transferts > Marché avec les filtres de l'ensemble (club, championnat, nation, rareté, qualité…), puis reclique.");
-        crit.value = JSON.stringify(c);
-        hint.textContent = `Capturé : ${describeCriteria(c)}`;
-        if (!label.value) label.focus();
-      };
-      const add = h('button', { textContent: 'Ajouter l’ensemble' });
-      add.onclick = () => {
-        let criteria;
-        try {
-          criteria = JSON.parse(crit.value || '{}');
-          if (!criteria || typeof criteria !== 'object' || Array.isArray(criteria)) throw 0;
-        } catch {
-          return void (hint.textContent = 'Critères invalides (objet JSON attendu)');
-        }
-        const price = Math.floor(Number(maxPrice.value));
-        if (!(price >= 200)) return void (hint.textContent = 'Prix max par carte requis (min 200)');
-        const set = {
-          id: Date.now().toString(36),
-          label: label.value.trim() || describeCriteria(criteria).slice(0, 40),
-          criteria,
-          maxPrice: price,
-          minRating: Math.floor(Number(minR.value) || 0),
-          maxRating: Math.floor(Number(maxR.value) || 99),
-          enabled: true,
-        };
-        this.saveSets([...this.sets().sets, set]);
-        label.value = maxPrice.value = minR.value = maxR.value = crit.value = '';
-        hint.textContent = `Ensemble « ${set.label} » ajouté`;
-      };
-      return h(
-        'details',
-        {},
-        h('summary', { textContent: 'Ajouter un ensemble' }),
-        h('div', { className: 'row' }, capture),
-        crit,
-        h('div', { className: 'row' }, label),
-        h('div', { className: 'row' }, maxPrice, minR, maxR),
-        h('div', { className: 'row' }, add),
-        hint,
+    showTab(id) {
+      this.tab = id;
+      for (const [k, el] of Object.entries(this.tabs)) el.classList.toggle('on', k === id);
+      for (const [k, b] of Object.entries(this.tabBtns)) b.classList.toggle('on', k === id);
+      this.footer.classList.toggle('hidden', id !== 'sets');
+      if (id === 'sales') this.renderSales();
+    }
+
+    // --- Onglet Sets ---
+
+    buildSetsTab() {
+      const addFutgg = h('button', { className: 'blue grow', textContent: '+ Set depuis fut.gg', onclick: () => window.open(FUTGG_GALLERY, '_blank', 'noopener') });
+      this.clubCard = this.buildClubCard();
+      const addClub = h('button', { className: 'grow', textContent: '+ Club via le marché', onclick: () => this.clubCard.classList.toggle('hidden') });
+
+      const search = h('input', { type: 'search', placeholder: 'Rechercher un joueur' });
+      search.oninput = () => ((this.filter.text = search.value.trim().toLowerCase()), this.renderSets());
+      const tier = h('select');
+      for (const [v, t] of [['all', 'Toutes'], ['gold', 'Or'], ['silver', 'Argent'], ['bronze', 'Bronze'], ['special', 'Spéciales'], ['unknown', 'Note ?']]) tier.append(h('option', { value: v, textContent: t }));
+      tier.onchange = () => ((this.filter.tier = tier.value), this.renderSets());
+      const showCol = h('input', { type: 'checkbox' });
+      showCol.onchange = () => ((this.filter.showCollected = showCol.checked), this.renderSets());
+      this.filtersEl = h(
+        'div',
+        { className: 'filters' },
+        search,
+        tier,
+        h('label', {}, showCol, 'collectés'),
+        h('button', { className: 'small', textContent: 'Tout cocher', onclick: () => this.checkVisible(true) }),
+        h('button', { className: 'small', textContent: 'Aucun', onclick: () => this.checkVisible(false) }),
       );
+      this.setsEl = h('div', { style: 'display:flex;flex-direction:column;gap:6px' });
+      return h('section', { className: 'tab' }, h('div', { className: 'row' }, addFutgg, addClub), this.clubCard, this.filtersEl, this.setsEl);
+    }
+
+    buildClubCard() {
+      this.leagueSel = h('select', { className: 'grow' });
+      this.clubSel = h('select', { className: 'grow' });
+      this.leagueSel.onchange = () => this.fillClubs();
+      this.clubHint = h('div', { className: 'hint' });
+      const reload = h('button', { className: 'small', textContent: '↻', title: 'Recharger les championnats', onclick: () => this.fillLeagues() });
+      this.scanBtn = h('button', { className: 'blue grow', textContent: 'Scanner ce club' });
+      this.scanBtn.onclick = () => {
+        if (this.engine.mode === 'scan') return this.engine.stop('Scan arrêté', true);
+        const c = this.clubs.find((x) => x.id === Number(this.clubSel.value));
+        if (!c) return void (this.clubHint.textContent = 'Choisis un championnat puis un club.');
+        this.open.add(setKey({ kind: 'club', club: c.id }));
+        void this.engine.scanClub({ club: c.id, name: c.name, league: Number(this.leagueSel.value) || null });
+      };
+      const last = h('button', { className: 'grow', textContent: 'Club de ma dernière recherche' });
+      last.onclick = () => {
+        if (!lastUiClub) return void (this.clubHint.textContent = 'Fais une recherche dans Transferts > Marché filtrée sur le club, puis reclique.');
+        const c = (lastUiClub.league ? loadClubs(lastUiClub.league) : []).find((x) => x.id === lastUiClub.club);
+        this.open.add(setKey({ kind: 'club', club: lastUiClub.club }));
+        void this.engine.scanClub({ club: lastUiClub.club, name: c?.name ?? `Club n° ${lastUiClub.club}`, league: lastUiClub.league });
+      };
+      const card = h(
+        'div',
+        { className: 'card hidden' },
+        h('h4', { textContent: 'Club via le marché : seules les cartes en vente apparaissent' }),
+        h('div', { className: 'row' }, this.leagueSel, reload),
+        h('div', { className: 'row' }, this.clubSel),
+        h('div', { className: 'row' }, this.scanBtn, last),
+        this.clubHint,
+      );
+      this.fillLeagues();
+      return card;
+    }
+
+    fillLeagues() {
+      this.leagues = loadLeagues();
+      this.leagueSel.replaceChildren(h('option', { value: '', textContent: this.leagues.length ? 'Championnat…' : 'Championnats indisponibles' }), ...this.leagues.map((l) => h('option', { value: String(l.id), textContent: l.name })));
+      this.leagueSel.disabled = !this.leagues.length;
+      this.clubHint.textContent = this.leagues.length ? '' : 'Liste non trouvée dans la Web App : utilise « Club de ma dernière recherche ».';
+      this.fillClubs();
+    }
+
+    fillClubs() {
+      const league = Number(this.leagueSel.value) || 0;
+      this.clubs = league ? loadClubs(league) : [];
+      this.clubSel.replaceChildren(h('option', { value: '', textContent: league && !this.clubs.length ? 'Clubs indisponibles' : 'Club…' }), ...this.clubs.map((c) => h('option', { value: String(c.id), textContent: c.name })));
+      this.clubSel.disabled = !this.clubs.length;
+      if (league && !this.clubs.length) this.clubHint.textContent = 'Clubs non trouvés : utilise « Club de ma dernière recherche ».';
+    }
+
+    match(p) {
+      const f = this.filter;
+      return (f.tier === 'all' || tierOf(p) === f.tier) && (!f.text || p.name.toLowerCase().includes(f.text));
+    }
+
+    visibleIn(set, inQueue) {
+      return this.engine.setPlayers(set).filter((p) => (this.filter.showCollected || !p.collected || inQueue.has(p.defId)) && this.match(p));
+    }
+
+    checkVisible(on, onlySet) {
+      const e = this.engine;
+      const inQueue = new Set(e.queue.map((q) => q.defId));
+      for (const s of onlySet ? [onlySet] : e.setList()) for (const p of this.visibleIn(s, inQueue)) if (!p.collected) e.setSelected(p.defId, on);
+      this.renderSets();
     }
 
     renderSets() {
-      const { sets, error } = this.sets();
-      const st = load(K_SETSTATS, {});
-      const rows = sets.map((s) => {
-        const cb = h('input', { type: 'checkbox', checked: s.enabled, title: 'Activer / désactiver' });
-        cb.onchange = () => this.saveSets(this.sets().sets.map((x) => (x.id === s.id ? { ...x, enabled: cb.checked } : x)));
-        const del = h('button', { className: 'x', textContent: '×', title: 'Retirer' });
-        del.onclick = () => this.saveSets(this.sets().sets.filter((x) => x.id !== s.id));
-        const p = st[s.id];
-        const rating = s.minRating > 0 || s.maxRating < 99 ? ` · note ${s.minRating}–${s.maxRating}` : '';
-        const prog = p ? ` · ${p.bought} collectés, score ~${p.score}` : '';
-        return h(
-          'div',
-          { className: `set${s.enabled ? '' : ' off'}`, title: JSON.stringify(s.criteria) },
-          cb,
-          h('span', { className: 'name', textContent: s.label }),
-          del,
-          h('span', { className: 'meta', textContent: `≤ ${s.maxPrice}${rating} · ${describeCriteria(s.criteria)}${prog}` }),
+      const e = this.engine;
+      const sets = e.setList();
+      this.filtersEl.style.display = sets.length ? '' : 'none';
+      if (!sets.length) {
+        this.setsEl.replaceChildren(
+          h(
+            'div',
+            { className: 'empty' },
+            h('b', { textContent: 'Aucun set.' }),
+            h('br'),
+            '1. « + Set depuis fut.gg » : ouvre un set de la Galerie, clique « Envoyer à AlbumFC27 ». Répète pour plusieurs sets.',
+            h('br'),
+            '2. Coche les joueurs à acheter, ajuste le prix max.',
+            h('br'),
+            '3. « Acheter et revendre » : achat puis remise en vente immédiate, coût projeté affiché en bas.',
+          ),
         );
-      });
-      if (!rows.length) rows.push(h('div', { className: 'empty', textContent: 'Aucun ensemble : ouvre « Ajouter un ensemble ».' }));
-      if (error) rows.push(h('div', { className: 'neg', textContent: error }));
-      this.setsEl.replaceChildren(...rows);
+        this.renderFooter();
+        return;
+      }
+      const busy = e.busy;
+      const statusOf = new Map(e.queue.map((q) => [q.defId, q]));
+      const inQueue = new Set(statusOf.keys());
+      this.setsEl.replaceChildren(...sets.map((s) => this.renderSet(s, busy, statusOf, inQueue)));
+      this.renderFooter();
     }
 
-    advanced() {
-      const diag = h('button', { textContent: 'Diagnostic réseau : off' });
-      diag.onclick = () => {
-        this.diagOn = !this.diagOn;
-        diag.textContent = `Diagnostic réseau : ${this.diagOn ? 'on' : 'off'}`;
-        this.handlers.onDiag(this.diagOn);
-      };
-      const unlock = h('button', { textContent: 'Lever le verrou' });
-      unlock.onclick = () => confirm("Lever le verrou anti-captcha ? À ne faire que si EA n'a pas affiché de captcha.") && this.handlers.onUnlock();
-      const scan = h('button', { textContent: 'Scanner le club' });
-      scan.onclick = () => this.handlers.onScanClub();
-      const reset = h('button', { textContent: 'Oublier les collectés' });
-      reset.onclick = () => confirm('Effacer la liste des joueurs déjà collectés ? Ils pourront être rachetés.') && (this.handlers.onReset(), this.renderSets());
-      const gallery = h('button', { textContent: 'Copier rapport Galerie' });
-      gallery.onclick = async () => {
-        gallery.textContent = 'Analyse…';
-        const data = await this.handlers.galleryReport();
-        gallery.textContent = (await copyText(JSON.stringify(data, null, 1))) ? 'Copié' : 'Échec';
-        setTimeout(() => (gallery.textContent = 'Copier rapport Galerie'), 1500);
-      };
-      const exp = h('button', { textContent: 'Exporter ensembles' });
-      exp.onclick = async () => {
-        exp.textContent = (await copyText(this.config.sets)) ? 'Copié' : 'Échec';
-        setTimeout(() => (exp.textContent = 'Exporter ensembles'), 1500);
-      };
-      const imp = h('button', { textContent: 'Importer ensembles' });
-      imp.onclick = () => {
-        const raw = prompt('Coller la liste exportée (JSON)');
-        if (!raw) return;
-        const { sets, error } = parseSets(raw);
-        if (error || !sets.length) return alert(error ?? 'Aucun ensemble valide');
-        this.saveSets([...this.sets().sets, ...sets]);
-      };
-      return h(
-        'details',
-        {},
-        h('summary', { textContent: 'Réglages avancés' }),
-        ...ADVANCED.map((s) => this.numSetting(s)),
-        h('div', { className: 'actions' }, scan, reset),
-        h('div', { className: 'actions', style: 'margin-top:6px' }, exp, imp),
-        h('div', { className: 'actions', style: 'margin-top:6px' }, diag, gallery, unlock),
+    renderSet(s, busy, statusOf, inQueue) {
+      const e = this.engine;
+      const all = e.setPlayers(s);
+      const missing = all.filter((p) => !p.collected);
+      const selected = missing.filter((p) => e.selection[p.defId] !== undefined).length;
+      const visible = this.visibleIn(s, inQueue);
+      const isOpen = this.open.has(s.key) || !!this.filter.text;
+      const scanning = e.scanningKey === s.key;
+
+      const allBox = h('input', { type: 'checkbox', title: 'Cocher tous les manquants visibles', checked: missing.length > 0 && selected === missing.length, disabled: busy || !missing.length });
+      allBox.indeterminate = selected > 0 && selected < missing.length;
+      allBox.onclick = (ev) => ev.stopPropagation();
+      allBox.onchange = () => this.checkVisible(allBox.checked, s);
+      const tools = h('span', { className: 'row' });
+      if (s.kind === 'club' && !scanning) tools.append(h('button', { className: 'small', textContent: '↻', title: 'Rescanner le club', disabled: busy, onclick: (ev) => (ev.stopPropagation(), void e.scanClub({ club: s.club, name: s.name, league: s.league })) }));
+      if (s.kind === 'futgg' && s.url) tools.append(h('button', { className: 'small', textContent: '↗', title: 'Ouvrir sur fut.gg pour le mettre à jour', onclick: (ev) => (ev.stopPropagation(), window.open(s.url, '_blank', 'noopener')) }));
+      tools.append(h('button', { className: 'small', textContent: '×', title: 'Retirer le set', disabled: busy, onclick: (ev) => (ev.stopPropagation(), confirm(`Retirer le set « ${s.name} » ?`) && e.removeSet(s.key)) }));
+
+      const meta = this.setMeta(s, all.length, missing.length, selected);
+      const head = h(
+        'div',
+        { className: 'shead' },
+        h('span', { className: 'caret', textContent: '▸' }),
+        allBox,
+        h('span', { className: 'nm', textContent: s.name }),
+        h('span', { className: 'src', textContent: s.source === 'futgg' ? 'fut.gg' : 'marché' }),
+        tools,
+        h('span', { className: 'mt', textContent: meta }),
       );
+      const wrap = h('div', { className: `set${isOpen ? ' open' : ''}` }, head);
+      head.onclick = () => {
+        if (this.open.has(s.key)) this.open.delete(s.key);
+        else this.open.add(s.key);
+        wrap.classList.toggle('open');
+        if (wrap.classList.contains('open') && !wrap.querySelector('.sbody')) wrap.append(this.renderRows(s, visible, busy, statusOf));
+      };
+      if (isOpen) wrap.append(this.renderRows(s, visible, busy, statusOf));
+      return wrap;
+    }
+
+    renderRows(s, visible, busy, statusOf) {
+      const e = this.engine;
+      const rows = visible.map((p) => {
+        const sel = e.selection[p.defId];
+        const q = statusOf.get(p.defId);
+        const cb = h('input', { type: 'checkbox', checked: sel !== undefined && !p.collected, disabled: busy || p.collected });
+        const max = h('input', { type: 'number', min: '200', step: String(step(p.minPrice || 200)), value: String(sel || e.defaultMax(p) || ''), placeholder: 'prix max', disabled: busy || p.collected, title: 'Prix max d’achat' });
+        const row = h('div', { className: `p${p.collected && !q ? ' got' : ''}${sel !== undefined && !p.collected ? ' sel' : ''}` });
+        cb.onchange = () => {
+          e.setSelected(p.defId, cb.checked, Math.floor(Number(max.value)) || e.defaultMax(p));
+          row.classList.toggle('sel', cb.checked);
+          this.renderFooter();
+          this.refreshSetHeads();
+        };
+        max.onchange = () => {
+          const v = Math.floor(Number(max.value)) > 0 ? Math.max(200, Math.floor(Number(max.value))) : 0;
+          max.value = v ? String(v) : '';
+          if (!cb.checked && v) {
+            cb.checked = true;
+            row.classList.add('sel');
+          }
+          if (cb.checked) e.setSelected(p.defId, true, v);
+          this.renderFooter();
+          this.refreshSetHeads();
+        };
+        const ref = p.minPrice || Number(sel) || 0;
+        const rt = ref ? roundTrip(ref) : null;
+        const metaParts = [
+          tierText(p),
+          !p.minPrice ? 'prix inconnu : saisir un prix max' : s.source === 'futgg' ? `fut.gg ${fmtNum(p.minPrice)}` : `dès ${fmtNum(p.minPrice)} (${p.listings} annonce(s))`,
+          rt && !p.collected ? `coût ~${fmtNum(rt.low)}–${fmtNum(rt.high)}` : '',
+          p.collected && !q ? 'déjà collecté' : '',
+        ];
+        const st = q
+          ? h('span', { className: `st${isDone(q) ? ' ok' : isFailed(q) ? ' ko' : ''}`, textContent: `${STATUS_LABEL[q.status] ?? q.status}${q.status === 'notfound' && !q.price ? ` (≤ ${fmtNum(q.max)})` : ''}${isOpen(q) && q.max0 && q.max > q.max0 ? ` · max relevé à ${fmtNum(q.max)}` : ''}${q.price ? ` à ${fmtNum(q.price)}` : ''}${q.sell ? `, en vente à ${fmtNum(q.sell)}` : ''}` })
+          : null;
+        row.append(cb, h('span', { className: 'n' }, p.rating ? h('i', { textContent: String(p.rating) }) : null, p.name), max, h('span', { className: 'm', textContent: metaParts.filter(Boolean).join(' · ') }));
+        if (st) row.append(st);
+        return row;
+      });
+      if (!rows.length) rows.push(h('div', { className: 'empty', textContent: 'Aucun joueur pour ces filtres.' }));
+      return h('div', { className: 'sbody' }, ...rows);
+    }
+
+    setMeta(s, total, missing, selected) {
+      const scanning = this.engine.scanningKey === s.key;
+      return [`${missing} manquant(s) / ${total}`, s.needed ? `${s.needed} requis` : '', selected ? `${selected} coché(s)` : '', scanning ? 'scan en cours…' : s.partial ? 'scan partiel' : ''].filter(Boolean).join(' · ');
+    }
+
+    // Met à jour compteurs et cases « tout » des sets sans reconstruire les lignes (garde le focus)
+    refreshSetHeads() {
+      const e = this.engine;
+      const heads = this.setsEl.querySelectorAll('.set');
+      e.setList().forEach((s, i) => {
+        const el = heads[i];
+        if (!el) return;
+        const missing = e.setPlayers(s).filter((p) => !p.collected);
+        const selected = missing.filter((p) => e.selection[p.defId] !== undefined).length;
+        const box = el.querySelector('.shead input[type=checkbox]');
+        if (box) {
+          box.checked = missing.length > 0 && selected === missing.length;
+          box.indeterminate = selected > 0 && selected < missing.length;
+        }
+        const mt = el.querySelector('.shead .mt');
+        if (mt) mt.textContent = this.setMeta(s, Object.keys(s.players ?? {}).length, missing.length, selected);
+      });
+    }
+
+    // --- Pied : coût projeté et bouton principal ---
+
+    buildFooter() {
+      this.costEl = h('div', { className: 'cost' });
+      this.noteEl = h('div', { className: 'note' });
+      this.barEl = h('div', { className: 'bar hidden' }, h('div', { className: 'fill' }));
+      this.mainBtn = h('button', { className: 'big go' });
+      this.mainBtn.onclick = () => (this.engine.mode === 'buy' ? this.engine.stop('Achats arrêtés', true) : void this.engine.validate());
+      this.resumeBtn = h('button', { className: 'big', textContent: 'Reprendre les achats en attente', onclick: () => void this.engine.runQueue() });
+      return h('footer', {}, this.costEl, this.noteEl, this.barEl, this.mainBtn, this.resumeBtn);
+    }
+
+    renderFooter() {
+      const e = this.engine;
+      const pk = e.picks();
+      const wallet = coins();
+      const free = wallet === null ? null : wallet - this.config.coinReserve;
+      const tight = free !== null && pk.engaged > free;
+      const cell = (label, value, warn) => h('div', { className: warn ? 'warn' : '' }, h('span', { textContent: label }), h('b', { textContent: value }));
+      this.costEl.replaceChildren(
+        cell('Joueurs cochés', `${pk.list.length}`),
+        cell('Crédits engagés', pk.list.length ? `~${fmtNum(pk.engaged)}` : '0', tight),
+        cell('Coût projeté', pk.list.length ? `${fmtNum(pk.low)}–${fmtNum(pk.high)}` : '0'),
+      );
+      const notes = [];
+      if (pk.list.length) notes.push(`Prix max cumulés ${fmtNum(pk.maxEngaged)}${pk.capEngaged > pk.maxEngaged ? ` (jusqu'à ${fmtNum(pk.capEngaged)} avec la hausse auto)` : ''}. Coût : taxe 5 % si revendu au prix d'achat, plus un palier si revendu sous la concurrence.`);
+      if (pk.noPrice) notes.push(`${pk.noPrice} joueur(s) coché(s) sans prix max : ignoré(s).`);
+      if (tight) notes.push(`Crédits disponibles ${fmtNum(free)} : les derniers joueurs seront sautés faute de crédits.`);
+      this.noteEl.textContent = notes.join(' ');
+      this.noteEl.className = `note${tight || pk.noPrice ? ' warn' : ''}`;
+
+      const q = e.queue;
+      const treated = q.filter((x) => !isOpen(x)).length;
+      const buying = e.mode === 'buy';
+      this.barEl.classList.toggle('hidden', !buying);
+      if (buying) this.barEl.firstChild.style.width = `${q.length ? (treated / q.length) * 100 : 0}%`;
+      this.mainBtn.className = buying ? 'big stop' : 'big go';
+      this.mainBtn.textContent = buying ? `Arrêter les achats (${treated}/${q.length})` : `Acheter et revendre (${pk.list.length})`;
+      this.mainBtn.disabled = e.mode === 'scan' || (!buying && !pk.list.length);
+      this.resumeBtn.style.display = !e.busy && q.some(isOpen) ? '' : 'none';
+    }
+
+    // --- Onglet Ventes ---
+
+    buildSalesTab() {
+      this.statsEl = h('div', { className: 'stats' });
+      this.watchBtn = h('button', { className: 'big', onclick: () => (this.engine.mode === 'watch' ? this.engine.stop('Suivi des ventes arrêté', true) : void this.engine.watch()) });
+      this.watchNote = h('div', { className: 'hint' });
+      this.salesEl = h('div', { style: 'display:flex;flex-direction:column;gap:3px' });
+      return h('section', { className: 'tab' }, this.statsEl, this.watchBtn, this.watchNote, h('h4', { textContent: 'Joueurs achetés encore en vente' }), this.salesEl);
+    }
+
+    renderSales(s = this.engine.snapshot()) {
+      const e = this.engine;
+      const lost = s.total.lost ?? 0;
+      const stat = (label, value, cls = '') => h('div', { className: 'stat' }, h('span', { textContent: label }), h('b', { className: cls, textContent: value }));
+      this.statsEl.replaceChildren(
+        stat('Crédits perdus', lost < 0 ? `+${fmtNum(-lost)}` : fmtNum(lost), lost > 0 ? 'neg' : lost < 0 ? 'pos' : ''),
+        stat(`Perte estimée (${s.onSale} en vente)`, fmtNum(s.pendingLoss), s.pendingLoss > 0 ? 'neg' : ''),
+        stat('Achetés / revendus', `${fmtNum(s.total.bought)} / ${fmtNum(s.total.sold)}`),
+        stat('Taxe EA payée', fmtNum(s.total.tax)),
+      );
+      const watching = e.mode === 'watch';
+      this.watchBtn.textContent = watching ? 'Arrêter le suivi des ventes' : 'Suivre les ventes (réajuste les invendus)';
+      this.watchBtn.className = watching ? 'big stop' : 'big';
+      this.watchBtn.disabled = e.busy;
+      this.watchNote.textContent = `Toutes les ${this.config.watchMinutes} min : encaisse les ventes, remet chaque invendu un palier sous la concurrence (ou au même prix). Démarre seul après les achats.`;
+      const items = Object.values(e.bought).filter((b) => typeof b === 'object');
+      this.salesEl.replaceChildren(
+        ...(items.length
+          ? items.map((b) => {
+              const loss = b.price - Math.floor((b.sell || b.price) * (1 - EA_TAX));
+              return h('div', { className: 'sale' }, h('b', { textContent: b.name || `#${b.defId}` }), h('span', { textContent: fmtNum(b.sell || b.price) }), h('span', { className: 'm', textContent: `acheté ${fmtNum(b.price)} · perte si vendu ${fmtNum(loss)}` }));
+            })
+          : [h('div', { className: 'empty', textContent: 'Aucun joueur acheté en vente.' })]),
+      );
+    }
+
+    // --- Onglet Journal ---
+
+    buildLogTab() {
+      this.feedEl = h('div', { className: 'feed' });
+      this.logEl = h('div', { className: 'log' });
+      const copy = h('button', { className: 'small', textContent: 'Copier' });
+      copy.onclick = async () => flash(copy, await copyText(this.logEl.textContent ?? ''));
+      return h('section', { className: 'tab' }, h('h4', { textContent: 'Activité récente' }), this.feedEl, h('div', { className: 'row' }, h('h4', { className: 'grow', textContent: 'Journal' }), copy), this.logEl);
+    }
+
+    // --- Onglet Réglages ---
+
+    buildSettingsTab() {
+      const groups = SETTING_GROUPS.map((g) => h('div', { className: 'card' }, h('h4', { textContent: g.title }), ...g.items.map((s) => (s.delay ? this.delayRow(s.label, ...s.delay, s.step) : this.numSetting(s)))));
+      const unlock = h('button', { textContent: 'Lever le verrou maintenant' });
+      unlock.onclick = () => confirm('Lever le verrou ? À faire seulement si aucun captcha n’est affiché.') && this.engine.unlock();
+      const reset = h('button', { textContent: 'Remettre les compteurs à zéro' });
+      reset.onclick = () => confirm('Remettre à zéro achetés, revendus, crédits perdus et taxe ?') && this.engine.resetTotals();
+      const diag = h('button', { textContent: 'Copier diagnostic clubs' });
+      diag.onclick = async () => flash(diag, await copyText(JSON.stringify(diagnosticReport(), null, 1)));
+      return h('section', { className: 'tab' }, ...groups, h('div', { className: 'card' }, h('h4', { textContent: 'Outils' }), h('div', { className: 'actions' }, unlock, reset, diag)));
     }
 
     numInput(key, seconds = false, stepS = 0.5) {
       const v = this.config[key];
       const i = h('input', { type: 'number', min: '0', value: String(seconds ? v / 1e3 : v) });
       if (seconds) i.step = String(stepS);
-      else if (FLOAT_KEYS.has(key)) i.step = '0.05';
       i.onchange = () => {
-        const n = Number(i.value);
-        this.setConfig({ [key]: seconds ? Math.round(n * 1e3) : FLOAT_KEYS.has(key) ? Math.max(0, n) : Math.floor(n) });
+        const n = Math.max(0, Number(i.value) || 0);
+        this.setConfig({ [key]: seconds ? Math.round(n * 1e3) : Math.floor(n) });
+        if (key === 'pricePct' || key === 'coinReserve') this.renderSets();
       };
       return i;
     }
     numSetting(s) {
       return h('div', { className: 'setting' }, h('span', { textContent: s.label }), this.numInput(s.key));
     }
-    checkSetting(key, label, map) {
-      const cb = h('input', { type: 'checkbox', checked: map ? this.config[key] === map(true) : !!this.config[key] });
-      cb.onchange = () => this.setConfig({ [key]: map ? map(cb.checked) : cb.checked });
-      return h('label', { className: 'setting' }, h('span', { textContent: label }), cb);
-    }
     delayRow(label, a, b, stepS = 0.5) {
       return h('div', { className: 'setting' }, h('span', { textContent: label }), h('span', { className: 'pair' }, this.numInput(a, true, stepS), '–', this.numInput(b, true, stepS)));
     }
 
+    // --- Mise à jour ---
+
     update(s, line) {
-      this.running = s.running;
-      this.activityEl.classList.toggle('on', s.running);
-      this.activityEl.textContent = s.running ? s.activity || 'En cours' : "À l'arrêt";
+      const locked = s.lockedUntil > Date.now();
+      this.pill.className = `pill${s.running ? ' on' : locked ? ' lock' : ''}`;
+      this.pill.textContent = s.mode === 'scan' ? 'Scan' : s.mode === 'buy' ? 'Achats' : s.mode === 'watch' ? 'Suivi des ventes' : locked ? 'Verrou' : 'Prêt';
+      this.coinsEl.textContent = s.coins == null ? '? crédits' : `${fmtNum(s.coins)} crédits`;
+      this.activityEl.textContent = s.running ? s.activity || 'En cours…' : s.lastMessage || '';
+      if (locked) {
+        const until = new Date(s.lockedUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const resume = s.resumeAt ? `, reprise automatique vers ${new Date(s.resumeAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : '';
+        const btn = h('button', { textContent: 'Lever', onclick: () => confirm('Lever le verrou ? À faire seulement si aucun captcha n’est affiché.') && this.engine.unlock() });
+        this.bannerEl.replaceChildren(h('span', { textContent: `Pause anti-captcha jusqu'à ${until}${resume}` }), btn);
+      } else this.bannerEl.replaceChildren();
       this.feedEl.replaceChildren(...s.feed.map((f) => h('div', { textContent: f })));
-      const level10 = s.mode !== 'custom';
-      this.mainBtn.textContent = s.running ? 'Arrêter' : level10 ? 'Lancer le niveau 10 automatique' : 'Lancer mes ensembles';
-      this.mainBtn.className = s.running ? 'stop big' : 'start big';
-      const pct = s.target > 0 ? Math.min(100, (s.progress / s.target) * 100) : 0;
-      this.goalTitle.textContent = level10 ? 'Objectif : Galerie niveau 10' : 'Mes ensembles';
-      this.barFill.style.width = `${pct}%`;
-      this.goalText.textContent = `${fmtNum(s.progress)} / ${fmtNum(s.target)} pts estimés (${pct.toFixed(1).replace('.', ',')} %)`;
-      const rows = [
-        ['Joueurs collectés', fmtNum(s.total.bought)],
-        ['Taxe EA payée', fmtNum(s.total.tax)],
-        ['En vente', s.listed ?? '?'],
-        ['Crédits', s.coins == null ? '?' : fmtNum(s.coins)],
-      ];
-      this.statsEl.replaceChildren(...rows.flatMap(([k, v]) => [h('span', { textContent: k }), h('b', { textContent: String(v) })]));
       if (line) this.logEl.textContent = `${line}\n${this.logEl.textContent ?? ''}`.split('\n').slice(0, 1e3).join('\n');
-      if (s.purchases !== this.lastPurchases) {
-        this.lastPurchases = s.purchases;
+      const sig = `${s.mode}|${s.version}`;
+      if (sig !== this.lastSig) {
+        this.lastSig = sig;
         this.renderSets();
-      }
+        this.scanBtn.textContent = s.mode === 'scan' ? 'Arrêter le scan' : 'Scanner ce club';
+        this.scanBtn.className = s.mode === 'scan' ? 'stop grow' : 'blue grow';
+        this.scanBtn.disabled = s.mode === 'buy';
+      } else this.renderFooter();
+      if (this.tab === 'sales') this.renderSales(s);
     }
 
     draggable(header) {
@@ -1578,52 +1835,59 @@ details > * + * { margin-top: 6px; }
 
   installNetHooks();
 
-  function postStats(stats) {
-    window.postMessage({ ns: NS, dir: 'to-ext', stats }, window.location.origin);
-  }
+  // Écoute posée dès le chargement : l'import fut.gg peut arriver avant que la Web App soit prête
+  const K_IMPORT_AT = `${NS}:importAt`;
+  let onCommand = null;
+  const pendingCmds = [];
+  window.addEventListener('message', (e) => {
+    if (e.source !== window || e.data?.ns !== NS || e.data.dir !== 'to-page' || !e.data.cmd) return;
+    onCommand ? onCommand(e.data.cmd) : pendingCmds.push(e.data.cmd);
+  });
+
+  const postStats = (stats) => window.postMessage({ ns: NS, dir: 'to-ext', stats }, window.location.origin);
 
   function init() {
     hookUiSearch();
-    const panel = new Panel({
-      onStart: () => void bot.start(),
-      onStop: () => bot.stop('Arrêt demandé', true),
-      onUnlock: () => bot.unlock(),
-      onScanClub: () => void bot.scanClub(),
-      onReset: () => bot.resetCollected(),
-      lastUiCriteria: () => lastUiCriteria,
-      galleryReport: async () => {
-        if (!galleryReport.probedAt) await probeGallery();
-        return { ...galleryReport, clubScan: clubScanShape, responses: galleryCaptures, url: location.href, at: new Date().toISOString() };
-      },
-      onDiag: (on) => {
-        diagSink = on ? (l) => panel.update(bot.snapshot(), `${new Date().toLocaleTimeString()} ${l}`) : null;
-        panel.update(bot.snapshot(), on ? 'Diagnostic réseau activé' : 'Diagnostic réseau désactivé');
-      },
-    });
-    const bot = new Collector(
-      () => panel.config,
+    let panel = null;
+    const engine = new Engine(
+      () => panel?.config ?? loadConfig(),
       (s, line) => {
-        panel.update(s, line);
+        panel?.update(s, line);
         postStats(s);
       },
     );
-    panel.update(bot.snapshot(), `Web App détectée, prêt (${bot.collected.size} joueurs déjà collectés, ${bot.clubOwned.size} connus au club)`);
-    postStats(bot.snapshot());
-    try {
-      const at = Number(localStorage.getItem(K_RESUME) ?? 0);
-      localStorage.removeItem(K_RESUME);
-      if ((at && Date.now() - at < 9e5) || load(K_ACTIVE, false)) {
-        panel.update(bot.snapshot(), 'Reprise automatique dans 10 s');
-        setTimeout(() => void bot.start(), 1e4);
-      }
-    } catch {}
-    window.addEventListener('message', (e) => {
-      if (e.source !== window || e.data?.ns !== NS || e.data.dir !== 'to-page') return;
-      const { cmd } = e.data;
-      if (cmd.type === 'start') bot.start();
-      else if (cmd.type === 'stop') bot.stop('Arrêt demandé', true);
+    panel = new Panel(engine);
+    const n = engine.setList().length;
+    engine.log(`Web App détectée, prêt${n ? ` (${n} set${n > 1 ? 's' : ''})` : ''}`);
+    const at = Number(load(K_RESUME, 0));
+    save(K_RESUME, 0);
+    const lockIntent = load(K_LOCK_RESUME, null);
+    if (lockIntent) engine.scheduleResume();
+    else if ((at && Date.now() - at < 9e5) || load(K_ACTIVE, false)) {
+      if (engine.queue.some(isOpen)) {
+        engine.log('Reprise automatique des achats dans 10 s');
+        setTimeout(() => void engine.runQueue(), 1e4);
+      } else save(K_ACTIVE, false);
+    }
+    if (!lockIntent && load(K_WATCH, false) && !load(K_ACTIVE, false)) {
+      engine.log('Reprise du suivi des ventes dans 10 s');
+      setTimeout(() => void engine.watch(), 1e4);
+    }
+    onCommand = (cmd) => {
+      if (cmd.type === 'stop') engine.stop('Arrêt demandé', true);
       else if (cmd.type === 'toggle-panel') panel.toggle();
-    });
+      else if (cmd.type === 'import' && Number(cmd.data?.at) > Number(load(K_IMPORT_AT, 0))) {
+        save(K_IMPORT_AT, Number(cmd.data.at));
+        const key = engine.importSet(cmd.data);
+        if (key) {
+          panel.open.add(key);
+          panel.showTab('sets');
+          panel.show();
+          engine.emit();
+        }
+      }
+    };
+    pendingCmds.splice(0).forEach(onCommand);
   }
 
   const boot = setInterval(() => {

@@ -20,27 +20,25 @@ function render(s) {
     return;
   }
   s ??= {};
+  const q = s.queue ?? {};
   const total = s.total ?? {};
-  const pct = s.target > 0 ? Math.min(100, ((s.progress ?? 0) / s.target) * 100) : 0;
+  const lost = total.lost ?? 0;
+  const locked = (s.lockedUntil ?? 0) > Date.now();
+  const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const rows = [
-    ['Progression', `${pct.toFixed(1).replace('.', ',')} %`],
-    ['Points estimés', `${fmt(s.progress)} / ${fmt(s.target)}`],
-    ['Joueurs collectés', fmt(total.bought)],
-    ['Taxe EA payée', fmt(total.tax)],
+    ['Sets', s.sets?.length ? s.sets.join(', ') : '-'],
+    ['Achats', q.total ? `${fmt(q.listed)} / ${fmt(q.total)}${q.failed ? ` (${q.failed} échec)` : ''}` : '-'],
+    ['Crédits perdus', lost < 0 ? `gain ${fmt(-lost)}` : fmt(lost)],
+    ['Perte estimée en vente', fmt(s.pendingLoss)],
     ['Crédits', s.coins == null ? '?' : fmt(s.coins)],
   ];
+  if (locked) rows.unshift(['Verrou', `jusqu'à ${hm(s.lockedUntil)}${s.resumeAt ? `, reprise ${hm(s.resumeAt)}` : ''}`]);
   root.replaceChildren(
     el('h1', {}, 'AlbumFC27 ', el('span', { className: s.running ? 'dot on' : 'dot' })),
     el('p', { className: 'activity', textContent: s.running ? s.activity || 'En cours' : s.lastMessage || "À l'arrêt" }),
     el('dl', {}, ...rows.flatMap(([k, v]) => [el('dt', { textContent: k }), el('dd', { textContent: String(v) })])),
     s.feed?.length ? el('ul', { className: 'feed' }, ...s.feed.slice(0, 6).map((f) => el('li', { textContent: f }))) : '',
-    el(
-      'div',
-      { className: 'row' },
-      s.running
-        ? el('button', { className: 'stop', textContent: 'Arrêter', onclick: () => send({ type: 'stop' }) })
-        : el('button', { className: 'start', textContent: 'Lancer le niveau 10', onclick: () => send({ type: 'start' }) }),
-    ),
+    s.running ? el('div', { className: 'row' }, el('button', { className: 'stop', textContent: 'Arrêter', onclick: () => send({ type: 'stop' }) })) : '',
     el('button', { className: 'ghost', textContent: 'Afficher / masquer le panneau', onclick: () => send({ type: 'toggle-panel' }) }),
   );
 }
