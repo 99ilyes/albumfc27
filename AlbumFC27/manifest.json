@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AlbumFC27",
-  "version": "1.5.1",
-  "description": "Complète un ensemble de la Galerie FC 27 : joueurs du set (fut.gg ou marché), achat puis remise en vente immédiate juste sous le marché.",
+  "version": "2.2.1",
+  "description": "Complète les sets de la Galerie FC 27 importés depuis fut.gg : achat au prix le plus bas, revente au prix d'achat, relist au prix du marché.",
   "action": {
     "default_popup": "popup.html",
     "default_title": "AlbumFC27",
