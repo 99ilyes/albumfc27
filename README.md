@@ -13,12 +13,18 @@
 5. **Coût projeté** (bas du panneau) : joueurs cochés, crédits engagés (prix de référence), coût projeté = fourchette entre la taxe seule (revente au prix d'achat) et la taxe plus un palier (revente sous la concurrence). Alerte si les crédits disponibles ne couvrent pas tout.
 6. **Acheter et revendre** : pour chaque joueur, achat de l'annonce la moins chère sous le prix max, puis remise en vente immédiate un palier sous la moins chère des autres annonces vues (50 crédits sous 1 000, 100 de 1 000 à 10 000, etc.), ou au prix d'achat s'il n'y en a pas d'autre. Barre de progression et statut par joueur.
    **Hausse auto** : si aucune annonce n'existe sous le prix max, le max est relevé de 5 % (au moins un palier EA) et une nouvelle recherche est faite, jusqu'à +20 % du prix max (réglable, 0 = désactivé). Le pied du panneau indique le total possible avec la hausse.
+   **Relances sans clic** : un joueur introuvable est relancé automatiquement après 30 min (réglable), jusqu'à 3 tours, avec un plafond relevé de 20 % du prix initial à chaque tour (+40 %, +60 %…). Un joueur sauté faute de crédits est relancé dès que les ventes ont rendu assez de crédits.
 
 ## Fonctionnement
 
 - **Suivi des ventes** (onglet Ventes, lancé automatiquement après les achats) : toutes les 5 min (réglable), encaisse les ventes ; chaque joueur acheté resté invendu est remis un palier sous la moins chère des annonces concurrentes, ou au même prix si personne n'est en dessous. Plancher optionnel en % du prix d'achat (0 = aucun). Le réajustement se fait à l'expiration (1 h), une annonce active ne pouvant pas être modifiée.
 - **Compteurs** (onglet Ventes) : crédits perdus sur les ventes faites (prix d'achat − net après taxe), perte estimée sur les joueurs encore en vente, achetés / revendus, taxe EA. Remise à zéro dans Réglages.
-- **Verrou automatique** : sur statut captcha / limite EA (426, 429, 458, 460, 494, 512, 521) ou 8 achats ratés d'affilée, pause de 30 min (réglable), doublée à chaque nouveau blocage dans les 24 h (plafond 12 h), puis reprise automatique de la tâche interrompue (achats ou suivi des ventes). Bannière avec heure de reprise et bouton « Lever ». Si EA affiche un captcha, le résoudre dans la Web App pendant la pause. Réglage à 0 = ancien comportement (arrêt et verrou 12 h).
+- **Aucun clic pendant le process** :
+  - Limites de débit EA (426, 429, 512, 521) ou 8 achats ratés d'affilée : pause courte de 3 min (réglable), doublée si ça se répète dans les 30 min (plafond 30 min), rythme des recherches ralenti (×1,5 par limite, jusqu'à ×4, retour à la normale après 30 min sans limite), puis reprise automatique.
+  - Captcha / vérification (458, 460, 494) : pause de 30 min (réglable), doublée à chaque nouveau blocage dans les 24 h (plafond 12 h), notification système et titre d'onglet « ⏸ Pause captcha », puis reprise automatique. **Le captcha lui-même n'est pas résolu automatiquement** : s'il est affiché, il faut le résoudre dans la Web App pendant la pause.
+  - Session expirée : rechargement de la Web App, clic automatique sur le bouton de connexion si la session EA est encore ouverte (aucun identifiant saisi), puis reprise.
+  - Notifications système à la fin des achats, en cas de pause captcha et quand tout est vendu.
+- **Suivi en direct** : bandeau « En direct » toujours visible (derniers évènements colorés, compteurs, compte à rebours de la prochaine action) ; onglet Journal avec filtres (Tout, Essentiel, Achats / ventes, Problèmes), copie et effacement, conservé après un rechargement.
 - Joueurs déjà dans la Galerie : repérés par `isCollected` (réponses EA) et l'historique d'achats de l'extension, ignorés.
 - Reprise automatique des achats en attente et du suivi des ventes après un rechargement de la Web App (session expirée).
 
