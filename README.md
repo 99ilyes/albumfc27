@@ -19,7 +19,22 @@ Coût réel par carte vendue : `prix × 5 %`. Une carte à 200 coûte 10 crédit
 
 Chrome > `chrome://extensions` > Mode développeur > Charger l'extension non empaquetée > dossier `AlbumFC27`. Ouvrir la Web App, le panneau s'affiche à gauche (SnipeFC27 est à droite).
 
-## Utilisation
+## Mode automatique
+
+Bouton **Compléter automatiquement la Galerie** : ajoute 4 ensembles automatiques puis démarre. Ils balayent tout le marché par qualité, du meilleur score par crédit au moins bon :
+
+| Ensemble | Filtre | Prix max |
+|---|---|---|
+| Auto · Or 84+ | or, note ≥ 84 | 3 000 |
+| Auto · Or 75–83 | or, note 75–83 | 1 000 |
+| Auto · Argent | argent | 400 |
+| Auto · Bronze | bronze | 300 |
+
+Chaque joueur collecté alimente en même temps ses ensembles championnat, club, nation et rareté. Au démarrage, l'extension scanne le club (au plus toutes les 12 h) et cherche un module Galerie dans la Web App. Si les cartes portent un marqueur « déjà dans la Galerie », il est utilisé pour ne pas racheter ces joueurs. Prix max et notes : supprimer l'ensemble auto et le recréer à la main pour les changer.
+
+**Rapport Galerie** (réglages avancés) : copie ce que la Web App expose sur la Galerie (modules, réponses serveur, champs des cartes). À transmettre pour brancher la lecture directe des ensembles et des joueurs manquants.
+
+## Utilisation manuelle
 
 1. Dans la Web App : Transferts > Marché, régler les filtres d'un ensemble de la Galerie (club, championnat, nation, rareté, qualité), lancer la recherche.
 2. Panneau AlbumFC27 > Ajouter un ensemble > **Capturer la recherche du marché** : les filtres sont repris tels quels.
@@ -37,5 +52,5 @@ Repris de SnipeFC27 : délais aléatoires, quotas recherches / achats par heure 
 
 - Le score affiché est une **estimation** du score de base (bronze 20, argent 35, or 75 = 90 … 90 = 14 000, valeurs communautaires), sans bonus de rareté ni tags. Le grade réel se lit dans la Galerie.
 - Unicité supposée par definitionId : une même carte n'est achetée qu'une fois.
-- Les joueurs déjà dans la Galerie mais plus dans le club ne sont pas détectés. Le bouton « Copier réponses Galerie » copie les réponses réseau de la Galerie captées par la Web App pour permettre une lecture directe dans une version suivante.
+- La structure de la Galerie côté Web App n'est pas documentée : sans marqueur sur les cartes, les joueurs déjà dans la Galerie mais plus dans le club ne sont pas détectés et peuvent être rachetés une fois. Le rapport Galerie sert à lever cette limite.
 - L'automatisation de la Web App est contraire aux conditions d'EA : risque de restriction du marché ou du compte.

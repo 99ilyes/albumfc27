@@ -28,6 +28,7 @@
     resweepMinutes: 30,
     stopAfterHours: 0,
     skipClubOwned: true,
+    autoScanClub: true,
     maxSearchesPerHour: 300,
     maxSearchesPerDay: 1500,
     maxPurchasesPerDay: 150,
@@ -102,6 +103,15 @@
     return { sets, error: null };
   }
 
+  // Balayage global par qualité, du meilleur score par crédit au moins bon : chaque joueur collecté
+  // alimente à la fois ses ensembles championnat, club, nation et rareté.
+  const AUTO_SETS = [
+    { id: 'auto-gold84', label: 'Auto · Or 84+', criteria: { level: 'gold' }, maxPrice: 3000, minRating: 84, maxRating: 99 },
+    { id: 'auto-gold75', label: 'Auto · Or 75–83', criteria: { level: 'gold' }, maxPrice: 1000, minRating: 75, maxRating: 83 },
+    { id: 'auto-silver', label: 'Auto · Argent', criteria: { level: 'silver' }, maxPrice: 400, minRating: 0, maxRating: 99 },
+    { id: 'auto-bronze', label: 'Auto · Bronze', criteria: { level: 'bronze' }, maxPrice: 300, minRating: 0, maxRating: 99 },
+  ];
+
   const describeCriteria = (c) =>
     Object.entries(c)
       .map(([k, v]) => `${k.replace(/^_/, '')}=${Array.isArray(v) ? v.join('|') : v}`)
@@ -111,7 +121,7 @@
 
   const NET_RE = /\/ut\/game\/|transfermarket|\/trade\//i;
   const PILE_RE = /\/tradepile(\?|$)/i;
-  const GALLERY_RE = /gallery|collection/i;
+  const GALLERY_RE = /galler|collection|album/i;
   let lastPile = null;
   let diagSink = null;
   const galleryCaptures = [];
@@ -123,7 +133,7 @@
         const j = JSON.parse(text);
         if (Array.isArray(j.auctionInfo)) lastPile = { at: Date.now(), auctions: j.auctionInfo, credits: typeof j.credits === 'number' ? j.credits : null };
       } catch {}
-    } else if (GALLERY_RE.test(url) && /\/ut\//i.test(url)) {
+    } else if (/\/ut\//i.test(url) && (GALLERY_RE.test(url) || /galler|collected/i.test(text))) {
       galleryCaptures.unshift({ at: new Date().toISOString(), url, body: text.slice(0, 2e5) });
       galleryCaptures.length = Math.min(galleryCaptures.length, 10);
       diagSink?.(`[GALERIE] réponse captée ${shortUrl(url)} (${text.length} octets)`);
@@ -163,7 +173,7 @@
     window.fetch = async function (input, init) {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       const res = await f.call(this, input, init);
-      if (PILE_RE.test(url) || GALLERY_RE.test(url)) res.clone().text().then((t) => onResponse(url, res.status, t)).catch(() => {});
+      if (PILE_RE.test(url) || /\/ut\//i.test(url)) res.clone().text().then((t) => onResponse(url, res.status, t)).catch(() => {});
       if (NET_RE.test(url)) diagSink?.(`[NET] fetch ${shortUrl(url)} → ${res.status}`);
       return res;
     };
@@ -239,6 +249,7 @@
       defId: Number(i.definitionId ?? 0),
       rating: Number(i.rating ?? 0),
       name: String(i._staticData?.name ?? i.getStaticData?.()?.name ?? i.definitionId),
+      collected: collectedFlag(i),
       duplicate: (() => {
         try {
           return i.isDuplicate?.() === true;
@@ -339,6 +350,96 @@
     return ids;
   }
 
+  // ---------- Détection Galerie ----------
+
+  const GAL_API_RE = /galler|album/i;
+  const COLLECTED_KEY_RE = /^_?(is)?(gallery)?collected$|^_?(is)?ingallery$/i;
+  const galleryReport = { probedAt: null, apis: [], calls: [], itemFlag: null, itemKeys: [], itemMethods: [] };
+  let flagKey;
+
+  function methodNames(o) {
+    const names = new Set();
+    for (let p = o; p && p !== Object.prototype && p !== Function.prototype; p = Object.getPrototypeOf(p)) {
+      for (const k of Object.getOwnPropertyNames(p)) if (k !== 'constructor' && typeof Object.getOwnPropertyDescriptor(p, k)?.value === 'function') names.add(k);
+    }
+    return [...names];
+  }
+
+  function safeJson(v, depth = 6, seen = new WeakSet()) {
+    if (typeof v === 'function') return undefined;
+    if (v === null || typeof v !== 'object') return v;
+    if (seen.has(v) || depth <= 0) return '[…]';
+    seen.add(v);
+    if (v instanceof Map) v = Object.fromEntries(v);
+    else if (v instanceof Set) v = [...v];
+    if (Array.isArray(v)) return [...v.slice(0, 40).map((x) => safeJson(x, depth - 1, seen)), ...(v.length > 40 ? [`… ${v.length - 40} de plus`] : [])];
+    const out = {};
+    for (const k of Object.keys(v).slice(0, 80)) {
+      const r = safeJson(v[k], depth - 1, seen);
+      if (r !== undefined) out[k] = r;
+    }
+    return out;
+  }
+
+  const withTimeout = (p) => Promise.race([p, sleep(1e4).then(() => ({ timeout: true }))]);
+
+  // Cherche les services Galerie de la Web App et appelle leurs méthodes de lecture sans argument
+  async function probeGallery() {
+    const apis = [];
+    for (const rootName of ['services', 'repositories', 'factories']) {
+      let root;
+      try {
+        root = window[rootName];
+      } catch {}
+      if (!root || typeof root !== 'object') continue;
+      for (const k of Object.keys(root)) if (GAL_API_RE.test(k)) apis.push({ path: `${rootName}.${k}`, obj: root[k] });
+    }
+    for (const k of Object.getOwnPropertyNames(window)) {
+      if (!GAL_API_RE.test(k)) continue;
+      try {
+        apis.push({ path: k, obj: window[k] });
+      } catch {}
+    }
+    galleryReport.apis = apis.map((a) => ({ path: a.path, type: typeof a.obj, methods: methodNames(typeof a.obj === 'function' ? a.obj.prototype : a.obj) }));
+    galleryReport.calls = [];
+    for (const a of apis) {
+      if (!/^(services|repositories)\./.test(a.path) || !a.obj) continue;
+      for (const m of methodNames(a.obj).filter((n) => /^(request|get|fetch|load)/i.test(n)).slice(0, 12)) {
+        const fn = a.obj[m];
+        if (typeof fn !== 'function' || fn.length > 0) continue;
+        try {
+          let r = fn.call(a.obj);
+          if (typeof r?.observe === 'function') r = await withTimeout(observe(r));
+          else if (typeof r?.then === 'function') r = await withTimeout(r);
+          galleryReport.calls.push({ call: `${a.path}.${m}()`, result: safeJson(r) });
+        } catch (e) {
+          galleryReport.calls.push({ call: `${a.path}.${m}()`, error: String(e?.message ?? e) });
+        }
+        await sleep(rand(300, 700));
+      }
+    }
+    galleryReport.probedAt = new Date().toISOString();
+    return galleryReport;
+  }
+
+  // Marqueur « déjà dans la Galerie » porté par les cartes, s'il existe : true / false / null (inconnu)
+  function collectedFlag(item) {
+    if (flagKey === undefined) {
+      const methods = methodNames(item);
+      galleryReport.itemKeys = Object.keys(item).slice(0, 120);
+      galleryReport.itemMethods = methods.slice(0, 250);
+      flagKey = [...Object.keys(item), ...methods].find((k) => COLLECTED_KEY_RE.test(k)) ?? null;
+      galleryReport.itemFlag = flagKey;
+    }
+    if (!flagKey) return null;
+    try {
+      const v = typeof item[flagKey] === 'function' ? item[flagKey]() : item[flagKey];
+      return typeof v === 'boolean' ? v : null;
+    } catch {
+      return null;
+    }
+  }
+
   // ---------- Garde-fous (quotas partagés avec SnipeFC27) ----------
 
   class Guard {
@@ -402,6 +503,7 @@
 
   const K_COLLECTED = `${NS}:collected`;
   const K_CLUB = `${NS}:club`;
+  const K_CLUB_AT = `${NS}:clubAt`;
   const K_BOUGHT = `${NS}:bought`;
   const K_EXPIRIES = `${NS}:expiries`;
   const K_SETSTATS = `${NS}:setstats`;
@@ -484,13 +586,14 @@
       save(K_SETSTATS, {});
       this.log('Historique des joueurs collectés effacé');
     }
-    async scanClub() {
-      if (this.running) return this.log("Scan du club impossible pendant que l'album tourne");
+    async scanClub(force = true) {
+      if (this.running && force) return this.log("Scan du club impossible pendant que l'album tourne");
       this.log('Scan du club en cours…');
       try {
         const ids = await scanClubDefIds((n) => this.activity(`Scan du club : ${n} joueurs`));
         this.clubOwned = ids;
         save(K_CLUB, [...ids]);
+        save(K_CLUB_AT, Date.now());
         this.log(`Scan du club terminé : ${ids.size} joueurs déjà possédés seront ignorés`);
       } catch (e) {
         this.log(`Scan du club impossible : ${e instanceof Error ? e.message : String(e)}`);
@@ -544,6 +647,9 @@
       this.holdWebLock();
       const active = parsed.sets.filter((s) => s.enabled).length;
       this.log(`Démarrage album (${active} ensemble${active > 1 ? 's' : ''}, revente ${cfg.markupPct > 0 ? `+${cfg.markupPct} %` : "au prix d'achat"})`);
+      if (cfg.skipClubOwned && cfg.autoScanClub && Date.now() - load(K_CLUB_AT, 0) > 12 * HOUR) await this.scanClub(false);
+      if (!galleryReport.probedAt) await this.reportGallery();
+      if (this.stopRequested) return this.finish();
       await this.maintain();
 
       let sessionStart = Date.now();
@@ -655,11 +761,30 @@
       } catch (e) {
         this.log(`Erreur : ${e instanceof Error ? e.message : String(e)}`);
       } finally {
-        this.stats.running = false;
-        this.stats.activity = '';
-        this.releaseLock?.();
-        this.releaseLock = null;
-        this.log('Arrêté');
+        this.finish();
+      }
+    }
+
+    finish() {
+      this.stats.running = false;
+      this.stats.activity = '';
+      this.releaseLock?.();
+      this.releaseLock = null;
+      this.log('Arrêté');
+    }
+
+    async reportGallery() {
+      this.activity('Détection de la Galerie');
+      try {
+        const r = await probeGallery();
+        const ok = r.calls.filter((c) => !c.error && !c.result?.timeout).length;
+        this.log(
+          r.apis.length
+            ? `Galerie : ${r.apis.length} module(s) détecté(s) (${r.apis.map((a) => a.path).join(', ')}), ${ok} lecture(s) réussie(s). Envoie le rapport Galerie pour activer la lecture directe des ensembles`
+            : 'Galerie : aucun module Galerie dans la Web App, complétion par balayage du marché',
+        );
+      } catch (e) {
+        this.log(`Détection Galerie impossible : ${e instanceof Error ? e.message : String(e)}`);
       }
     }
 
@@ -694,12 +819,20 @@
         if (it.expires > 0 && it.expires <= 3) continue;
         if (it.rating < set.minRating || it.rating > set.maxRating) continue;
         if (!it.defId || this.owns(it.defId)) continue;
+        if (it.collected === true) {
+          this.collected.add(it.defId);
+          continue;
+        }
         if (cfg.skipClubOwned && it.duplicate) {
           this.clubOwned.add(it.defId);
           continue;
         }
         const prev = best.get(it.defId);
         if (!prev || it.buyNow < prev.buyNow) best.set(it.defId, it);
+      }
+      if (flagKey && !this.flagLogged) {
+        this.flagLogged = true;
+        this.log(`Marqueur Galerie détecté sur les cartes (${flagKey}) : joueurs déjà dans la Galerie ignorés`);
       }
       const picks = [...best.values()].sort((a, b) => a.buyNow - b.buyNow).slice(0, cfg.maxBuysPerSearch);
       this.feed(`${set.label} : ${items.length} annonce${items.length > 1 ? 's' : ''}, ${best.size} joueur${best.size > 1 ? 's' : ''} manquant${best.size > 1 ? 's' : ''}${picks.length ? ' → achat' : ''}`);
@@ -1016,7 +1149,7 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
       const body = h(
         'div',
         { className: 'body' },
-        h('div', {}, h('h4', { textContent: 'Ensembles à compléter' }), this.setsEl),
+        h('div', {}, h('h4', { textContent: 'Ensembles à compléter' }), this.autoButton(), this.setsEl),
         this.addForm(),
         h(
           'div',
@@ -1026,6 +1159,7 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
           this.delayRow('Délai avant achat (s)', 'buyDelayMinMs', 'buyDelayMaxMs', 0.1),
           ...SETTINGS.map((s) => this.numSetting(s)),
           this.checkSetting('skipClubOwned', 'Ignorer les joueurs déjà possédés (club)'),
+          this.checkSetting('autoScanClub', 'Scanner le club au démarrage (toutes les 12 h)'),
         ),
         this.advanced(),
         h('div', { className: 'actions' }, this.startBtn, this.stopBtn),
@@ -1034,6 +1168,18 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
       );
       this.box.append(header, this.activityEl, this.feedEl, body);
       this.renderSets();
+    }
+
+    autoButton() {
+      const b = h('button', { className: 'start', style: 'width:100%;margin-bottom:6px', textContent: 'Compléter automatiquement la Galerie' });
+      b.title = 'Ajoute les ensembles automatiques (or 84+, or 75–83, argent, bronze), scanne le club et démarre';
+      b.onclick = () => {
+        const cur = this.sets().sets;
+        const missing = AUTO_SETS.filter((a) => !cur.some((x) => x.id === a.id)).map((a) => ({ ...a, enabled: true }));
+        this.saveSets([...cur.map((x) => (x.id.startsWith('auto-') ? { ...x, enabled: true } : x)), ...missing]);
+        this.handlers.onStart();
+      };
+      return b;
     }
 
     addForm() {
@@ -1126,11 +1272,12 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
       scan.onclick = () => this.handlers.onScanClub();
       const reset = h('button', { textContent: 'Oublier les collectés' });
       reset.onclick = () => confirm('Effacer la liste des joueurs déjà collectés ? Ils pourront être rachetés.') && (this.handlers.onReset(), this.renderSets());
-      const gallery = h('button', { textContent: 'Copier réponses Galerie' });
+      const gallery = h('button', { textContent: 'Copier rapport Galerie' });
       gallery.onclick = async () => {
-        const data = this.handlers.galleryCaptures();
-        gallery.textContent = !data.length ? 'Rien capté' : (await copyText(JSON.stringify(data, null, 1))) ? 'Copié' : 'Échec';
-        setTimeout(() => (gallery.textContent = 'Copier réponses Galerie'), 1500);
+        gallery.textContent = 'Analyse…';
+        const data = await this.handlers.galleryReport();
+        gallery.textContent = (await copyText(JSON.stringify(data, null, 1))) ? 'Copié' : 'Échec';
+        setTimeout(() => (gallery.textContent = 'Copier rapport Galerie'), 1500);
       };
       const exp = h('button', { textContent: 'Exporter ensembles' });
       exp.onclick = async () => {
@@ -1239,7 +1386,10 @@ details .actions button { padding: 5px; font-weight: 500; font-size: 11px; }
       onScanClub: () => void bot.scanClub(),
       onReset: () => bot.resetCollected(),
       lastUiCriteria: () => lastUiCriteria,
-      galleryCaptures: () => galleryCaptures,
+      galleryReport: async () => {
+        if (!galleryReport.probedAt) await probeGallery();
+        return { ...galleryReport, responses: galleryCaptures, url: location.href, at: new Date().toISOString() };
+      },
       onDiag: (on) => {
         diagSink = on ? (l) => panel.update(bot.snapshot(), `${new Date().toLocaleTimeString()} ${l}`) : null;
         panel.update(bot.snapshot(), on ? 'Diagnostic réseau activé' : 'Diagnostic réseau désactivé');
