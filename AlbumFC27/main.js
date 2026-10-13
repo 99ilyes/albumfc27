@@ -6,6 +6,7 @@
   // Limites de débit (trop de requêtes) : pause courte et rythme ralenti ; les autres demandent une vérification (captcha)
   const SOFT_STATUS = new Set([426, 429, 512, 521]);
   const SOFT_CAP = 30 * 6e4;
+  const HARD_CAP = 2 * 36e5;
   const CALM_MS = 30 * 6e4;
   const PILE_MAX = 100;
   const PAGE_SIZE = 20;
@@ -16,7 +17,9 @@
   const HOUR = 36e5;
   const DAY = 24 * HOUR;
 
+  const CONFIG_VERSION = 2;
   const DEFAULTS = {
+    v: CONFIG_VERSION,
     minDelayMs: 5e3,
     maxDelayMs: 9e3,
     buyDelayMinMs: 300,
@@ -32,7 +35,7 @@
     lockMinutes: 30,
     softPauseMinutes: 3,
     autoRaisePct: 20,
-    retryMinutes: 30,
+    retryMinutes: 0,
     retryRounds: 3,
     maxSearchesPerHour: 300,
     maxSearchesPerDay: 1500,
@@ -386,6 +389,18 @@
   class Guard {
     key = `${NS}:guard`;
     s = { searches: [], purchases: [], lockedUntil: 0, lockStreak: 0, lastLockAt: 0, ...load(this.key, {}) };
+    constructor() {
+      // Verrous posés avant la 1.5 (jusqu'à 12 h, limites de débit comptées comme captcha) : ramenés à une pause courte
+      if (!this.s.migrated) {
+        if (this.s.lockedUntil > Date.now()) {
+          this.s.lockedUntil = Math.min(this.s.lockedUntil, Date.now() + 3 * 6e4);
+          this.s.lockKind = 'soft';
+        }
+        this.s.lockStreak = 0;
+        this.s.migrated = 1;
+        this.persist();
+      }
+    }
     persist() {
       const now = Date.now();
       this.s.searches = this.s.searches.filter((t) => now - t < DAY);
@@ -395,8 +410,9 @@
     other() {
       return { searches: [], purchases: [], lockedUntil: 0, ...load(`${SNIPE_NS}:guard`, {}) };
     }
+    // Seul le verrou d'AlbumFC27 compte (celui de SnipeFC27 dure 12 h ; les quotas restent partagés)
     lockedUntil() {
-      return Math.max(this.s.lockedUntil, Number(this.other().lockedUntil) || 0);
+      return this.s.lockedUntil;
     }
     unlock() {
       this.s.lockedUntil = 0;
@@ -409,7 +425,7 @@
       const now = Date.now();
       this.s.lockStreak = now - this.s.lastLockAt < DAY ? this.s.lockStreak + 1 : 0;
       this.s.lastLockAt = now;
-      const ms = baseMinutes > 0 ? Math.min(LOCK_HOURS * HOUR, baseMinutes * 6e4 * 2 ** this.s.lockStreak) : LOCK_HOURS * HOUR;
+      const ms = baseMinutes > 0 ? Math.min(HARD_CAP, baseMinutes * 6e4 * 2 ** this.s.lockStreak) : LOCK_HOURS * HOUR;
       this.s.lockedUntil = now + ms;
       this.s.lockKind = 'hard';
       this.persist();
@@ -432,7 +448,7 @@
       return Date.now() - (this.s.lastSoftAt ?? 0) > CALM_MS ? 1 : (this.s.pace ?? 1);
     }
     lockKind() {
-      return this.s.lockedUntil > Date.now() ? (this.s.lockKind ?? 'hard') : Number(this.other().lockedUntil) > Date.now() ? 'snipe' : null;
+      return this.s.lockedUntil > Date.now() ? (this.s.lockKind ?? 'hard') : null;
     }
     record(kind) {
       this.s[kind].push(Date.now());
@@ -492,6 +508,8 @@
 
   function loadConfig() {
     const raw = load(K_CONFIG, {});
+    // v2 : relances enchaînées sans attente par défaut (l'ancien défaut de 30 min était enregistré avec les réglages)
+    if (raw.v !== CONFIG_VERSION) delete raw.retryMinutes;
     const cfg = { ...DEFAULTS };
     for (const k of Object.keys(DEFAULTS)) if (typeof raw[k] === 'number' && Number.isFinite(raw[k])) cfg[k] = raw[k];
     return cfg;
@@ -1087,9 +1105,21 @@
         if (e.tries < cfg.triesPerPlayer || raised) await this.sleep(this.delay(cfg), `Nouvel essai pour ${e.name}`);
       }
       if (!this.stopRequested && isOpen(e)) {
+        // Relance immédiate au tour suivant : plafond relevé de autoRaisePct % du prix initial
+        if (cfg.retryMinutes === 0 && cfg.autoRaisePct > 0 && (e.rounds ?? 0) < cfg.retryRounds) {
+          e.rounds = (e.rounds ?? 0) + 1;
+          e.tries = 0;
+          e.cap = capFor(e.max0, cfg.autoRaisePct * (e.rounds + 1));
+          const prev = e.max;
+          e.max = raisePrice(e.max, e.cap);
+          this.feed(`${e.name} : toujours introuvable ≤ ${fmtNum(prev)}, prix max relevé à ${fmtNum(e.max)} (tour ${e.rounds + 1}, plafond ${fmtNum(e.cap)})`, 'warn');
+          await this.sleep(this.delay(cfg), `Tour suivant pour ${e.name}`);
+          if (!this.stopRequested) return this.buyOne(e);
+          return;
+        }
         e.status = 'notfound';
         e.at = Date.now();
-        this.log(`${e.name} introuvable ≤ ${fmtNum(e.max)} après ${e.tries} recherche(s)`);
+        this.log(`${e.name} introuvable ≤ ${fmtNum(e.max)} après ${e.tries} recherche(s)${e.rounds ? ` (${e.rounds + 1} tours)` : ''}`);
       }
     }
 
@@ -1481,8 +1511,8 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       items: [
         { key: 'pricePct', label: 'Prix max proposé (% au-dessus du prix de référence)' },
         { key: 'autoRaisePct', label: 'Hausse auto si introuvable (% par tour au-dessus du prix max, 0 = non)' },
-        { key: 'retryMinutes', label: 'Relance auto des introuvables après (min, 0 = non)' },
-        { key: 'retryRounds', label: 'Tours de relance max (plafond relevé à chaque tour)' },
+        { key: 'retryRounds', label: 'Tours de hausse max (plafond +% par tour, enchaînés sans attente)' },
+        { key: 'retryMinutes', label: 'Attente entre tours (min, 0 = enchaîner tout de suite)' },
         { key: 'triesPerPlayer', label: 'Recherches max par joueur' },
         { key: 'coinReserve', label: 'Crédits à garder' },
         { delay: ['minDelayMs', 'maxDelayMs'], label: 'Délai entre recherches (s)' },
@@ -1500,7 +1530,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       title: 'Sécurité',
       items: [
         { key: 'softPauseMinutes', label: 'Pause après limite EA 426/429/521 (min, doublée si ça se répète, max 30)' },
-        { key: 'lockMinutes', label: 'Pause après captcha 458 (min, doublée si ça se répète, 0 = arrêt 12 h)' },
+        { key: 'lockMinutes', label: 'Pause après captcha 458 (min, doublée si ça se répète, max 2 h, 0 = arrêt 12 h)' },
         { key: 'maxSearchesPerHour', label: 'Recherches max / heure' },
         { key: 'maxSearchesPerDay', label: 'Recherches max / 24 h' },
         { key: 'maxPurchasesPerDay', label: 'Achats max / 24 h' },
