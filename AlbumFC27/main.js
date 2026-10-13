@@ -14,6 +14,8 @@
   const CALM_MS = 30 * 6e4;
   const LIMITS = { searchesPerHour: 300, searchesPerDay: 1500, purchasesPerDay: 150 };
   const SPEED_DEFAULTS = { minDelayMs: 4e3, maxDelayMs: 8e3, buyDelayMinMs: 300, buyDelayMaxMs: 900 };
+  // Ralentissement après une limite EA : délais × paceStep à chaque limite, plafond paceMax, retour à ×1 après paceResetMin sans limite
+  const PACE_DEFAULTS = { paceStep: 1.5, paceMax: 4, paceResetMin: 30 };
   const SPEED_PRESETS = [
     ['Prudent', { minDelayMs: 7e3, maxDelayMs: 12e3, buyDelayMinMs: 500, buyDelayMaxMs: 1200 }],
     ['Normal', SPEED_DEFAULTS],
@@ -252,12 +254,12 @@
       this.persist();
       return ms;
     }
-    // Limite de débit : 3 min, doublée si ça se répète dans les 30 min (plafond 30 min), rythme ×1,5 (plafond ×4)
-    lockSoft() {
+    // Limite de débit : 3 min, doublée si ça se répète dans les 30 min (plafond 30 min), rythme ralenti selon les réglages
+    lockSoft(cfg) {
       const now = Date.now();
       const calm = now - (this.s.lastSoftAt ?? 0) > CALM_MS;
       this.s.softStreak = calm ? 0 : (this.s.softStreak ?? 0) + 1;
-      this.s.pace = Math.min(4, (calm ? 1 : (this.s.pace ?? 1)) * 1.5);
+      this.s.pace = Math.min(cfg.paceMax, this.pace(cfg) * cfg.paceStep);
       this.s.lastSoftAt = now;
       const ms = Math.min(SOFT_CAP, SOFT_PAUSE_MIN * 6e4 * 2 ** this.s.softStreak);
       this.s.lockedUntil = now + ms;
@@ -265,8 +267,15 @@
       this.persist();
       return ms;
     }
-    pace() {
-      return Date.now() - (this.s.lastSoftAt ?? 0) > CALM_MS ? 1 : (this.s.pace ?? 1);
+    pace(cfg) {
+      return Date.now() - (this.s.lastSoftAt ?? 0) > cfg.paceResetMin * 6e4 ? 1 : Math.max(1, Math.min(cfg.paceMax, this.s.pace ?? 1));
+    }
+    paceUntil(cfg) {
+      return (this.s.lastSoftAt ?? 0) + cfg.paceResetMin * 6e4;
+    }
+    resetPace() {
+      this.s.pace = 1;
+      this.persist();
     }
     record(kind) {
       this.s[kind].push(Date.now());
@@ -328,8 +337,9 @@
   function loadConfig() {
     const raw = load(K_CONFIG, {});
     const pct = Number(raw.raisePct);
-    const cfg = { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE, ...SPEED_DEFAULTS };
+    const cfg = { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE, ...SPEED_DEFAULTS, ...PACE_DEFAULTS };
     for (const k of Object.keys(SPEED_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = raw[k];
+    for (const k of Object.keys(PACE_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= (k === 'paceResetMin' ? 0 : 1)) cfg[k] = raw[k];
     return cfg;
   }
 
@@ -412,6 +422,8 @@
         unsold: onSale.filter(isUnsold).length,
         lockedUntil: this.guard.lockedUntil(),
         lockKind: this.guard.lockKind(),
+        pace: this.guard.pace(this.getConfig()),
+        paceUntil: this.guard.paceUntil(this.getConfig()),
         resumeAt: this.resumeAt,
         version: this.version,
         lastEventId: this.eventSeq,
@@ -586,13 +598,13 @@
       const mode = this.mode;
       this.stopRequested = true;
       this.wake?.();
-      const ms = soft ? this.guard.lockSoft() : this.guard.lock();
+      const ms = soft ? this.guard.lockSoft(this.getConfig()) : this.guard.lock();
       if (mode) {
         save(K_LOCK_RESUME, { mode });
         this.scheduleResume();
       }
       if (soft) {
-        const pace = this.guard.pace();
+        const pace = this.guard.pace(this.getConfig());
         this.log(`${msg} : pause de ${fmtMin(ms)}${pace > 1 ? `, rythme ralenti ×${pace.toFixed(1).replace('.', ',')}` : ''}${mode ? ', reprise automatique' : ''}`, 'lock');
         return;
       }
@@ -710,7 +722,7 @@
     }
     delay() {
       const c = this.getConfig();
-      return rand(c.minDelayMs, c.maxDelayMs) * this.guard.pace();
+      return rand(c.minDelayMs, c.maxDelayMs) * this.guard.pace(c);
     }
     async sleep(ms, label) {
       if (this.stopRequested) return;
@@ -764,12 +776,21 @@
 
     async validate() {
       if (this.running) return;
-      const pk = this.picks();
-      if (!pk.count) return this.log('Aucun joueur coché');
       const pct = this.getConfig().raisePct;
-      const setOf = (defId) => this.setList().find((s) => s.players?.[defId])?.name ?? '';
-      const entry = (p, start) => ({ defId: p.defId, name: p.name, rating: p.rating, set: setOf(p.defId), start, max: start, cap: capFor(start, pct), status: 'pending', searches: 0, price: 0, sell: 0 });
-      this.queue = [...pk.list.map((x) => entry(x.p, x.start)), ...pk.unpriced.map((p) => entry(p, 0))];
+      // Ordre du panneau : set par set, joueurs dans l'ordre de la liste ; un joueur présent dans plusieurs sets est acheté dans le premier
+      const seen = new Set();
+      const queue = [];
+      for (const s of this.setList()) {
+        for (const p of this.setPlayers(s)) {
+          if (p.collected || seen.has(p.defId) || !this.isSelected(p.defId)) continue;
+          seen.add(p.defId);
+          const v = Number(this.selection[p.defId]);
+          const start = v >= 200 ? Math.floor(v) : 0;
+          queue.push({ defId: p.defId, name: p.name, rating: p.rating, set: s.name, start, max: start, cap: capFor(start, pct), status: 'pending', searches: 0, price: 0, sell: 0 });
+        }
+      }
+      if (!queue.length) return this.log('Aucun joueur coché');
+      this.queue = queue;
       save(K_QUEUE, this.queue);
       this.touch();
       await this.runQueue();
@@ -789,14 +810,22 @@
       this.log(`Achat de ${n} joueur(s) au prix le plus bas (hausse jusqu'à +${this.getConfig().raisePct} % si introuvable), revente au prix d'achat`);
       try {
         await this.syncPile();
+        let curSet = null;
         for (const e of this.queue) {
           if (this.stopRequested) break;
           if (e.status === 'searching') e.status = 'pending';
           if (e.status !== 'pending') continue;
+          if (e.set !== curSet) {
+            if (curSet !== null) this.setSummary(curSet);
+            curSet = e.set;
+            const inSet = this.queue.filter((x) => x.set === curSet);
+            this.log(`Set « ${curSet} » : ${inSet.filter(isOpen).length} joueur(s) à acheter`);
+          }
           await this.buyOne(e);
           this.saveQueue();
-          if (this.queue.some(isOpen)) await this.sleep(this.delay(), 'Joueur suivant');
+          if (this.queue.some(isOpen)) await this.sleep(this.delay(), e.set === this.queue.find(isOpen)?.set ? 'Joueur suivant' : 'Set suivant');
         }
+        if (curSet !== null && !this.stopRequested) this.setSummary(curSet);
         if (!this.stopRequested) {
           save(K_ACTIVE, false);
           const got = this.queue.filter((q) => q.price > 0);
@@ -813,6 +842,13 @@
         save(K_QUEUE, this.queue);
         this.leave();
       }
+    }
+
+    setSummary(name) {
+      const inSet = this.queue.filter((x) => x.set === name);
+      const got = inSet.filter((x) => x.price > 0);
+      const fail = inSet.filter(isFailed).length;
+      this.log(`Set « ${name} » terminé : ${got.length}/${inSet.length} achetés, ${fmtNum(got.reduce((t, x) => t + x.price, 0))} dépensés${fail ? `, ${fail} non trouvé(s)` : ''}`, 'buy');
     }
 
     giveUp(e, status, why) {
@@ -1458,17 +1494,19 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       return h('footer', {}, this.recapEl, this.raiseRow, this.speedEl, this.mainBtn, this.resumeBtn);
     }
 
-    // Réglages de vitesse : préréglages + délais (s), appliqués immédiatement, même pendant les achats
+    // Réglages de vitesse : préréglages, délais (s), ralentissement après limite EA ; appliqués immédiatement
     renderSpeed() {
       const c = this.config;
       const keys = Object.keys(SPEED_DEFAULTS);
       const active = SPEED_PRESETS.find(([, v]) => keys.every((k) => v[k] === c[k]))?.[0];
-      const sec = (ms) => String(Math.round(ms / 100) / 10).replace('.', ',');
-      const input = (k, stepS) => {
-        const i = h('input', { type: 'number', min: '0', step: String(stepS), value: String(c[k] / 1e3) });
+      const dec = (n) => String(Math.round(n * 10) / 10).replace('.', ',');
+      const pace = this.engine.guard.pace(c);
+      // scale : 1e3 pour des secondes stockées en ms ; min : valeur plancher
+      const input = (k, stepV, scale = 1, min = 0) => {
+        const i = h('input', { type: 'number', min: String(min), step: String(stepV), value: String(c[k] / scale) });
         i.onchange = () => {
-          const v = Math.round(Math.max(0, Number(String(i.value).replace(',', '.')) || 0) * 1e3);
-          const patch = { [k]: v };
+          const v = Math.round(Math.max(min, Number(String(i.value).replace(',', '.')) || 0) * scale * 10) / 10;
+          const patch = { [k]: scale > 1 ? Math.round(v) : v };
           // min ≤ max : la borne modifiée entraîne l'autre
           if (k === 'minDelayMs' && v > c.maxDelayMs) patch.maxDelayMs = v;
           if (k === 'maxDelayMs' && v < c.minDelayMs) patch.minDelayMs = v;
@@ -1480,13 +1518,20 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         };
         return i;
       };
-      const pair = (a, b, stepS) => h('span', { className: 'pair' }, input(a, stepS), '–', input(b, stepS), 's');
+      const pair = (a, b, stepS) => h('span', { className: 'pair' }, input(a, stepS, 1e3), '–', input(b, stepS, 1e3), 's');
       const presets = SPEED_PRESETS.map(([name, v]) =>
         h('button', { className: `small${name === active ? ' on' : ''}`, textContent: name, onclick: () => (this.setConfig({ ...v }), this.renderSpeed()) }),
       );
+      const off = c.paceStep <= 1 || c.paceMax <= 1 || c.paceResetMin <= 0;
+      const paceState = off
+        ? 'Ralentissement désactivé : seule la pause après limite EA s’applique.'
+        : pace > 1
+          ? `Rythme actuel ralenti ×${dec(pace)} (délais ${dec((c.minDelayMs * pace) / 1e3)}–${dec((c.maxDelayMs * pace) / 1e3)} s) jusqu’à ${hm(this.engine.guard.paceUntil(c))} sans nouvelle limite.`
+          : 'Rythme normal.';
+      const resetBtn = pace > 1 ? h('button', { className: 'small', textContent: 'Revenir au rythme normal', onclick: () => (this.engine.guard.resetPace(), this.engine.log('Rythme remis à la normale'), this.renderSpeed()) }) : null;
       const open = this.speedEl.open;
       this.speedEl.replaceChildren(
-        h('summary', { textContent: `Vitesse : ${active ?? 'personnalisée'} (${sec(c.minDelayMs)}–${sec(c.maxDelayMs)} s entre recherches)` }),
+        h('summary', { textContent: `Vitesse : ${active ?? 'personnalisée'} (${dec(c.minDelayMs / 1e3)}–${dec(c.maxDelayMs / 1e3)} s entre recherches)${pace > 1 ? ` · ralenti ×${dec(pace)}` : ''}` }),
         h(
           'div',
           { className: 'grid' },
@@ -1496,10 +1541,19 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           pair('minDelayMs', 'maxDelayMs', 0.5),
           h('span', { textContent: 'Délai avant achat' }),
           pair('buyDelayMinMs', 'buyDelayMaxMs', 0.1),
+          h('h4', { textContent: 'Ralentissement après limite EA', style: 'grid-column:1 / -1;margin-top:4px' }),
+          h('span', { textContent: 'Multiplier les délais à chaque limite (1 = jamais)' }),
+          h('span', { className: 'pair' }, '×', input('paceStep', 0.1, 1, 1)),
+          h('span', { textContent: 'Ralentissement maximal' }),
+          h('span', { className: 'pair' }, '×', input('paceMax', 0.5, 1, 1)),
+          h('span', { textContent: 'Retour au rythme normal après (sans limite)' }),
+          h('span', { className: 'pair' }, input('paceResetMin', 5), 'min'),
         ),
-        h('div', { className: 'note', style: 'margin-top:6px', textContent: 'Plus rapide = plus de risque de limite EA ou de captcha. Après une limite EA, le rythme est ralenti automatiquement (jusqu’à ×4).' }),
+        h('div', { className: 'row', style: 'margin-top:6px' }, h('span', { className: 'note grow', textContent: paceState }), resetBtn),
+        h('div', { className: 'note', style: 'margin-top:4px', textContent: 'Plus rapide = plus de risque de limite EA ou de captcha.' }),
       );
       this.speedEl.open = open;
+      this.paceShown = pace;
     }
 
     renderFooter() {
@@ -1573,7 +1627,14 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       const open = q.filter(isOpen).length;
       const spent = got.reduce((s, x) => s + x.price, 0);
       const planned = q.reduce((s, x) => s + (x.price || x.start || 0), 0);
-      const cur = q.find((x) => x.status === 'searching');
+      const cur = q.find((x) => x.status === 'searching') ?? q.find(isOpen);
+      const sets = [...new Set(q.map((x) => x.set))];
+      const setLine = cur
+        ? (() => {
+            const inSet = q.filter((x) => x.set === cur.set);
+            return `Set ${sets.indexOf(cur.set) + 1}/${sets.length} « ${cur.set} » : ${inSet.filter((x) => !isOpen(x)).length}/${inSet.length} traités`;
+          })()
+        : '';
       return [
         h(
           'div',
@@ -1583,6 +1644,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           tile('Coût réel', fmtNum(got.reduce((s, x) => s + taxOf(x.price), 0)), 'taxe à la revente', 'neg'),
         ),
         bar([['ok', got.length], ['over', fail]], q.length),
+        setLine ? h('div', { className: 'note', style: 'color:#e6e7eb', textContent: setLine }) : null,
         cur ? h('div', { className: 'note', textContent: `En cours : ${cur.name}${cur.max ? ` ≤ ${fmtNum(cur.max)}${cur.max > cur.start ? ` (relevé, plafond ${fmtNum(cur.cap)})` : ''}` : ' (sondage)'}` }) : null,
       ].filter(Boolean);
     }
@@ -1756,6 +1818,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       this.salesBadge.textContent = String(s.unsold);
       if (s.unsold) this.tabBtns.sales.append(this.salesBadge);
       else this.salesBadge.remove();
+      if (s.pace !== this.paceShown && !this.speedEl.contains(this.speedEl.getRootNode().activeElement)) this.renderSpeed();
       if (s.lastEventId !== this.shownEventId) this.renderEvents();
       this.live.classList.toggle('on', s.running);
       this.tick();
