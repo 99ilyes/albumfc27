@@ -13,7 +13,12 @@
   const HARD_CAP = 2 * HOUR;
   const CALM_MS = 30 * 6e4;
   const LIMITS = { searchesPerHour: 300, searchesPerDay: 1500, purchasesPerDay: 150 };
-  const DELAY = [4e3, 8e3];
+  const SPEED_DEFAULTS = { minDelayMs: 4e3, maxDelayMs: 8e3, buyDelayMinMs: 300, buyDelayMaxMs: 900 };
+  const SPEED_PRESETS = [
+    ['Prudent', { minDelayMs: 7e3, maxDelayMs: 12e3, buyDelayMinMs: 500, buyDelayMaxMs: 1200 }],
+    ['Normal', SPEED_DEFAULTS],
+    ['Rapide', { minDelayMs: 2e3, maxDelayMs: 4e3, buyDelayMinMs: 150, buyDelayMaxMs: 500 }],
+  ];
   const PILE_MAX = 100;
   const PAGE_SIZE = 20;
   const PROBE_PAGES = 3;
@@ -323,7 +328,9 @@
   function loadConfig() {
     const raw = load(K_CONFIG, {});
     const pct = Number(raw.raisePct);
-    return { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE };
+    const cfg = { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE, ...SPEED_DEFAULTS };
+    for (const k of Object.keys(SPEED_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = raw[k];
+    return cfg;
   }
 
   // Ancien format (nombre = prix d'achat) vers { price, sell, defId, name }
@@ -702,7 +709,8 @@
       this.emit();
     }
     delay() {
-      return rand(...DELAY) * this.guard.pace();
+      const c = this.getConfig();
+      return rand(c.minDelayMs, c.maxDelayMs) * this.guard.pace();
     }
     async sleep(ms, label) {
       if (this.stopRequested) return;
@@ -878,7 +886,7 @@
     }
 
     async buyAndList(it, e) {
-      await sleep(rand(300, 900));
+      await sleep(rand(this.getConfig().buyDelayMinMs, this.getConfig().buyDelayMaxMs));
       if (this.stopRequested) return 'stop';
       const name = e.name || it.name;
       this.activity(`Achat de ${name} à ${fmtNum(it.buyNow)}…`);
@@ -1123,6 +1131,13 @@ footer.hidden { display: none; }
 .note.warn { color: #ffa94d; }
 .raise { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #a9aebb; }
 .raise input { width: 52px; text-align: right; }
+details.speed { font-size: 11px; color: #a9aebb; }
+details.speed summary { cursor: pointer; user-select: none; }
+details.speed .grid { display: grid; grid-template-columns: 1fr auto; gap: 6px 8px; align-items: center; margin-top: 6px; }
+details.speed .pair { display: flex; align-items: center; gap: 4px; color: #7c8190; }
+details.speed .pair input { width: 54px; text-align: right; }
+details.speed .presets { display: flex; gap: 4px; }
+details.speed .presets button.on { background: #364fc7; color: #fff; }
 button.big { width: 100%; padding: 10px; font-size: 13px; }
 .hero { background: #1b1e25; border-radius: 10px; padding: 10px 12px; display: flex; align-items: baseline; gap: 10px; }
 .hero span { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #8a8f9c; }
@@ -1438,7 +1453,53 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       this.mainBtn = h('button', { className: 'big go' });
       this.mainBtn.onclick = () => (this.engine.mode === 'buy' ? this.engine.stop('Achats arrêtés', true) : void this.engine.validate());
       this.resumeBtn = h('button', { className: 'big', onclick: () => void this.engine.runQueue() });
-      return h('footer', {}, this.recapEl, this.raiseRow, this.mainBtn, this.resumeBtn);
+      this.speedEl = h('details', { className: 'speed' });
+      this.renderSpeed();
+      return h('footer', {}, this.recapEl, this.raiseRow, this.speedEl, this.mainBtn, this.resumeBtn);
+    }
+
+    // Réglages de vitesse : préréglages + délais (s), appliqués immédiatement, même pendant les achats
+    renderSpeed() {
+      const c = this.config;
+      const keys = Object.keys(SPEED_DEFAULTS);
+      const active = SPEED_PRESETS.find(([, v]) => keys.every((k) => v[k] === c[k]))?.[0];
+      const sec = (ms) => String(Math.round(ms / 100) / 10).replace('.', ',');
+      const input = (k, stepS) => {
+        const i = h('input', { type: 'number', min: '0', step: String(stepS), value: String(c[k] / 1e3) });
+        i.onchange = () => {
+          const v = Math.round(Math.max(0, Number(String(i.value).replace(',', '.')) || 0) * 1e3);
+          const patch = { [k]: v };
+          // min ≤ max : la borne modifiée entraîne l'autre
+          if (k === 'minDelayMs' && v > c.maxDelayMs) patch.maxDelayMs = v;
+          if (k === 'maxDelayMs' && v < c.minDelayMs) patch.minDelayMs = v;
+          if (k === 'buyDelayMinMs' && v > c.buyDelayMaxMs) patch.buyDelayMaxMs = v;
+          if (k === 'buyDelayMaxMs' && v < c.buyDelayMinMs) patch.buyDelayMinMs = v;
+          this.setConfig(patch);
+          // Reconstruction différée : retirer le champ encore focalisé pendant son « change » lève une erreur
+          setTimeout(() => this.renderSpeed());
+        };
+        return i;
+      };
+      const pair = (a, b, stepS) => h('span', { className: 'pair' }, input(a, stepS), '–', input(b, stepS), 's');
+      const presets = SPEED_PRESETS.map(([name, v]) =>
+        h('button', { className: `small${name === active ? ' on' : ''}`, textContent: name, onclick: () => (this.setConfig({ ...v }), this.renderSpeed()) }),
+      );
+      const open = this.speedEl.open;
+      this.speedEl.replaceChildren(
+        h('summary', { textContent: `Vitesse : ${active ?? 'personnalisée'} (${sec(c.minDelayMs)}–${sec(c.maxDelayMs)} s entre recherches)` }),
+        h(
+          'div',
+          { className: 'grid' },
+          h('span', { textContent: 'Préréglage' }),
+          h('span', { className: 'presets' }, ...presets),
+          h('span', { textContent: 'Délai entre recherches' }),
+          pair('minDelayMs', 'maxDelayMs', 0.5),
+          h('span', { textContent: 'Délai avant achat' }),
+          pair('buyDelayMinMs', 'buyDelayMaxMs', 0.1),
+        ),
+        h('div', { className: 'note', style: 'margin-top:6px', textContent: 'Plus rapide = plus de risque de limite EA ou de captcha. Après une limite EA, le rythme est ralenti automatiquement (jusqu’à ×4).' }),
+      );
+      this.speedEl.open = open;
     }
 
     renderFooter() {
