@@ -12,8 +12,9 @@
   const SOFT_CAP = 30 * 6e4;
   const HARD_CAP = 2 * HOUR;
   const CALM_MS = 30 * 6e4;
-  // Quotas (0 = illimité), comptés avec SnipeFC27 ; quotidiens désactivés par défaut
-  const QUOTA_DEFAULTS = { quotaSearchHour: 300, quotaSearchDay: 0, quotaBuyDay: 0 };
+  // Quotas (0 = illimité), comptés avec SnipeFC27 ; désactivés par défaut
+  const QUOTA_DEFAULTS = { quotaSearchHour: 0, quotaSearchDay: 0, quotaBuyDay: 0 };
+  const CONFIG_VERSION = 3;
   const SPEED_DEFAULTS = { minDelayMs: 4e3, maxDelayMs: 8e3, buyDelayMinMs: 300, buyDelayMaxMs: 900 };
   // Ralentissement après une limite EA : délais × paceStep à chaque limite, plafond paceMax, retour à ×1 après paceResetMin sans limite
   const PACE_DEFAULTS = { paceStep: 1.5, paceMax: 4, paceResetMin: 30 };
@@ -336,9 +337,11 @@
   const eventType = (msg) => EVENT_RULES.find(([re]) => re.test(msg))?.[1];
 
   function loadConfig() {
-    const raw = load(K_CONFIG, {});
+    const raw = load(K_CONFIG, {}) ?? {};
+    // v3 : quota horaire désactivé par défaut (l'ancien défaut de 300 était enregistré avec les réglages)
+    if (raw.cfgV !== CONFIG_VERSION) delete raw.quotaSearchHour;
     const pct = Number(raw.raisePct);
-    const cfg = { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE, ...SPEED_DEFAULTS, ...PACE_DEFAULTS, ...QUOTA_DEFAULTS };
+    const cfg = { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE, ...SPEED_DEFAULTS, ...PACE_DEFAULTS, ...QUOTA_DEFAULTS, cfgV: CONFIG_VERSION };
     for (const k of Object.keys(SPEED_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = raw[k];
     for (const k of Object.keys(QUOTA_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = Math.floor(raw[k]);
     for (const k of Object.keys(PACE_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= (k === 'paceResetMin' ? 0 : 1)) cfg[k] = raw[k];

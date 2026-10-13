@@ -21,7 +21,7 @@
 
 ## Garde-fous
 
-- Quotas réglables dans « Vitesse » (0 = illimité), cumulés avec SnipeFC27 : recherches par heure (300 par défaut), recherches et achats par 24 h (désactivés par défaut) ; refus de démarrer si SnipeFC27 tourne, liste de transferts pleine (100) : attente des ventes.
+- Quotas réglables dans « Vitesse » (0 = illimité), cumulés avec SnipeFC27 : recherches par heure, recherches et achats par 24 h (tous désactivés par défaut) ; refus de démarrer si SnipeFC27 tourne, liste de transferts pleine (100) : attente des ventes.
 - Limites de débit EA (426, 429, 512, 521) ou 8 achats ratés d'affilée : pause de 3 min (doublée si ça se répète, max 30 min), rythme ralenti selon les réglages de vitesse, reprise automatique.
 - Captcha / vérification (458, 460, 494) : pause de 30 min (doublée si ça se répète dans les 24 h, max 2 h), notification, reprise automatique. Le captcha n'est pas résolu automatiquement.
 - Session expirée : rechargement de la Web App, clic sur le bouton de connexion si la session EA est encore ouverte, reprise des achats.
