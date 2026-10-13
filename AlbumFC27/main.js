@@ -12,7 +12,8 @@
   const SOFT_CAP = 30 * 6e4;
   const HARD_CAP = 2 * HOUR;
   const CALM_MS = 30 * 6e4;
-  const LIMITS = { searchesPerHour: 300, searchesPerDay: 1500, purchasesPerDay: 150 };
+  // Quotas (0 = illimité), comptés avec SnipeFC27 ; quotidiens désactivés par défaut
+  const QUOTA_DEFAULTS = { quotaSearchHour: 300, quotaSearchDay: 0, quotaBuyDay: 0 };
   const SPEED_DEFAULTS = { minDelayMs: 4e3, maxDelayMs: 8e3, buyDelayMinMs: 300, buyDelayMaxMs: 900 };
   // Ralentissement après une limite EA : délais × paceStep à chaque limite, plafond paceMax, retour à ×1 après paceResetMin sans limite
   const PACE_DEFAULTS = { paceStep: 1.5, paceMax: 4, paceResetMin: 30 };
@@ -284,7 +285,7 @@
     all(kind) {
       return [...this.s[kind], ...(this.other()[kind] ?? [])].sort((a, b) => a - b);
     }
-    check() {
+    check(cfg) {
       const lockMs = this.s.lockedUntil - Date.now();
       if (lockMs > 0) return { ok: false, locked: true, stop: `${this.lockKind() === 'soft' ? 'Pause limite EA' : 'Pause anti-captcha'} encore ${fmtMin(lockMs)}` };
       const now = Date.now();
@@ -294,12 +295,12 @@
         const w = Math.max(6e4, arr[arr.length - max] + DAY - now + 5e3);
         return { ok: false, waitMs: w, reason: `Quota journalier ${what} atteint (max ${max}, partagé avec SnipeFC27), reprise dans ${fmtMin(w)}` };
       };
-      if (searches.length >= LIMITS.searchesPerDay) return dayWait(searches, 'de recherches', LIMITS.searchesPerDay);
-      if (purchases.length >= LIMITS.purchasesPerDay) return dayWait(purchases, "d'achats", LIMITS.purchasesPerDay);
+      if (cfg.quotaSearchDay > 0 && searches.length >= cfg.quotaSearchDay) return dayWait(searches, 'de recherches', cfg.quotaSearchDay);
+      if (cfg.quotaBuyDay > 0 && purchases.length >= cfg.quotaBuyDay) return dayWait(purchases, "d'achats", cfg.quotaBuyDay);
       const hour = searches.filter((t) => now - t < HOUR);
-      if (hour.length >= LIMITS.searchesPerHour) {
+      if (cfg.quotaSearchHour > 0 && hour.length >= cfg.quotaSearchHour) {
         const w = hour[0] + HOUR - now + 5e3;
-        return { ok: false, waitMs: w, reason: `Quota horaire de recherches atteint (max ${LIMITS.searchesPerHour}), reprise dans ${fmtMin(w)}` };
+        return { ok: false, waitMs: w, reason: `Quota horaire de recherches atteint (max ${cfg.quotaSearchHour}), reprise dans ${fmtMin(w)}` };
       }
       return { ok: true };
     }
@@ -337,8 +338,9 @@
   function loadConfig() {
     const raw = load(K_CONFIG, {});
     const pct = Number(raw.raisePct);
-    const cfg = { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE, ...SPEED_DEFAULTS, ...PACE_DEFAULTS };
+    const cfg = { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE, ...SPEED_DEFAULTS, ...PACE_DEFAULTS, ...QUOTA_DEFAULTS };
     for (const k of Object.keys(SPEED_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = raw[k];
+    for (const k of Object.keys(QUOTA_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = Math.floor(raw[k]);
     for (const k of Object.keys(PACE_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= (k === 'paceResetMin' ? 0 : 1)) cfg[k] = raw[k];
     return cfg;
   }
@@ -664,7 +666,7 @@
     // Attend que les quotas le permettent ; false si arrêt ou pause
     async waitGuard() {
       while (!this.stopRequested) {
-        const g = this.guard.check();
+        const g = this.guard.check(this.getConfig());
         if (g.ok) return true;
         if (g.locked) {
           const mode = this.mode;
@@ -696,7 +698,7 @@
         this.log('SnipeFC27 tourne : arrête-le avant (quotas EA partagés)');
         return false;
       }
-      const g = this.guard.check();
+      const g = this.guard.check(this.getConfig());
       if (g.locked) {
         save(K_LOCK_RESUME, { mode });
         this.scheduleResume();
@@ -1548,6 +1550,13 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           h('span', { className: 'pair' }, '×', input('paceMax', 0.5, 1, 1)),
           h('span', { textContent: 'Retour au rythme normal après (sans limite)' }),
           h('span', { className: 'pair' }, input('paceResetMin', 5), 'min'),
+          h('h4', { textContent: 'Quotas (0 = illimité, cumulés avec SnipeFC27)', style: 'grid-column:1 / -1;margin-top:4px' }),
+          h('span', { textContent: 'Recherches max par heure' }),
+          h('span', { className: 'pair' }, input('quotaSearchHour', 50)),
+          h('span', { textContent: 'Recherches max par 24 h' }),
+          h('span', { className: 'pair' }, input('quotaSearchDay', 100)),
+          h('span', { textContent: 'Achats max par 24 h' }),
+          h('span', { className: 'pair' }, input('quotaBuyDay', 10)),
         ),
         h('div', { className: 'row', style: 'margin-top:6px' }, h('span', { className: 'note grow', textContent: paceState }), resetBtn),
         h('div', { className: 'note', style: 'margin-top:4px', textContent: 'Plus rapide = plus de risque de limite EA ou de captcha.' }),
