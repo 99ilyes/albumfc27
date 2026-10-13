@@ -14,7 +14,8 @@ L'extension tourne ensuite seule : elle attend quand les quotas ou les crédits 
 
 ## Fonctionnement
 
-- Achète les joueurs or 84+ pas encore dans la Galerie (champ `isCollected` des réponses EA), entre 650 et 15 000 crédits, en privilégiant le meilleur rapport points / crédits (`gradingScore` EA, plafond 1,4 crédit par point).
+- Repérage : balaye le marché or entre 1 000 et 15 000 et lit dans chaque réponse EA le statut Galerie (`isCollected`), le score (`gradingScore`) et le prix moyen (`marketAverage`) de chaque joueur.
+- Achat ciblé : recherche un par un les joueurs 84+ pas encore dans la Galerie dont le prix moyen reste sous 1,5 crédit par point, du meilleur rapport au moins bon, et achète l'annonce la moins chère au prix moyen au plus. Sans annonce, le joueur est retenté 30 min plus tard ; sans aucun joueur rentable, nouveau repérage 10 min plus tard.
 - Remet chaque carte en vente à son prix d'achat (la carte reste comptée dans la Galerie), encaisse les ventes, remet les invendus au même prix.
 - Coût réel : la taxe EA de 5 % par carte vendue, environ 0,065 crédit par point, soit environ 200 000 crédits pour 3 millions de points.
 

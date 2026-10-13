@@ -111,7 +111,7 @@
 
   // Mode niveau 10 : uniquement les cartes or 84+ au meilleur rapport points / crédits
   const LEVEL10_SET = { id: 'level10', label: 'Niveau 10 · Or 84+', criteria: { level: 'gold' }, minPrice: 650, maxPrice: 15000, minRating: 84, maxRating: 99, enabled: true };
-  const LEVEL10_RATIO = 1.4;
+  const LEVEL10_RATIO = 1.5;
 
   const describeCriteria = (c) =>
     Object.entries(c)
@@ -138,7 +138,12 @@
       if (!defId || it.itemType !== 'player') continue;
       const collected = it.isCollected === true;
       const prev = netItems.get(defId);
-      netItems.set(defId, { collected: collected || !!prev?.collected, score: Number(it.gradingScore) || prev?.score || 0 });
+      netItems.set(defId, {
+        collected: collected || !!prev?.collected,
+        score: Number(it.gradingScore) || prev?.score || 0,
+        rating: Number(it.rating) || prev?.rating || 0,
+        avg: Number(it.marketAverage) || prev?.avg || 0,
+      });
       if (club && collected) clubCollected.add(defId);
     }
   }
@@ -562,6 +567,9 @@
     expiries = load(K_EXPIRIES, {});
     setStats = load(K_SETSTATS, {});
     total = { score: 0, bought: 0, tax: 0, ...load(K_TOTAL, {}) };
+    cooldown = new Map();
+    l10Cursor = { stepIdx: 0, page: 1 };
+    l10Iter = 0;
     starting = false;
     seen = new Set();
     cursor = { setId: null, stepIdx: 0, page: 1 };
@@ -786,48 +794,17 @@
             continue;
           }
 
-          let idx = sets.findIndex((s) => s.id === this.cursor.setId);
-          if (idx < 0) {
-            idx = 0;
-            this.cursor = { setId: sets[0].id, stepIdx: 0, page: 1 };
-          }
-          const set = sets[idx];
-          const steps = ladder(set.maxPrice, set.minPrice ?? 0);
-          const lo = this.cursor.stepIdx > 0 ? steps[this.cursor.stepIdx - 1] : (set.minPrice ?? 0);
-          if (lo >= available) {
-            this.feed(`${set.label} : paliers suivants au-dessus des crédits disponibles (${Math.floor(available)})`);
-            if (await this.nextSet(sets, idx, cfg)) break;
-            continue;
-          }
-          const hi = steps[this.cursor.stepIdx];
-          this.activity(`${set.label} : ${lo}–${hi}, page ${this.cursor.page}`);
-          const res = await searchMarket(set, lo, hi, this.cursor.page);
-          this.stats.searches++;
-          this.guard.recordSearch();
-
-          if (!res.success) {
-            if (res.status === 401) {
-              this.sessionExpired();
-              break;
+          if (cfg.mode === 'level10') {
+            const r = await this.level10Step(cfg, available);
+            if (r === 'stop') break;
+            if (r === 'idle') {
+              const w = 10 * 6e4 * rand(0.8, 1.2);
+              this.activity(`Aucun joueur manquant rentable pour l'instant, nouveau repérage à ${clock(w)}`);
+              await this.sleep(w);
+              await this.maintain();
+              continue;
             }
-            if (BAD_STATUS.has(res.status)) {
-              this.lockout(`Statut EA ${res.status} (captcha ou limite)`);
-              break;
-            }
-            if (res.status === 403) {
-              this.stop(`Recherche refusée (403)${errText(res.error)}. Vérifier les critères de l'ensemble « ${set.label} »`);
-              break;
-            }
-            this.log(`Recherche en échec (statut ${res.status})${errText(res.error)}`);
-          } else {
-            const outcome = await this.handleResults(set, res.data, available, cfg);
-            if (outcome === 'stopped' || this.stopRequested) break;
-            const more = res.data.length >= PAGE_SIZE && this.cursor.page < cfg.maxPagesPerStep;
-            if (outcome === 'again') this.feed(`${set.label} : joueurs manquants restants, même page`);
-            else if (more) this.cursor.page++;
-            else if (this.cursor.stepIdx + 1 < steps.length) this.cursor = { ...this.cursor, stepIdx: this.cursor.stepIdx + 1, page: 1 };
-            else if (await this.nextSet(sets, idx, cfg)) break;
-          }
+          } else if (await this.customStep(sets, cfg, available)) break;
           if (this.stopRequested) break;
           if (Date.now() - this.lastMaintain > MAINTAIN_EVERY_MS) {
             await sleep(rand(600, 1400));
@@ -865,6 +842,139 @@
       } catch (e) {
         this.log(`Détection Galerie impossible : ${e instanceof Error ? e.message : String(e)}`);
       }
+    }
+
+    // true = arrêter la boucle
+    searchFailed(res, label) {
+      if (res.status === 401) {
+        this.sessionExpired();
+        return true;
+      }
+      if (BAD_STATUS.has(res.status)) {
+        this.lockout(`Statut EA ${res.status} (captcha ou limite)`);
+        return true;
+      }
+      if (res.status === 403) {
+        this.stop(`Recherche refusée (403)${errText(res.error)} (${label})`);
+        return true;
+      }
+      this.log(`Recherche en échec (statut ${res.status})${errText(res.error)}`);
+      return false;
+    }
+
+    // Joueurs 84+ repérés dans les réponses EA, pas encore dans la Galerie, au meilleur rapport points / crédits
+    level10Candidates(cfg, available) {
+      const ratio = maxRatio(cfg);
+      const now = Date.now();
+      const out = [];
+      for (const [defId, it] of netItems) {
+        if (it.collected || this.owns(defId) || (this.cooldown.get(defId) ?? 0) > now) continue;
+        if (it.rating < LEVEL10_SET.minRating || !(it.score > 0) || !(it.avg > 0)) continue;
+        const price = roundUp(it.avg);
+        if (price > available || price > LEVEL10_SET.maxPrice || (ratio > 0 && price / it.score > ratio)) continue;
+        out.push({ defId, rating: it.rating, score: it.score, price });
+      }
+      return out.sort((a, b) => b.score / b.price - a.score / a.price);
+    }
+
+    async level10Step(cfg, available) {
+      this.l10Iter++;
+      const cands = this.level10Candidates(cfg, available);
+      if (cands.length && this.l10Iter % 4 !== 0) return this.level10Target(cands[0], cands.length, cfg, available);
+      return this.level10Discover(cfg, available, cands.length);
+    }
+
+    // Recherche ciblée d'un joueur manquant, achat au prix moyen du marché au plus
+    async level10Target(c, n, cfg, available) {
+      this.activity(`Niveau 10 : joueur ${c.rating} manquant (+${c.score} pts) ≤ ${c.price}, ${n} repéré${n > 1 ? 's' : ''}`);
+      const res = await searchMarket({ criteria: { defId: [c.defId] } }, 0, c.price, 1);
+      this.stats.searches++;
+      this.guard.recordSearch();
+      if (!res.success) return this.searchFailed(res, 'recherche ciblée') ? 'stop' : 'ok';
+      const offers = res.data
+        .filter((it) => it.defId === c.defId && it.buyNow > 0 && it.buyNow <= c.price && it.buyNow <= available && !this.seen.has(it.tradeId) && !(it.expires > 0 && it.expires <= 3) && !it.collected)
+        .sort((a, b) => a.buyNow - b.buyNow);
+      if (!offers.length) {
+        this.cooldown.set(c.defId, Date.now() + 30 * 6e4);
+        this.feed(`Joueur ${c.rating} (+${c.score} pts) : aucune annonce ≤ ${c.price}, réessai dans 30 min`);
+        return 'ok';
+      }
+      const it = offers[0];
+      it.score = c.score;
+      this.seen.add(it.tradeId);
+      const r = await this.buyAndList(it, LEVEL10_SET, cfg);
+      if (r === 'stopped') return 'stop';
+      if (r === 'missed') {
+        this.cooldown.set(c.defId, Date.now() + 5 * 6e4);
+        if (++this.misses >= MAX_MISSES) {
+          this.lockout(`${this.misses} achats ratés d'affilée, soft ban probable`);
+          return 'stop';
+        }
+      } else this.misses = 0;
+      return 'ok';
+    }
+
+    // Balayage du marché or (1 000 à 15 000) pour repérer les joueurs 84+ manquants et leur prix moyen
+    async level10Discover(cfg, available, known) {
+      const set = { ...LEVEL10_SET, minPrice: 1000 };
+      const steps = ladder(set.maxPrice, set.minPrice);
+      const cur = this.l10Cursor;
+      if (cur.stepIdx >= steps.length) Object.assign(cur, { stepIdx: 0, page: 1 });
+      const lo = cur.stepIdx > 0 ? steps[cur.stepIdx - 1] : set.minPrice;
+      const hi = steps[cur.stepIdx];
+      this.activity(`Niveau 10 : repérage ${lo}–${hi}, page ${cur.page} (${known} joueur${known > 1 ? 's' : ''} repéré${known > 1 ? 's' : ''})`);
+      const res = await searchMarket(set, lo, hi, cur.page);
+      this.stats.searches++;
+      this.guard.recordSearch();
+      if (!res.success) return this.searchFailed(res, 'repérage') ? 'stop' : 'ok';
+      const outcome = await this.handleResults(set, res.data, available, cfg);
+      if (outcome === 'stopped') return 'stop';
+      if (outcome !== 'again') {
+        if (res.data.length >= PAGE_SIZE && cur.page < cfg.maxPagesPerStep) cur.page++;
+        else if (cur.stepIdx + 1 < steps.length) Object.assign(cur, { stepIdx: cur.stepIdx + 1, page: 1 });
+        else {
+          Object.assign(cur, { stepIdx: 0, page: 1 });
+          const n = this.level10Candidates(cfg, available).length;
+          this.log(`Repérage complet : ${n} joueurs 84+ manquants achetables repérés`);
+          if (!n) return 'idle';
+        }
+      }
+      return 'ok';
+    }
+
+    // Ensembles personnalisés : balayage par paliers ; renvoie true s'il faut arrêter la boucle
+    async customStep(sets, cfg, available) {
+      let idx = sets.findIndex((s) => s.id === this.cursor.setId);
+      if (idx < 0) {
+        idx = 0;
+        this.cursor = { setId: sets[0].id, stepIdx: 0, page: 1 };
+      }
+      const set = sets[idx];
+      const steps = ladder(set.maxPrice, set.minPrice ?? 0);
+      const lo = this.cursor.stepIdx > 0 ? steps[this.cursor.stepIdx - 1] : (set.minPrice ?? 0);
+      if (lo >= available) {
+        this.feed(`${set.label} : paliers suivants au-dessus des crédits disponibles (${Math.floor(available)})`);
+        if (await this.nextSet(sets, idx, cfg)) return true;
+        return false;
+      }
+      const hi = steps[this.cursor.stepIdx];
+      this.activity(`${set.label} : ${lo}–${hi}, page ${this.cursor.page}`);
+      const res = await searchMarket(set, lo, hi, this.cursor.page);
+      this.stats.searches++;
+      this.guard.recordSearch();
+
+      if (!res.success) {
+        if (this.searchFailed(res, set.label)) return true;
+      } else {
+        const outcome = await this.handleResults(set, res.data, available, cfg);
+        if (outcome === 'stopped' || this.stopRequested) return true;
+        const more = res.data.length >= PAGE_SIZE && this.cursor.page < cfg.maxPagesPerStep;
+        if (outcome === 'again') this.feed(`${set.label} : joueurs manquants restants, même page`);
+        else if (more) this.cursor.page++;
+        else if (this.cursor.stepIdx + 1 < steps.length) this.cursor = { ...this.cursor, stepIdx: this.cursor.stepIdx + 1, page: 1 };
+        else if (await this.nextSet(sets, idx, cfg)) return true;
+      }
+      return false;
     }
 
     // Passe à l'ensemble suivant ; renvoie true s'il faut arrêter la boucle.
@@ -968,6 +1078,8 @@
       this.guard.recordPurchase();
       this.collected.add(it.defId);
       save(K_COLLECTED, [...this.collected]);
+      const known = netItems.get(it.defId);
+      if (known) known.collected = true;
       this.bumpSet(set.id, 'bought', 1);
       this.bumpSet(set.id, 'score', score);
       this.bumpSet(set.id, 'spent', it.buyNow);

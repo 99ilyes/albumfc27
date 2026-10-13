@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AlbumFC27",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Complète la Galerie FC 27 : achète les joueurs des ensembles et les remet en vente au prix d'achat.",
   "action": { "default_popup": "popup.html", "default_title": "AlbumFC27" },
   "permissions": ["storage"],
