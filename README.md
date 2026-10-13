@@ -12,6 +12,7 @@
 4. **Cocher les joueurs** : par joueur, par set (case de l'en-tête) ou tout ce qui est filtré (recherche par nom, rareté). Le prix max est prérempli (prix de référence + 10 %) et modifiable. Un joueur présent dans plusieurs sets n'est acheté qu'une fois.
 5. **Coût projeté** (bas du panneau) : joueurs cochés, crédits engagés (prix de référence), coût projeté = fourchette entre la taxe seule (revente au prix d'achat) et la taxe plus un palier (revente sous la concurrence). Alerte si les crédits disponibles ne couvrent pas tout.
 6. **Acheter et revendre** : pour chaque joueur, achat de l'annonce la moins chère sous le prix max, puis remise en vente immédiate un palier sous la moins chère des autres annonces vues (50 crédits sous 1 000, 100 de 1 000 à 10 000, etc.), ou au prix d'achat s'il n'y en a pas d'autre. Barre de progression et statut par joueur.
+   **Hausse auto** : si aucune annonce n'existe sous le prix max, le max est relevé de 5 % (au moins un palier EA) et une nouvelle recherche est faite, jusqu'à +20 % du prix max (réglable, 0 = désactivé). Le pied du panneau indique le total possible avec la hausse.
 
 ## Fonctionnement
 

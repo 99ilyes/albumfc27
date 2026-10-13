@@ -26,6 +26,7 @@
     watchMinutes: 5,
     minSellPct: 0,
     lockMinutes: 30,
+    autoRaisePct: 20,
     maxSearchesPerHour: 300,
     maxSearchesPerDay: 1500,
     maxPurchasesPerDay: 150,
@@ -34,6 +35,9 @@
   const step = (p) => (p < 1e3 ? 50 : p < 1e4 ? 100 : p < 5e4 ? 250 : p < 1e5 ? 500 : 1e3);
   const priceDown = (p) => Math.max(150, p - step(p - 1));
   const roundUp = (p) => Math.max(200, Math.ceil(p / step(p)) * step(p));
+  // Hausse auto : +5 % arrondi au palier EA (au moins un palier), sans dépasser le plafond
+  const raisePrice = (p, cap) => Math.min(cap, Math.max(p + step(p), roundUp(p * 1.05)));
+  const capFor = (max, pct) => (pct > 0 ? Math.max(max, roundUp(max * (1 + pct / 100))) : max);
   const BOUNDS = [400, 700, 1e3, 1500, 2500, 5e3, 1e4, 25e3, 5e4, 1e5, 2e5, 5e5, 1e6, 15e6];
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -627,7 +631,9 @@
         out.push({ p, max: Number(max), ref, ...roundTrip(ref) });
       }
       const sum = (k) => out.reduce((s, x) => s + x[k], 0);
-      return { list: out, noPrice, engaged: sum('ref'), maxEngaged: sum('max'), low: sum('low'), high: sum('high') };
+      const pct = this.getConfig().autoRaisePct;
+      const capEngaged = out.reduce((s, x) => s + capFor(x.max, pct), 0);
+      return { list: out, noPrice, engaged: sum('ref'), maxEngaged: sum('max'), capEngaged, low: sum('low'), high: sum('high') };
     }
 
     // Set envoyé depuis une page Galerie de fut.gg (joueurs, defId, prix fut.gg)
@@ -881,7 +887,8 @@
       const { list } = this.picks();
       if (!list.length) return this.log('Aucun joueur coché avec un prix max');
       const setOf = (defId) => this.setList().find((s) => s.players?.[defId])?.name ?? '';
-      this.queue = list.map(({ p, max }) => ({ defId: p.defId, name: p.name, rating: p.rating, max, set: setOf(p.defId), status: 'pending', tries: 0, price: 0, sell: 0 }));
+      const pct = this.getConfig().autoRaisePct;
+      this.queue = list.map(({ p, max }) => ({ defId: p.defId, name: p.name, rating: p.rating, max, max0: max, cap: capFor(max, pct), set: setOf(p.defId), status: 'pending', tries: 0, price: 0, sell: 0 }));
       save(K_QUEUE, this.queue);
       this.touch();
       await this.runQueue();
@@ -927,7 +934,12 @@
 
     async buyOne(e) {
       const cfg = this.getConfig();
-      while (!this.stopRequested && e.tries < cfg.triesPerPlayer) {
+      e.max0 ??= e.max;
+      e.cap ??= e.max;
+      let raised = false;
+      // Essais au prix max courant ; chaque recherche vide relève le max (plafond e.cap) et accorde un essai de plus
+      while (!this.stopRequested && (e.tries < cfg.triesPerPlayer || raised)) {
+        raised = false;
         if (this.pileCount >= PILE_MAX) {
           this.activity('Liste de transferts pleine : attente de ventes');
           this.log('Liste de transferts pleine (100) : attente de ventes, nouvel essai dans 2 min');
@@ -944,7 +956,7 @@
         if (!(await this.waitGuard(cfg))) return;
         e.status = 'searching';
         e.tries++;
-        this.activity(`Recherche ${e.name} ≤ ${fmtNum(e.max)}, essai ${e.tries}/${cfg.triesPerPlayer}`);
+        this.activity(`Recherche ${e.name} ≤ ${fmtNum(e.max)}${e.max > e.max0 ? ` (relevé, plafond ${fmtNum(e.cap)})` : ''}, essai ${e.tries}`);
         // minBuy alterné : contourne le cache EA sans exclure d'annonce (prix mini 200)
         const res = await searchMarket({ defId: [e.defId] }, e.tries % 2 ? 0 : 150, e.max);
         this.guard.record('searches');
@@ -969,9 +981,15 @@
             if (r === 'stop' || r === 'ok') return;
             missed.add(it.tradeId);
           }
-          if (!cands.length) this.feed(`${e.name} : aucune annonce ≤ ${fmtNum(e.max)}`);
+          const listed = res.data.some((x) => x.defId === e.defId && x.buyNow > 0 && x.buyNow <= e.max);
+          if (!listed && e.max < e.cap) {
+            const prev = e.max;
+            e.max = raisePrice(e.max, e.cap);
+            raised = true;
+            this.feed(`${e.name} : aucune annonce ≤ ${fmtNum(prev)}, prix max relevé à ${fmtNum(e.max)}${e.max >= e.cap ? ' (plafond)' : ''}`);
+          } else if (!cands.length) this.feed(`${e.name} : aucune annonce ≤ ${fmtNum(e.max)}${listed ? ' achetable (crédits)' : ''}`);
         }
-        if (e.tries < cfg.triesPerPlayer) await this.sleep(rand(cfg.minDelayMs, cfg.maxDelayMs));
+        if (e.tries < cfg.triesPerPlayer || raised) await this.sleep(rand(cfg.minDelayMs, cfg.maxDelayMs));
       }
       if (!this.stopRequested && isOpen(e)) {
         e.status = 'notfound';
@@ -1292,6 +1310,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       title: 'Achat',
       items: [
         { key: 'pricePct', label: 'Prix max proposé (% au-dessus du prix de référence)' },
+        { key: 'autoRaisePct', label: 'Hausse auto si introuvable (% max au-dessus du prix max, 0 = non)' },
         { key: 'triesPerPlayer', label: 'Recherches max par joueur' },
         { key: 'coinReserve', label: 'Crédits à garder' },
         { delay: ['minDelayMs', 'maxDelayMs'], label: 'Délai entre recherches (s)' },
@@ -1612,7 +1631,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           p.collected && !q ? 'déjà collecté' : '',
         ];
         const st = q
-          ? h('span', { className: `st${isDone(q) ? ' ok' : isFailed(q) ? ' ko' : ''}`, textContent: `${STATUS_LABEL[q.status] ?? q.status}${q.price ? ` à ${fmtNum(q.price)}` : ''}${q.sell ? `, en vente à ${fmtNum(q.sell)}` : ''}` })
+          ? h('span', { className: `st${isDone(q) ? ' ok' : isFailed(q) ? ' ko' : ''}`, textContent: `${STATUS_LABEL[q.status] ?? q.status}${q.status === 'notfound' && !q.price ? ` (≤ ${fmtNum(q.max)})` : ''}${isOpen(q) && q.max0 && q.max > q.max0 ? ` · max relevé à ${fmtNum(q.max)}` : ''}${q.price ? ` à ${fmtNum(q.price)}` : ''}${q.sell ? `, en vente à ${fmtNum(q.sell)}` : ''}` })
           : null;
         row.append(cb, h('span', { className: 'n' }, p.rating ? h('i', { textContent: String(p.rating) }) : null, p.name), max, h('span', { className: 'm', textContent: metaParts.filter(Boolean).join(' · ') }));
         if (st) row.append(st);
@@ -1671,7 +1690,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         cell('Coût projeté', pk.list.length ? `${fmtNum(pk.low)}–${fmtNum(pk.high)}` : '0'),
       );
       const notes = [];
-      if (pk.list.length) notes.push(`Prix max cumulés ${fmtNum(pk.maxEngaged)}. Coût : taxe 5 % si revendu au prix d'achat, plus un palier si revendu sous la concurrence.`);
+      if (pk.list.length) notes.push(`Prix max cumulés ${fmtNum(pk.maxEngaged)}${pk.capEngaged > pk.maxEngaged ? ` (jusqu'à ${fmtNum(pk.capEngaged)} avec la hausse auto)` : ''}. Coût : taxe 5 % si revendu au prix d'achat, plus un palier si revendu sous la concurrence.`);
       if (pk.noPrice) notes.push(`${pk.noPrice} joueur(s) coché(s) sans prix max : ignoré(s).`);
       if (tight) notes.push(`Crédits disponibles ${fmtNum(free)} : les derniers joueurs seront sautés faute de crédits.`);
       this.noteEl.textContent = notes.join(' ');
