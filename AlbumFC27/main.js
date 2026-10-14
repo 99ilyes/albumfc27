@@ -24,8 +24,9 @@
     ['Rapide', { minDelayMs: 2e3, maxDelayMs: 4e3, buyDelayMinMs: 150, buyDelayMaxMs: 500 }],
   ];
   const PILE_MAX = 100;
-  // Page de résultats EA pleine (21 annonces demandées) : il peut exister moins cher
-  const PAGE_FULL = 21;
+  // 21 annonces demandées ; page pleine dès 20 (selon la version, la Web App renvoie 20 ou 21) : il peut exister moins cher
+  const PAGE_COUNT = 21;
+  const PAGE_FULL = 20;
   // Achat (méthode FST) : 10 recherches max par joueur, abandon après 6 achats ratés (concurrence)
   const BUY_SEARCHES = 10;
   const MAX_COMPETITION = 6;
@@ -226,7 +227,7 @@
     const c = new UTSearchCriteriaDTO();
     c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
     c.defId = [defId];
-    c.count = PAGE_FULL;
+    c.count = PAGE_COUNT;
     if (minBuy > 0) c.minBuy = minBuy;
     if (maxBuy > 0) c.maxBuy = maxBuy;
     if (minBid > 0) c.minBid = minBid;
@@ -283,8 +284,10 @@
         req.setPath(`/ut/game/${game}/defid`);
         req.setUrlVariables({ count: DEFID_CHUNK, sort: 'desc', start: 0, type: 'player', defId: ids });
         const tag = {};
+        const timer = setTimeout(() => resolve({ success: false, status: 0, error: 'pas de réponse EA en 20 s' }), 2e4);
         queue.send(req).observe(tag, (obs, r) => {
-          obs.unobserve(tag);
+          clearTimeout(timer);
+          obs.unobserve?.(tag);
           resolve(r?.success && Array.isArray(r.response?.itemData) ? { success: true, items: r.response.itemData } : { success: false, status: Number(r?.status ?? 0), error: r?.error });
         });
       } catch (err) {
@@ -518,7 +521,7 @@
     searching: 'recherche…',
     listed: 'acheté',
     kept: 'acheté, gardé au club',
-    bought: 'acheté, mise en vente échouée',
+    bought: 'acheté, resté dans les non-assignés',
     skipped: 'déjà dans la Galerie',
     moved: 'prix monté',
     notfound: 'non trouvé',
@@ -526,8 +529,8 @@
   };
   const isDone = (q) => q.status === 'listed' || q.status === 'kept' || q.status === 'bought' || q.status === 'skipped';
   const isFailed = (q) => q.status === 'notfound' || q.status === 'nocoins' || q.status === 'moved';
-  // Coût réel d'un achat : prix payé moins le net de la revente (rien de récupéré si gardé au club)
-  const costOf = (q) => (q.status === 'kept' ? q.price : q.price - netOf(q.sell || q.price));
+  // Coût réel d'un achat : prix payé moins le net de la revente (rien de récupéré si la carte n'est pas en vente)
+  const costOf = (q) => (q.status === 'listed' ? q.price - netOf(q.sell || q.price) : q.price);
   // Prix de revente prévu selon le réglage « Après achat »
   const sellFor = (p, cfg) => (cfg.afterBuy === 'keep' ? 0 : cfg.afterBuy === 'markup' ? markupPrice(p, cfg.markupPct) : roundPrice(p));
   const isOpen = (q) => q.status === 'pending' || q.status === 'searching';
@@ -982,26 +985,27 @@
     }
 
     // --- Recherche marché d'un joueur : annonces de cette carte exacte, triées par prix ---
-    async search(defId, opts) {
+    // anyCollected : ne pas s'arrêter sur une carte déjà collectée (relist d'une carte possédée)
+    async search(defId, { anyCollected = false, ...opts } = {}) {
       if (this.stopRequested || !(await this.waitGuard())) return { stop: true };
       const res = await searchMarket(defId, { ...opts, minBid: this.nonce++ % 2 ? 150 : 0 });
       this.guard.record('searches');
       if (!res.success) return this.fatal(res, 'search') ? { stop: true } : { error: res.status || -1 };
       const mine = res.data.filter((x) => x.defId === defId);
-      if (mine.some((x) => x.collected)) return { collected: true };
+      if (!anyCollected && mine.some((x) => x.collected)) return { collected: true };
       return { items: mine.filter((x) => x.buyNow > 0).sort((x, y) => x.buyNow - y.buyNow), full: res.data.length >= PAGE_FULL };
     }
 
     // Prix de référence (méthode FST) : 4e annonce la moins chère parmi celles publiées depuis plus d'une minute.
     // Page pleine : recherche dichotomique sous ce prix (10 recherches max) tant qu'au moins 4 annonces restent.
     // lowest = annonce la moins chère vue (prix de revente au relist)
-    async checkPrice(p) {
+    async checkPrice(p, { anyCollected = false } = {}) {
       const floor = minPriceFor(p.rareflag, p.rating);
       const seen = [];
       let n = 0;
       const look = async (max) => {
         if (n++) await this.sleep(this.delay(), `Sondage du prix de ${p.name}`);
-        const r = await this.search(p.defId, { maxBuy: max });
+        const r = await this.search(p.defId, { maxBuy: max, anyCollected });
         if (r.items) {
           r.prices = r.items.filter((x) => settled(x.sr)).map((x) => x.buyNow);
           seen.push(...r.prices);
@@ -1208,10 +1212,11 @@
         if (this.stopRequested) return;
         if (e.max > e.cap) {
           const seen = await this.peek(e.defId);
+          if (this.stopRequested) return;
           e.seen = seen;
           return this.giveUp(e, 'moved', `prix au-delà de la tolérance (${fmtNum(e.cap)})${seen ? `, annonce la moins chère ${fmtNum(seen)}` : ''} : modifier le prix pour réessayer`);
         }
-        if (!(await this.affordable(e.start))) return this.giveUp(e, 'nocoins', `crédits insuffisants (${fmtNum(coins())})`);
+        if (!(await this.affordable(150))) return this.giveUp(e, 'nocoins', `crédits insuffisants (${fmtNum(coins())})`);
         e.status = 'searching';
         this.activity(`${e.name} : recherche ≤ ${fmtNum(e.max)}${e.max > e.start ? ` (relevé, tolérance ${fmtNum(e.cap)})` : ''}`);
         const r = await this.search(e.defId, { minBuy, maxBuy: e.max });
@@ -1410,7 +1415,7 @@
           const cur = i.buyNow || b?.sell || b?.price || 0;
           this.activity(`${i.name} : sondage du prix${cur ? ` (était à ${fmtNum(cur)})` : ''}`);
           const ref = this.findPlayer(defId);
-          const r = defId ? await this.checkPrice({ defId, name: i.name, rating: ref?.rating || i.raw?._rating || i.raw?.rating || 0, rareflag: ref?.rareflag ?? i.raw?.rareflag ?? i.raw?._rareflag ?? 0 }) : { lowest: 0 };
+          const r = defId ? await this.checkPrice({ defId, name: i.name, rating: ref?.rating || i.raw?._rating || i.raw?.rating || 0, rareflag: ref?.rareflag ?? i.raw?.rareflag ?? i.raw?._rareflag ?? 0 }, { anyCollected: true }) : { lowest: 0 };
           if (r.stop) break;
           const price = r.lowest >= 150 ? r.lowest : cur;
           if (!(price >= 150)) {
@@ -1852,7 +1857,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         const q = statusOf.get(p.defId);
         const startOf = () => (selected ? Number(e.selection[p.defId]) || 0 : p.minPrice || 0);
         const cb = h('input', { type: 'checkbox', checked: selected, disabled: busy || p.collected });
-        const price = h('input', { type: 'number', min: '200', step: String(step(p.minPrice || 200)), value: startOf() ? String(startOf()) : '', placeholder: 'sondage', disabled: busy || p.collected, title: 'Prix de départ (vide = sondage du marché)' });
+        const price = h('input', { type: 'number', min: '150', step: String(step(p.minPrice || 200)), value: startOf() ? String(startOf()) : '', placeholder: 'sondage', disabled: busy || p.collected, title: 'Prix de départ (vide = sondage du marché)' });
         const meta = h('span', { className: 'm' }, ...this.rowMeta(p, startOf(), selected, q));
         const row = h('div', { className: `p${p.collected && !q ? ' got' : ''}${selected ? ' sel' : ''}` });
         const changed = () => {
@@ -1862,11 +1867,11 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           this.refreshSetHeads();
         };
         cb.onchange = () => {
-          e.setSelected(p.defId, cb.checked, Math.floor(Number(price.value)) >= 200 ? Math.floor(Number(price.value)) : 0);
+          e.setSelected(p.defId, cb.checked, Math.floor(Number(price.value)) >= 150 ? Math.floor(Number(price.value)) : 0);
           changed();
         };
         price.onchange = () => {
-          const v = Math.floor(Number(price.value)) > 0 ? Math.max(200, Math.floor(Number(price.value))) : 0;
+          const v = Math.floor(Number(price.value)) > 0 ? Math.max(150, Math.floor(Number(price.value))) : 0;
           price.value = v ? String(v) : '';
           cb.checked = true;
           e.setSelected(p.defId, true, v);
@@ -2127,11 +2132,11 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
     renderSales(s = this.engine.snapshot()) {
       const e = this.engine;
       const t = s.total;
-      const real = t.lost + s.pendingLoss;
+      const real = t.lost + s.pendingLoss + (t.keptSpent ?? 0);
       this.heroEl.replaceChildren(
         h('span', { textContent: 'Coût réel' }),
         h('b', { className: real > 0 ? 'neg' : real < 0 ? 'pos' : '', textContent: real < 0 ? `+${fmtNum(-real)}` : fmtNum(real) }),
-        h('small', { textContent: `réalisé ${t.lost < 0 ? `+${fmtNum(-t.lost)}` : fmtNum(t.lost)} · en attente ${fmtNum(s.pendingLoss)}` }),
+        h('small', { textContent: `réalisé ${t.lost < 0 ? `+${fmtNum(-t.lost)}` : fmtNum(t.lost)} · en attente ${fmtNum(s.pendingLoss)}${t.keptSpent ? ` · club ${fmtNum(t.keptSpent)}` : ''}` }),
       );
       const items = Object.values(e.bought);
       const value = items.reduce((v, b) => v + (b.sell || b.price), 0);

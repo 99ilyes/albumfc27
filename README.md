@@ -19,7 +19,7 @@
 
 ## Onglet Ventes
 
-- Coût réel = perte réalisée (prix d'achat − net encaissé) + perte en attente (sur les joueurs encore en vente, au prix affiché). Joueurs gardés au club : nombre et montant dans la tuile « Dépensé ».
+- Coût réel = perte réalisée (prix d'achat − net encaissé) + perte en attente (sur les joueurs encore en vente, au prix affiché). Les joueurs gardés au club comptent pour leur prix payé (aussi détaillés dans la tuile « Dépensé »).
 - En vente (valeur, invendus), vendus / achetés, crédits récupérés, dépensé, taxe payée. Liste des joueurs en vente, invendus en tête.
 
 ## Garde-fous
