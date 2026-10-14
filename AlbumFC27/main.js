@@ -740,15 +740,17 @@
     }
 
     // Statut Galerie lu chez EA (requête /defid, comme FST) : collectés, rareté et note de chaque joueur des sets
-    async syncGallery(keys) {
+    // maxAgeMs : lecture complète récente réutilisée (limite les requêtes EA lors des reprises automatiques)
+    async syncGallery(keys, maxAgeMs = 0) {
+      if (!keys && maxAgeMs && Date.now() - (this.gallerySyncAt ?? 0) < maxAgeMs) return true;
       const sets = (keys ?? Object.keys(this.sets)).map((k) => this.sets[k]).filter(Boolean);
       const byId = new Map();
       for (const s of sets) for (const p of Object.values(s.players ?? {})) byId.set(p.defId, [...(byId.get(p.defId) ?? []), p]);
       const ids = [...byId.keys()];
       if (!ids.length) return true;
-      let seen = 0;
-      let got = 0;
-      const lost = [];
+      const seen = new Set();
+      const got = new Set();
+      const lost = new Set();
       for (let i = 0; i < ids.length; i += DEFID_CHUNK) {
         const r = await requestDefIds(ids.slice(i, i + DEFID_CHUNK));
         if (!r.success) {
@@ -758,16 +760,16 @@
         for (const it of r.items) {
           const defId = Number(it.resourceId || it.assetId || it.id);
           for (const p of byId.get(defId) ?? []) {
-            seen++;
+            seen.add(defId);
             if (Number.isFinite(Number(it.rareflag))) p.rareflag = Number(it.rareflag);
             if (!p.rating && Number(it.rating)) p.rating = Number(it.rating);
             if (typeof it.isCollected !== 'boolean') continue;
             netItems.set(defId, { collected: it.isCollected });
             if (it.isCollected) {
-              if (!p.collected) got++;
+              if (!p.collected) got.add(defId);
               p.collected = true;
             } else if (p.collected) {
-              if (this.done.has(defId)) lost.push(p.name);
+              if (this.done.has(defId)) lost.add(p.name);
               p.collected = false;
             }
           }
@@ -777,8 +779,10 @@
       }
       save(K_DONE, [...this.done]);
       this.saveSets();
-      this.log(`Galerie EA lue : ${seen} joueur(s) vérifié(s)${got ? `, ${got} nouvellement collecté(s)` : ''}`);
-      if (lost.length) this.log(`Achetés mais absents de la Galerie selon EA : ${lost.slice(0, 5).join(', ')}${lost.length > 5 ? '…' : ''} (de nouveau manquants)`, 'warn');
+      if (!keys) this.gallerySyncAt = Date.now();
+      this.log(`Galerie EA lue : ${seen.size} joueur(s) vérifié(s)${got.size ? `, ${got.size} nouvellement collecté(s)` : ''}`);
+      const names = [...lost];
+      if (names.length) this.log(`Achetés mais absents de la Galerie selon EA : ${names.slice(0, 5).join(', ')}${names.length > 5 ? '…' : ''} (de nouveau manquants)`, 'warn');
       this.emit();
       return true;
     }
@@ -876,7 +880,7 @@
       this.log('Reprise automatique');
       if (intent.mode === 'buy' && this.queue.some(isOpen)) await this.runQueue();
       else if (intent.mode === 'relist') await this.relist();
-      else if (intent.mode === 'check') await this.checkPrices();
+      else if (intent.mode === 'check') await this.checkPrices(true);
     }
     sessionExpired() {
       const d = rand(6e4, 12e4);
@@ -1041,9 +1045,10 @@
 
     // --- Vérifier les prix : sondage des joueurs cochés, le prix trouvé devient le prix de départ (FST) ---
 
-    async checkPrices() {
-      const list = this.selectedPlayers();
-      if (!list.length) return this.log('Aucun joueur coché');
+    async checkPrices(resume = false) {
+      this.checkedAt ??= {};
+      const list = this.selectedPlayers().filter(({ p }) => !resume || Date.now() - (this.checkedAt[p.defId] ?? 0) > 15 * 6e4);
+      if (!list.length) return this.log(resume ? 'Vérification des prix : tous les joueurs cochés ont été vérifiés' : 'Aucun joueur coché');
       if (!(await this.enter('check'))) return;
       let ok = 0;
       let none = 0;
@@ -1073,6 +1078,7 @@
           }
           const old = Number(this.selection[p.defId]) || 0;
           this.setSelected(p.defId, true, c.price);
+          this.checkedAt[p.defId] = Date.now();
           ok++;
           this.touch();
           this.feed(`${p.name} : prix du marché ${fmtNum(c.price)}${old && old !== c.price ? ` (était ${fmtNum(old)})` : ''}`);
@@ -1114,11 +1120,12 @@
       save(K_ACTIVE, true);
       const n = this.queue.length;
       const cfg = this.getConfig();
+      for (const e of this.queue) if (isOpen(e) && e.start) e.cap = tolCap(e.start, cfg.tolerance);
       const after = cfg.afterBuy === 'keep' ? 'gardés au club' : cfg.afterBuy === 'markup' ? `revendus avec +${cfg.markupPct} %` : "revendus au prix d'achat";
       this.log(`Achat de ${n} joueur(s), tolérance ${cfg.tolerance} palier(s) EA au-dessus du prix de départ, ${after}`);
       try {
         // Statut Galerie relu chez EA avant d'acheter : les joueurs déjà collectés sont sautés
-        if (await this.syncGallery()) {
+        if (await this.syncGallery(undefined, 5 * 6e4)) {
           for (const e of this.queue) {
             if (isOpen(e) && this.findPlayer(e.defId)?.collected) {
               e.status = 'skipped';
@@ -1718,7 +1725,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       this.recapEl = h('div', { style: 'display:flex;flex-direction:column;gap:8px' });
       const syncBtn = h('button', { textContent: '↻ Galerie EA', title: 'Relire chez EA les joueurs déjà collectés (même requête que FUT Simple Trader)' });
       syncBtn.onclick = async () => {
-        if (this.engine.running) return;
+        if (this.engine.running) return this.engine.log('Lecture de la Galerie EA : attendre la fin de la tâche en cours (faite aussi avant chaque lot d’achats)');
         syncBtn.disabled = true;
         await this.engine.syncGallery();
         syncBtn.disabled = false;
@@ -1871,7 +1878,8 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           changed();
         };
         price.onchange = () => {
-          const v = Math.floor(Number(price.value)) > 0 ? Math.max(150, Math.floor(Number(price.value))) : 0;
+          const raw = Math.floor(Number(price.value));
+          const v = raw > 0 ? Math.max(150, Math.floor(raw / step(raw)) * step(raw)) : 0;
           price.value = v ? String(v) : '';
           cb.checked = true;
           e.setSelected(p.defId, true, v);
