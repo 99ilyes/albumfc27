@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "SnipeFC27",
-  "version": "0.5.0",
-  "description": "Sniper pour la Web App FC 27, avec mode nuit sans surveillance, et album : sets de la Galerie importés depuis fut.gg, achat au plus bas, revente au prix d'achat.",
+  "name": "AlbumFC27",
+  "version": "3.0.0",
+  "description": "Complète les sets de la Galerie FC 27 importés depuis fut.gg (achat au prix le plus bas, revente au prix d'achat, relist au prix du marché), avec sniper et mode nuit.",
   "action": {
     "default_popup": "popup.html",
-    "default_title": "SnipeFC27",
+    "default_title": "AlbumFC27",
     "default_icon": {
       "16": "icon-16.png",
       "48": "icon-48.png"

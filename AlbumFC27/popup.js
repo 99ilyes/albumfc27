@@ -1,5 +1,5 @@
 const WEB_APP = /^https:\/\/www\.ea\.com\/([a-z-]+\/)?ea-sports-fc\/ultimate-team\/web-app\//;
-const LIMITS = { searchesHour: 900, searchesDay: 9e3, bidsHour: 180, bidsDay: 1800 };
+const LIMITS = { searchesHour: 900, searchesDay: 4500, bidsHour: 180, bidsDay: 1800 };
 const EMPTY = {
   running: false,
   night: false,
@@ -48,23 +48,32 @@ function market(t = Date.now()) {
 }
 
 function albumSection(a, busy) {
-  if (!a) return [];
-  const q = a.queue ?? {};
-  const t = a.total ?? {};
-  const real = (t.lost ?? 0) + (a.pendingLoss ?? 0);
-  const locked = (a.lockedUntil ?? 0) > Date.now();
-  const status = a.running ? a.activity || 'Achats en cours' : a.lastMessage || 'À l’arrêt';
+  const q = a?.queue ?? {};
+  const t = a?.total ?? {};
+  const real = (t.lost ?? 0) + (a?.pendingLoss ?? 0);
+  const locked = (a?.lockedUntil ?? 0) > Date.now();
+  const status = a?.running ? a.activity || 'Achats en cours' : a?.lastMessage || 'À l’arrêt';
   return [
-    el('h2', {}, 'Album ', el('span', { className: a.running ? 'dot on' : 'dot' })),
+    el('h1', {}, 'AlbumFC27 ', el('span', { className: a?.running ? 'dot on' : 'dot' })),
     el('p', { className: 'activity', textContent: status }),
     locked ? el('p', { className: 'lock', textContent: `Pause jusqu'à ${hm(a.lockedUntil)}${a.resumeAt ? `, reprise ${hm(a.resumeAt)}` : ''}` }) : null,
     rows([
-      ['Sets', a.sets?.length ? a.sets.join(', ') : '—'],
+      ['Crédits', fmt(a?.coins ?? stats.coins)],
+      ['Sets', a?.sets?.length ? a.sets.join(', ') : '—'],
       ['Dernier lot', q.total ? `${fmt(q.done)} / ${fmt(q.total)}${q.failed ? ` (${q.failed} non trouvé)` : ''}` : '—'],
-      ['En vente', `${fmt(a.onSale)}${a.unsold ? ` (${a.unsold} invendu)` : ''}`],
+      ['En vente', `${fmt(a?.onSale ?? 0)}${a?.unsold ? ` (${a.unsold} invendu)` : ''}`],
       ['Coût réel', real < 0 ? `gain ${fmt(-real)}` : fmt(real)],
     ]),
-    tabId === null ? null : el('button', { className: 'ghost', textContent: `Relister les invendus${a.unsold ? ` (${a.unsold})` : ''}`, disabled: busy, onclick: () => send({ type: 'relist' }) }),
+    tabId === null
+      ? null
+      : el(
+          'div',
+          { className: 'grid' },
+          a?.running
+            ? el('button', { className: 'stop', textContent: 'STOP', onclick: () => send({ type: 'stop' }) })
+            : el('button', { className: 'start', textContent: 'ACHETER', disabled: busy, title: 'Acheter les joueurs cochés', onclick: () => send({ type: 'album-buy' }) }),
+          el('button', { textContent: `Relister${a?.unsold ? ` (${a.unsold})` : ''}`, disabled: busy, onclick: () => send({ type: 'relist' }) }),
+        ),
   ];
 }
 
@@ -76,27 +85,24 @@ function render() {
   const m = market();
   const busy = s.running || !!a?.running;
   const children = [
-    el('h1', {}, 'SnipeFC27 ', el('span', { className: s.running ? 'dot on' : 'dot' })),
+    ...(tabId === null ? [el('h1', { textContent: 'AlbumFC27' }), el('p', { className: 'muted', textContent: "Ouvre la Web App FC 27 dans l'onglet actif." })] : albumSection(a, busy)),
+    el('h2', {}, 'Snipe ', el('span', { className: s.running ? 'dot on' : 'dot' })),
     el('p', { className: 'activity', textContent: s.running ? s.activity || 'En cours' : "À l'arrêt" }),
     el('p', { className: `market ${m.level}` }, `${m.label} · ${m.detail}`),
     rows([
       ['Filtre', s.filter || '—'],
-      ['Crédits', fmt(s.coins)],
       ['Snipes / ratés', `${se.snipes} / ${se.misses}`],
       ['Profit estimé · réalisé', `${fmt(se.profit)} · ${fmt(se.realized)}`],
       ['Recherches 24 h', `${s.limits.searchesDay}/${LIMITS.searchesDay}`],
     ]),
-    ...(tabId === null
-      ? [el('p', { className: 'muted', textContent: "Ouvre la Web App FC 27 dans l'onglet actif." })]
-      : [
-          el(
-            'div',
-            { className: 'grid' },
-            el('button', { className: busy ? 'stop' : 'start', textContent: busy ? 'STOP' : 'LANCER', onclick: () => send(busy ? { type: 'stop' } : { type: 'start' }) }),
-            el('button', { className: s.night ? 'night' : '', textContent: `Mode nuit : ${s.night ? 'ON' : 'OFF'}`, disabled: !!a?.running, onclick: () => send({ type: 'night', on: !s.night }) }),
-          ),
-        ]),
-    ...albumSection(a, busy),
+    tabId === null
+      ? null
+      : el(
+          'div',
+          { className: 'grid' },
+          el('button', { className: s.running ? 'stop' : 'start', textContent: s.running ? 'STOP' : 'LANCER', disabled: !s.running && !!a?.running, onclick: () => send(s.running ? { type: 'stop' } : { type: 'start' }) }),
+          el('button', { className: s.night ? 'night' : '', textContent: `Mode nuit : ${s.night ? 'ON' : 'OFF'}`, disabled: !!a?.running, onclick: () => send({ type: 'night', on: !s.night }) }),
+        ),
     tabId === null ? null : el('button', { className: 'ghost', textContent: 'Afficher / masquer le panneau', onclick: () => send({ type: 'toggle-panel' }) }),
   ];
   root.replaceChildren(...children.filter(Boolean));

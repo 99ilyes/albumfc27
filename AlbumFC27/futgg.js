@@ -1,4 +1,4 @@
-// Page d'un set Galerie sur fut.gg : bouton « Envoyer à SnipeFC27 » (lecture de la page affichée uniquement)
+// Page d'un set Galerie sur fut.gg : bouton « Envoyer à AlbumFC27 » (lecture de la page affichée uniquement)
 (function () {
   const PLAYER_RE = /\/players\/(\d+)-([a-z0-9-]+)\/(\d{2})-(\d+)/i;
   const GALLERY_RE = /^\/fut-gallery\/[^/]+\/([^/]+)\/?$/;
@@ -70,8 +70,8 @@
   }
 
   function toast(text) {
-    document.querySelector('.snipefc27-toast')?.remove();
-    const t = Object.assign(document.createElement('div'), { className: 'snipefc27-toast', textContent: text });
+    document.querySelector('.albumfc27-toast')?.remove();
+    const t = Object.assign(document.createElement('div'), { className: 'albumfc27-toast', textContent: text });
     t.style.cssText = 'position:fixed;right:20px;bottom:76px;z-index:2147483647;background:#14161b;color:#e8e8e8;border:1px solid #2a2e37;border-radius:8px;padding:8px 12px;font:13px system-ui,sans-serif;max-width:320px';
     document.body.appendChild(t);
     setTimeout(() => t.remove(), 4000);
@@ -99,12 +99,12 @@
           return toast('Extension mise à jour : recharge cette page');
         }
         const noPrice = list.filter((p) => !p.price).length;
-        toast(`Envoyé à SnipeFC27 (Album) : ${list.length} joueur(s)${noPrice ? `, ${noPrice} sans prix` : ''}. Va dans l'onglet de la Web App.`);
+        toast(`Envoyé à AlbumFC27 : ${list.length} joueur(s)${noPrice ? `, ${noPrice} sans prix` : ''}. Va dans l'onglet de la Web App.`);
       };
       document.body.appendChild(btn);
     }
     const n = players().length;
-    const label = `Envoyer à SnipeFC27 (${n})`;
+    const label = `Envoyer à AlbumFC27 (${n})`;
     if (btn.textContent !== label) btn.textContent = label;
     btn.disabled = n === 0;
   }

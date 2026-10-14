@@ -1,4 +1,4 @@
-// SnipeFC27 : sniper + album (sets de la Galerie importés depuis fut.gg), dans un seul panneau
+// AlbumFC27 : album (sets de la Galerie importés depuis fut.gg) + sniper, dans un seul panneau
 (function () {
   const NS = 'snipefc27';
   const ALBUM_NS = 'albumfc27';
@@ -18,7 +18,7 @@
     minProfit: 0,
     snipeSound: true,
   };
-  const LIMITS = { searchesHour: 900, searchesDay: 9e3, bidsHour: 180, bidsDay: 1800 };
+  const LIMITS = { searchesHour: 900, searchesDay: 4500, bidsHour: 180, bidsDay: 1800 };
   const DELAY_PRESETS = {
     safest: { label: 'Long', info: '4-6 s', min: 4e3, max: 6e3 },
     safe: { label: 'Normal', info: '3-5 s', min: 3e3, max: 5e3 },
@@ -1267,7 +1267,7 @@
       await requestCurrencies();
       this.pileCheck = { at: Date.now(), total };
       const items = pile.data.filter((i) => i.state !== 'sold');
-      this.album?.onPile(items, sold.length);
+      this.album?.onPile(items, pile.fresh !== false);
       this.emit();
       return { items, total, fresh: pile.fresh !== false };
     }
@@ -1496,7 +1496,7 @@
     }
     notify(title, message) {
       try {
-        window.postMessage({ ns: NS, dir: 'to-ext', notify: { title, message } }, window.location.origin);
+        window.postMessage({ ns: ALBUM_NS, dir: 'to-ext', notify: { title, message } }, window.location.origin);
       } catch {}
     }
     activity(msg, phase = this.phase) {
@@ -1633,25 +1633,36 @@
       this.addTotal('sold', 1);
       delete this.bought[i.id];
       this.saveBought();
+      this.syncSold = (this.syncSold ?? 0) + 1;
       this.feed(`Vendu ${b.name || i.name} à ${fmtNum(i.soldPrice)} (net ${fmtNum(net)}, ${loss >= 0 ? `perte ${fmtNum(loss)}` : `gain ${fmtNum(-loss)}`})`);
       return true;
     }
-    onPile(rest, soldCount) {
+    // État réel des joueurs de l'album dans la liste de transferts (prix affiché, en vente ou invendu)
+    onPile(rest, fresh) {
       const byId = new Map(rest.map((i) => [String(i.id), i]));
-      // Joueurs vendus ou retirés hors extension : plus suivis
       for (const [id, b] of Object.entries(this.bought)) {
         const i = byId.get(id);
-        if (!i) delete this.bought[id];
-        else {
-          b.state = i.state;
-          if (i.buyNow > 0) b.sell = i.buyNow;
+        // Absent d'une lecture réseau : vendu ou retiré hors extension, plus suivi. Lecture du cache de la Web App
+        // (parfois incomplète) : gardé tel quel
+        if (!i) {
+          if (fresh) delete this.bought[id];
+          continue;
         }
+        b.state = i.state;
+        if (i.buyNow > 0) b.sell = i.buyNow;
       }
       this.saveBought();
       this.pileCount = rest.length;
-      this.pile = { at: Date.now(), active: rest.filter((i) => i.state === 'active').length, unsold: rest.filter((i) => i.state !== 'active').length, sold: soldCount };
+      this.pile = { at: Date.now(), fresh, sold: this.syncSold ?? 0 };
+      this.syncSold = 0;
       save(K_PILE, this.pile);
       this.touch();
+      this.emit();
+    }
+    // Relecture de la liste de transferts (une requête, aucune recherche sur le marché)
+    async refreshPile() {
+      if (this.running || this.snipe.running) return this.log('Tâche en cours : la liste de transferts est relue à chaque étape');
+      await this.syncPile();
     }
     afterRelist(id, price, why) {
       const b = this.bought[id];
@@ -1695,13 +1706,13 @@
         this.log(`${msg} : pas de pause${slowed}${mode ? ', reprise immédiate' : ''}${soft ? '' : '. Si EA affiche un captcha, le résoudre dans la Web App : le process continue seul ensuite'}`, 'lock');
         if (!soft && Date.now() - (this.captchaNotifiedAt ?? 0) > 10 * 6e4) {
           this.captchaNotifiedAt = Date.now();
-          this.notify('SnipeFC27 Album : captcha EA', `${msg}. Résous le captcha dans la Web App, le process reprend seul.`);
+          this.notify('AlbumFC27 : captcha EA', `${msg}. Résous le captcha dans la Web App, le process reprend seul.`);
         }
         return;
       }
       if (soft) return this.log(`${msg} : pause de ${fmtMin(ms)}${slowed}${mode ? ', reprise automatique' : ''}`, 'lock');
       this.log(`${msg} : pause de ${fmtMin(ms)}${mode ? ', reprise automatique ensuite' : ''}. Si EA affiche un captcha, le résoudre dans la Web App.`, 'lock');
-      this.notify('SnipeFC27 Album : pause anti-captcha', `${msg}. Reprise vers ${clockAt(ms)}. Si EA affiche un captcha, résous-le dans la Web App.`);
+      this.notify('AlbumFC27 : pause anti-captcha', `${msg}. Reprise vers ${clockAt(ms)}. Si EA affiche un captcha, résous-le dans la Web App.`);
     }
     scheduleResume() {
       if (!load(K_LOCK_RESUME, null)) return;
@@ -1927,7 +1938,7 @@
           const tax = got.reduce((s, q) => s + taxOf(q.price), 0);
           const fail = this.queue.filter(isFailed).length;
           this.log(`Achats terminés : ${got.length}/${n} achetés et remis en vente, ${fmtNum(spent)} dépensés, coût réel ~${fmtNum(tax)}${fail ? `. ${fail} non trouvé(s), toujours coché(s) : relance possible` : ''}`, 'buy');
-          this.notify('SnipeFC27 Album : achats terminés', `${got.length}/${n} achetés, coût réel ~${fmtNum(tax)} crédits${fail ? `, ${fail} non trouvé(s)` : ''}.`);
+          this.notify('AlbumFC27 : achats terminés', `${got.length}/${n} achetés, coût réel ~${fmtNum(tax)} crédits${fail ? `, ${fail} non trouvé(s)` : ''}.`);
         }
       } catch (err) {
         this.log(`Erreur : ${errMsg(err)}`);
@@ -2437,7 +2448,7 @@ details[open] > summary { margin-bottom: 6px; }
     aSig = '';
     jfilter = 'all';
     shownEventId = -1;
-    view = load(`${NS}:view`, 'snipe') === 'album' ? 'album' : 'snipe';
+    view = load(`${NS}:view`, 'album') === 'snipe' ? 'snipe' : 'album';
     minimized = false;
     overlayKey = '';
 
@@ -2445,7 +2456,7 @@ details[open] > summary { margin-bottom: 6px; }
       this.handlers = handlers;
       this.album = album;
       const host = document.createElement('div');
-      host.id = `${NS}-host`;
+      host.id = `${ALBUM_NS}-host`;
       for (const ev of ['keydown', 'keyup', 'keypress']) host.addEventListener(ev, (e) => e.stopPropagation());
       document.body.appendChild(host);
       this.root = host.attachShadow({ mode: 'open' });
@@ -2483,14 +2494,14 @@ details[open] > summary { margin-bottom: 6px; }
 
     render() {
       const close = el('button', { className: 'x', textContent: '×', title: 'Masquer (icône de l’extension pour réafficher)', onclick: () => this.toggle() });
-      const top = el('div', { className: 'top' }, el('b', { textContent: 'SnipeFC27' }), this.coinsEl, close);
+      const top = el('div', { className: 'top' }, el('b', { textContent: 'AlbumFC27' }), this.coinsEl, close);
       this.tabSnipe = el('button', { onclick: () => this.showView('snipe') });
       this.tabAlbum = el('button', { onclick: () => this.showView('album') });
       this.statusEl = el('div', { className: 'status hidden', title: 'Afficher la progression', onclick: () => ((this.minimized = false), this.last && this.renderLive(this.last)) });
-      this.scrollEl = el('div', { className: 'scroll' }, (this.snipeView = this.buildSnipeView()), (this.albumView = this.buildAlbumView()));
+      this.scrollEl = el('div', { className: 'scroll' }, (this.albumView = this.buildAlbumView()), (this.snipeView = this.buildSnipeView()));
       this.snipeActions = el('div', { className: 'actions' }, this.goBtn, this.nightBtn);
       this.albumActions = this.buildAlbumActions();
-      this.dock.append(top, el('div', { className: 'tabs' }, this.tabSnipe, this.tabAlbum), this.statusEl, this.scrollEl, this.snipeActions, this.albumActions);
+      this.dock.append(top, el('div', { className: 'tabs' }, this.tabAlbum, this.tabSnipe), this.statusEl, this.scrollEl, this.snipeActions, this.albumActions);
       this.showView(this.view);
       this.renderEvents(true);
     }
@@ -2921,7 +2932,12 @@ details[open] > summary { margin-bottom: 6px; }
       const salesCard = el(
         'div',
         { className: 'card' },
-        el('h3', {}, 'Ventes de l’album', reset),
+        el(
+          'h3',
+          {},
+          'Ventes de l’album',
+          el('span', { className: 'row' }, el('button', { className: 'link', textContent: 'Actualiser', title: 'Relire la liste de transferts (ventes encaissées, état et prix des annonces)', onclick: () => void this.album.refreshPile() }), reset),
+        ),
         this.heroEl,
         this.statsEl,
         this.pileEl,
@@ -2954,7 +2970,7 @@ details[open] > summary { margin-bottom: 6px; }
         copy.textContent = ok ? 'Copié' : 'Échec';
         setTimeout(() => (copy.textContent = 'Copier'), 1500);
       };
-      const clear = el('button', { className: 'link', textContent: 'Effacer', onclick: () => this.album.clearEvents() });
+      const clear = el('button', { className: 'link', textContent: 'Effacer', onclick: () => (this.album.clearEvents(), this.renderEvents(true)) });
       const logCard = el('div', { className: 'card' }, el('h3', {}, 'Journal', el('span', { className: 'row' }, copy, clear)), el('div', { className: 'chips' }, ...chips), this.jList);
       return el('div', { className: 'view' }, this.aLockEl, recapCard, setsCard, this.speedCard, salesCard, logCard);
     }
@@ -3052,7 +3068,7 @@ details[open] > summary { margin-bottom: 6px; }
             el(
               'ol',
               {},
-              el('li', { textContent: '« Importer un set fut.gg » : ouvre un set de la Galerie, clique le bouton vert « Envoyer à SnipeFC27 ».' }),
+              el('li', { textContent: '« Importer un set fut.gg » : ouvre un set de la Galerie, clique le bouton vert « Envoyer à AlbumFC27 ».' }),
               el('li', { textContent: 'Coche les joueurs manquants (prix de départ = prix fut.gg, modifiable).' }),
               el('li', { textContent: '« Acheter » : chaque joueur est acheté au prix le plus bas puis remis en vente au même prix. Coût réel = taxe EA 5 %.' }),
               el('li', { textContent: '« Relister » remet les invendus au prix le plus bas du marché.' }),
@@ -3413,7 +3429,10 @@ details[open] > summary { margin-bottom: 6px; }
         this.tile('Dépensé', fmtNum(t.spent), `taxe payée ${fmtNum(t.tax)}`),
       );
       const p = e.pile;
-      this.pileEl.textContent = p ? `Liste de transferts lue à ${hm(p.at)} : ${p.active} en vente, ${p.unsold} invendu(s), ${p.sold} vente(s) encaissée(s).` : '';
+      const active = items.filter((b) => !isUnsold(b)).length;
+      this.pileEl.textContent = p
+        ? `Liste de transferts lue à ${hm(p.at)}${p.fresh === false ? ' (cache de la Web App)' : ''} : ${active} joueur(s) de l'album en vente, ${items.length - active} invendu(s)${p.sold ? `, ${p.sold} vente(s) encaissée(s)` : ''}.`
+        : 'Liste de transferts pas encore lue : « Actualiser ».';
       const sorted = items.sort((a, b) => Number(isUnsold(b)) - Number(isUnsold(a)) || (b.at ?? 0) - (a.at ?? 0));
       this.salesEl.replaceChildren(
         ...(sorted.length
@@ -3475,12 +3494,12 @@ details[open] > summary { margin-bottom: 6px; }
   let onCommand = null;
   const pendingCmds = [];
   window.addEventListener('message', (e) => {
-    if (e.source !== window || e.data?.ns !== NS || e.data.dir !== 'to-page' || !e.data.cmd) return;
+    if (e.source !== window || e.data?.ns !== ALBUM_NS || e.data.dir !== 'to-page' || !e.data.cmd) return;
     if (onCommand) onCommand(e.data.cmd);
     else pendingCmds.push(e.data.cmd);
   });
 
-  const post = (data) => window.postMessage({ ns: NS, dir: 'to-ext', ...data }, window.location.origin);
+  const post = (data) => window.postMessage({ ns: ALBUM_NS, dir: 'to-ext', ...data }, window.location.origin);
 
   function init() {
     let panel = null;

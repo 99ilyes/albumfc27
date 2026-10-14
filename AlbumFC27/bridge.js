@@ -1,6 +1,6 @@
 // Relais entre la page (main.js) et l'extension : commandes du popup, statistiques, notifications, sets envoyés depuis fut.gg
 (function () {
-  const NS = 'snipefc27';
+  const NS = 'albumfc27';
   const toPage = (cmd) => window.postMessage({ ns: NS, dir: 'to-page', cmd }, window.location.origin);
   chrome.runtime.onMessage.addListener((cmd) => toPage(cmd));
   window.addEventListener('message', (e) => {
