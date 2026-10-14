@@ -1,13 +1,24 @@
 {
   "manifest_version": 3,
   "name": "SnipeFC27",
-  "version": "0.1.0",
-  "description": "Autobuyer pour le marché des transferts de la Web App FC 27.",
-  "action": { "default_popup": "index.html", "default_title": "SnipeFC27" },
-  "permissions": ["storage"],
+  "version": "0.5.0",
+  "description": "Sniper pour la Web App FC 27, avec mode nuit sans surveillance, et album : sets de la Galerie importés depuis fut.gg, achat au plus bas, revente au prix d'achat.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "SnipeFC27",
+    "default_icon": {
+      "16": "icon-16.png",
+      "48": "icon-48.png"
+    }
+  },
+  "permissions": [
+    "storage",
+    "notifications"
+  ],
   "host_permissions": [
     "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*",
-    "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*"
+    "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*",
+    "https://www.fut.gg/*"
   ],
   "content_scripts": [
     {
@@ -15,7 +26,9 @@
         "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*",
         "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*"
       ],
-      "js": ["main.js"],
+      "js": [
+        "main.js"
+      ],
       "world": "MAIN",
       "run_at": "document_idle"
     },
@@ -24,8 +37,27 @@
         "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*",
         "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*"
       ],
-      "js": ["bridge.js"],
+      "js": [
+        "bridge.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.fut.gg/*"
+      ],
+      "js": [
+        "futgg.js"
+      ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icon-16.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  }
 }
