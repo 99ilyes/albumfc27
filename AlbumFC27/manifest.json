@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AlbumFC27",
-  "version": "2.5.0",
-  "description": "Complète les sets de la Galerie FC 27 importés depuis fut.gg : achat au prix le plus bas, revente au prix d'achat, relist au prix du marché.",
+  "version": "3.0.0",
+  "description": "Complète les sets de la Galerie FC 27 importés depuis fut.gg (achat au prix le plus bas, revente au prix d'achat, relist au prix du marché), avec sniper et mode nuit.",
   "action": {
     "default_popup": "popup.html",
     "default_title": "AlbumFC27",

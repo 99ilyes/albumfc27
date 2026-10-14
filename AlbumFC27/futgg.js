@@ -4,7 +4,11 @@
   const GALLERY_RE = /^\/fut-gallery\/[^/]+\/([^/]+)\/?$/;
   const PRICE_RE = /^(\d{1,3}(?:[.,\s]\d{3})+|\d+(?:[.,]\d+)?)\s*([km])?$/i;
 
-  const toName = (slug) => slug.split('-').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+  const toName = (slug) =>
+    slug
+      .split('-')
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(' ');
 
   function parsePrice(text) {
     const m = text.replace(/\s+/g, ' ').trim().match(PRICE_RE);
@@ -68,7 +72,7 @@
   function toast(text) {
     document.querySelector('.albumfc27-toast')?.remove();
     const t = Object.assign(document.createElement('div'), { className: 'albumfc27-toast', textContent: text });
-    t.style.cssText = 'position:fixed;right:20px;bottom:76px;z-index:2147483647;background:#15171c;color:#e8e8e8;border:1px solid #2c303a;border-radius:8px;padding:8px 12px;font:13px system-ui,sans-serif;max-width:320px';
+    t.style.cssText = 'position:fixed;right:20px;bottom:76px;z-index:2147483647;background:#14161b;color:#e8e8e8;border:1px solid #2a2e37;border-radius:8px;padding:8px 12px;font:13px system-ui,sans-serif;max-width:320px';
     document.body.appendChild(t);
     setTimeout(() => t.remove(), 4000);
   }
@@ -84,7 +88,7 @@
     if (!btn) {
       btn = document.createElement('button');
       btn.type = 'button';
-      btn.style.cssText = 'position:fixed;right:20px;bottom:20px;z-index:2147483647;background:#2f9e44;color:#fff;border:0;border-radius:8px;padding:10px 14px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 14px #0007';
+      btn.style.cssText = 'position:fixed;right:20px;bottom:20px;z-index:2147483647;background:#63e64b;color:#0d1a09;border:0;border-radius:8px;padding:10px 14px;font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 14px #0007';
       btn.onclick = async () => {
         const list = players();
         if (!list.length) return toast('Aucun joueur trouvé sur cette page');
