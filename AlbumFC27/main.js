@@ -7,13 +7,13 @@
   const SOFT_STATUS = new Set([426, 429, 512, 521]);
   const HOUR = 36e5;
   const DAY = 24 * HOUR;
-  const SOFT_PAUSE_MIN = 3;
-  const HARD_PAUSE_MIN = 30;
   const SOFT_CAP = 30 * 6e4;
   const HARD_CAP = 2 * HOUR;
   const CALM_MS = 30 * 6e4;
   // Quotas (0 = illimité), comptés avec SnipeFC27 ; désactivés par défaut
   const QUOTA_DEFAULTS = { quotaSearchHour: 0, quotaSearchDay: 0, quotaBuyDay: 0 };
+  // Pauses après un refus EA (min, 0 = aucune : reprise immédiate) ; doublées si ça se répète
+  const PAUSE_DEFAULTS = { softPauseMin: 0, captchaPauseMin: 0 };
   const CONFIG_VERSION = 3;
   const SPEED_DEFAULTS = { minDelayMs: 4e3, maxDelayMs: 8e3, buyDelayMinMs: 300, buyDelayMaxMs: 900 };
   // Ralentissement après une limite EA : délais × paceStep à chaque limite, plafond paceMax, retour à ×1 après paceResetMin sans limite
@@ -110,10 +110,28 @@
     }
   }
 
+  // Session EA vue passer dans les requêtes de la Web App : permet de remettre en vente par identifiant de carte
+  const eaApi = { base: null, headers: {} };
+  function noteUrl(url) {
+    try {
+      const m = new URL(String(url), location.href).href.match(/^(https?:\/\/[^?#]*?\/ut\/game\/[^/?#]+\/)/i);
+      if (m) eaApi.base = m[1];
+    } catch {}
+  }
+  function noteHeader(name, value) {
+    if (/^x-ut-/i.test(String(name)) && value) eaApi.headers[String(name)] = String(value);
+  }
+
   function installNetHooks() {
     const X = XMLHttpRequest.prototype;
     const open = X.open;
+    const setHeader = X.setRequestHeader;
+    X.setRequestHeader = function (name, value) {
+      noteHeader(name, value);
+      return setHeader.call(this, name, value);
+    };
     X.open = function (method, url, ...rest) {
+      noteUrl(url);
       this.addEventListener('readystatechange', () => {
         if (this.readyState === 4 && (this.responseType === '' || this.responseType === 'text')) onResponse(String(url), this.status, this.responseText);
       });
@@ -122,6 +140,13 @@
     const f = window.fetch;
     window.fetch = async function (input, init) {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (/\/ut\//i.test(url)) {
+        noteUrl(url);
+        try {
+          const hs = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+          hs.forEach((v, k) => noteHeader(k, v));
+        } catch {}
+      }
       const res = await f.call(this, input, init);
       if (/\/ut\//i.test(url)) res.clone().text().then((t) => onResponse(url, res.status, t)).catch(() => {});
       return res;
@@ -142,7 +167,7 @@
     return new Promise((resolve) => {
       if (typeof obs?.observe !== 'function') return resolve({ success: false, status: -1, data: undefined, error: 'fonction Web App introuvable' });
       obs.observe(undefined, (_, r) =>
-        resolve({ success: !!r?.success, status: Number(r?.status ?? 0), data: r?.data, error: r?.error ?? r?.data?.reason ?? r?.data?.message }),
+        resolve({ success: !!r?.success, status: Number(r?.status ?? 0), data: r?.data, response: r?.response, error: r?.error ?? r?.data?.reason ?? r?.data?.message }),
       );
     });
   }
@@ -180,9 +205,40 @@
   const bid = (item) => observe(services.Item.bid(item.raw, item.buyNow));
   const listItem = (raw, buyNow) => observe(services.Item.list(raw, priceDown(buyNow), buyNow, 3600));
 
+  // Même requête que la Web App (POST auctionhouse), pour une carte que la Web App n'a pas chargée
+  function listById(id, buyNow) {
+    return new Promise((resolve) => {
+      if (!eaApi.base || !Object.keys(eaApi.headers).length) return resolve({ success: false, status: -1, error: 'session EA pas encore vue : ouvre la liste de transferts puis relance' });
+      const x = new XMLHttpRequest();
+      x.open('POST', `${eaApi.base}auctionhouse`);
+      for (const [k, v] of Object.entries(eaApi.headers)) x.setRequestHeader(k, v);
+      x.setRequestHeader('Content-Type', 'application/json');
+      x.onload = () => resolve({ success: x.status >= 200 && x.status < 300, status: x.status, error: x.status >= 300 ? String(x.responseText || '').slice(0, 200) : undefined });
+      x.onerror = () => resolve({ success: false, status: 0, error: 'réseau' });
+      x.send(JSON.stringify({ itemData: { id: Number(id) }, startingBid: priceDown(buyNow), duration: 3600, buyNowPrice: buyNow }));
+    });
+  }
+
   async function moveAndList(raw, price) {
     const m = await observe(services.Item.move(raw, ItemPile.TRANSFER));
     return m.success ? listItem(raw, price) : m;
+  }
+
+  // Cartes de la liste de transferts (objets Web App nécessaires pour remettre en vente) : selon la version,
+  // dans data.items, response.items ou le dépôt local de la Web App
+  function transferEntities(r) {
+    const isItem = (x) => x && typeof x === 'object' && Number(x.id) > 0 && ('definitionId' in x || typeof x.getAuctionData === 'function');
+    const lists = [r?.data?.items, r?.response?.items, r?.data?.response?.items];
+    try {
+      const repo = typeof repositories !== 'undefined' ? repositories.Item : undefined;
+      lists.push(repo?.getTransferItems?.(), repo?.transfer?.items, repo?.getPile?.(ItemPile.TRANSFER), repo?.piles?.[ItemPile.TRANSFER]?.items);
+    } catch {}
+    const out = new Map();
+    for (const l of lists) {
+      const arr = l instanceof Map ? [...l.values()] : Array.isArray(l) ? l : l && typeof l === 'object' ? Object.values(l) : [];
+      for (const x of arr) if (isItem(x) && !out.has(Number(x.id))) out.set(Number(x.id), x);
+    }
+    return [...out.values()];
   }
 
   const tradeState = (s, bidV) => (s === 'closed' && bidV > 0 ? 'sold' : s === 'expired' || s === 'closed' ? 'expired' : s === 'active' ? 'active' : 'unlisted');
@@ -193,7 +249,7 @@
     } catch {}
     const t0 = Date.now();
     const r = await observe(services.Item.requestTransferItems?.());
-    const items = r.data?.items ?? [];
+    const items = transferEntities(r);
     const byId = new Map(items.map((i) => [Number(i.id), i]));
     let pile = lastPile;
     for (let n = 0; n < 10 && !(pile && pile.at >= t0); n++) {
@@ -203,20 +259,25 @@
     if (pile && pile.at >= t0) {
       return {
         success: true,
+        fresh: true,
         data: pile.auctions.map((a) => {
           const id = Number(a.itemData?.id);
           const raw = byId.get(id);
           const defId = Number(raw?.definitionId ?? a.itemData?.resourceId ?? 0);
-          return { raw, id, defId, name: raw ? staticName(raw) : String(defId || id), state: tradeState(String(a.tradeState ?? ''), Number(a.currentBid ?? 0)), soldPrice: Number(a.currentBid ?? 0), buyNow: Number(a.buyNowPrice ?? 0) };
+          return { raw, id, defId, type: String(a.itemData?.itemType ?? raw?.type ?? 'player'), name: raw ? staticName(raw) : String(defId || id), state: tradeState(String(a.tradeState ?? ''), Number(a.currentBid ?? 0)), soldPrice: Number(a.currentBid ?? 0), buyNow: Number(a.buyNowPrice ?? 0) };
         }),
       };
     }
+    // Données du cache de la Web App (pas de réponse réseau vue) : une annonce « active » sans temps restant est expirée
     return {
       ...r,
+      fresh: false,
       data: items.map((i) => {
         const a = i._auction ?? i.getAuctionData?.() ?? {};
         const cur = Number(a.currentBid ?? 0);
-        return { raw: i, id: Number(i.id), defId: Number(i.definitionId ?? 0), name: staticName(i), state: tradeState(String(a.tradeState ?? ''), cur), soldPrice: cur, buyNow: Number(a.buyNowPrice ?? 0) };
+        let state = tradeState(String(a.tradeState ?? ''), cur);
+        if (state === 'active' && Number(a.expires ?? 1) <= 0) state = 'expired';
+        return { raw: i, id: Number(i.id), defId: Number(i.definitionId ?? 0), name: staticName(i), state, soldPrice: cur, buyNow: Number(a.buyNowPrice ?? 0) };
       }),
     };
   }
@@ -245,26 +306,26 @@
       this.s.lockedUntil = 0;
       this.persist();
     }
-    // Captcha : 30 min, doublée à chaque nouveau blocage dans les 24 h, plafond 2 h
-    lock() {
+    // Captcha : durée réglée, doublée à chaque nouveau blocage dans les 24 h, plafond 2 h
+    lock(baseMin) {
       const now = Date.now();
       this.s.lockStreak = now - this.s.lastLockAt < DAY ? this.s.lockStreak + 1 : 0;
       this.s.lastLockAt = now;
-      const ms = Math.min(HARD_CAP, HARD_PAUSE_MIN * 6e4 * 2 ** this.s.lockStreak);
-      this.s.lockedUntil = now + ms;
+      const ms = Math.min(HARD_CAP, baseMin * 6e4 * 2 ** this.s.lockStreak);
+      this.s.lockedUntil = ms > 0 ? now + ms : 0;
       this.s.lockKind = 'hard';
       this.persist();
       return ms;
     }
-    // Limite de débit : 3 min, doublée si ça se répète dans les 30 min (plafond 30 min), rythme ralenti selon les réglages
+    // Limite de débit : durée réglée, doublée si ça se répète dans les 30 min (plafond 30 min), rythme ralenti selon les réglages
     lockSoft(cfg) {
       const now = Date.now();
       const calm = now - (this.s.lastSoftAt ?? 0) > CALM_MS;
       this.s.softStreak = calm ? 0 : (this.s.softStreak ?? 0) + 1;
       this.s.pace = Math.min(cfg.paceMax, this.pace(cfg) * cfg.paceStep);
       this.s.lastSoftAt = now;
-      const ms = Math.min(SOFT_CAP, SOFT_PAUSE_MIN * 6e4 * 2 ** this.s.softStreak);
-      this.s.lockedUntil = now + ms;
+      const ms = Math.min(SOFT_CAP, cfg.softPauseMin * 6e4 * 2 ** this.s.softStreak);
+      this.s.lockedUntil = ms > 0 ? now + ms : 0;
       this.s.lockKind = 'soft';
       this.persist();
       return ms;
@@ -341,8 +402,9 @@
     // v3 : quota horaire désactivé par défaut (l'ancien défaut de 300 était enregistré avec les réglages)
     if (raw.cfgV !== CONFIG_VERSION) delete raw.quotaSearchHour;
     const pct = Number(raw.raisePct);
-    const cfg = { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE, ...SPEED_DEFAULTS, ...PACE_DEFAULTS, ...QUOTA_DEFAULTS, cfgV: CONFIG_VERSION };
+    const cfg = { raisePct: Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_RAISE, ...SPEED_DEFAULTS, ...PACE_DEFAULTS, ...QUOTA_DEFAULTS, ...PAUSE_DEFAULTS, cfgV: CONFIG_VERSION };
     for (const k of Object.keys(SPEED_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = raw[k];
+    for (const k of Object.keys(PAUSE_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = raw[k];
     for (const k of Object.keys(QUOTA_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= 0) cfg[k] = Math.floor(raw[k]);
     for (const k of Object.keys(PACE_DEFAULTS)) if (Number.isFinite(raw[k]) && raw[k] >= (k === 'paceResetMin' ? 0 : 1)) cfg[k] = raw[k];
     return cfg;
@@ -601,12 +663,23 @@
     }
     lockout(msg, soft = false) {
       const mode = this.mode;
+      const cfg = this.getConfig();
       this.stopRequested = true;
       this.wake?.();
-      const ms = soft ? this.guard.lockSoft(this.getConfig()) : this.guard.lock();
+      const ms = soft ? this.guard.lockSoft(cfg) : this.guard.lock(cfg.captchaPauseMin);
       if (mode) {
         save(K_LOCK_RESUME, { mode });
         this.scheduleResume();
+      }
+      if (ms <= 0) {
+        // Aucune pause réglée : reprise après le délai normal entre recherches
+        const pace = this.guard.pace(cfg);
+        this.log(`${msg} : pas de pause${pace > 1 ? `, rythme ralenti ×${pace.toFixed(1).replace('.', ',')}` : ''}${mode ? ', reprise immédiate' : ''}${soft ? '' : '. Si EA affiche un captcha, le résoudre dans la Web App : le process continue seul ensuite'}`, 'lock');
+        if (!soft && Date.now() - (this.captchaNotifiedAt ?? 0) > 10 * 6e4) {
+          this.captchaNotifiedAt = Date.now();
+          this.notify('AlbumFC27 : captcha EA', `${msg}. Résous le captcha dans la Web App, le process reprend seul.`);
+        }
+        return;
       }
       if (soft) {
         const pace = this.guard.pace(this.getConfig());
@@ -619,7 +692,8 @@
     scheduleResume() {
       if (!load(K_LOCK_RESUME, null)) return;
       clearTimeout(this.resumeTimer);
-      const wait = Math.max(5e3, this.guard.lockedUntil() - Date.now() + (this.guard.lockKind() === 'soft' ? rand(5e3, 2e4) : rand(3e4, 9e4)));
+      const locked = this.guard.lockedUntil() > Date.now();
+      const wait = locked ? Math.max(5e3, this.guard.lockedUntil() - Date.now() + (this.guard.lockKind() === 'soft' ? rand(5e3, 2e4) : rand(3e4, 9e4))) : this.delay();
       this.resumeAt = Date.now() + wait;
       this.resumeTimer = setTimeout(() => void this.autoResume(), wait);
       this.emit();
@@ -635,9 +709,10 @@
       this.resumeAt = 0;
       if (!intent) return;
       if (this.guard.lockedUntil() > Date.now()) return this.scheduleResume();
-      if (this.running) return;
+      // Tâche interrompue encore en train de se terminer : nouvel essai dans 1 s
+      if (this.running) return void (this.resumeTimer = setTimeout(() => void this.autoResume(), 1e3));
       save(K_LOCK_RESUME, null);
-      this.log('Fin de la pause : reprise automatique');
+      this.log('Reprise automatique');
       if (intent.mode === 'buy' && this.queue.some(isOpen)) await this.runQueue();
       else if (intent.mode === 'relist') await this.relist();
     }
@@ -989,6 +1064,7 @@
         if (!this.fatal(pile, 'pile')) this.log(`Lecture de la liste de transferts impossible (statut ${pile.status})${errText(pile.error)}`);
         return null;
       }
+      for (const i of pile.data) if (!i.raw || /^\d+$/.test(i.name)) i.name = this.bought[i.id]?.name || this.findPlayer(i.defId)?.name || i.name;
       const sold = pile.data.filter((i) => i.state === 'sold');
       for (const i of sold) {
         const net = netOf(i.soldPrice);
@@ -1011,6 +1087,7 @@
         if (!c.success) this.log(`Encaissement des ventes échoué (statut ${c.status})${errText(c.error)}`);
       }
       const rest = pile.data.filter((i) => i.state !== 'sold');
+      this.pileFresh = pile.fresh !== false;
       const byId = new Map(rest.map((i) => [String(i.id), i]));
       // Joueurs vendus ou retirés hors extension : plus suivis
       for (const [id, b] of Object.entries(this.bought)) {
@@ -1033,49 +1110,79 @@
 
     // --- Relister : chaque invendu au prix de l'annonce la moins chère trouvée par sondage ---
 
+    async relistAll(n, why) {
+      await sleep(rand(800, 1600));
+      const g = await observe(services.Item.relistExpiredAuctions?.());
+      if (g.success) {
+        this.log(`${n} invendu(s) remis en vente en bloc à leur prix précédent (${why})`, 'list');
+        for (const b of Object.values(this.bought)) if (isUnsold(b)) b.state = 'active';
+        this.saveBought();
+      } else if (!this.fatal(g, 'list')) this.log(`Remise en vente en bloc échouée (statut ${g.status})${errText(g.error)}`, 'error');
+    }
+
     async relist() {
       if (!(await this.enter('relist'))) return;
       try {
         const items = await this.syncPile();
         if (!items) return;
-        const unsold = items.filter((i) => i.state !== 'active' && i.raw);
-        const todo = unsold.filter((i) => this.bought[i.id]);
-        const ignored = unsold.length - todo.length;
-        if (!todo.length) return this.log(`Aucun invendu à relister${ignored ? ` (${ignored} invendu(s) non achetés par AlbumFC27, laissés tels quels)` : ''}`);
-        this.log(`Relister ${todo.length} invendu(s) au prix le plus bas du marché`);
+        const players = items.filter((i) => (i.type ?? i.raw?.type ?? 'player') === 'player');
+        const active = players.filter((i) => i.state === 'active').length;
+        const todo = players.filter((i) => i.state !== 'active');
+        const direct = todo.filter((i) => !i.raw).length;
+        this.log(`Liste de transferts : ${active} en vente, ${todo.length} invendu(s)${direct ? ` (${direct} remis en vente par requête directe, carte non chargée par la Web App)` : ''}${this.pileFresh ? '' : ' (lue depuis le cache de la Web App : si des invendus manquent, ouvre Transferts > Liste de transferts puis relance)'}`);
+        if (!todo.length) {
+          this.log(active ? `Aucun invendu. Les ${active} joueur(s) en vente ne peuvent pas être modifiés (règle EA) : relistables à leur expiration (1 h)` : 'Aucun invendu à relister');
+          return;
+        }
+        this.log(`Relister ${todo.length} invendu(s) au prix de l'annonce la moins chère`);
         let ok = 0;
+        let failed = 0;
         let diff = 0;
         for (const [n, i] of todo.entries()) {
           if (this.stopRequested) break;
           if (n) await this.sleep(this.delay(), 'Invendu suivant');
           if (this.stopRequested) break;
           const b = this.bought[i.id];
-          const cur = i.buyNow || b.sell || b.price;
-          this.activity(`${i.name} : sondage du prix (acheté ${fmtNum(b.price)}, était à ${fmtNum(cur)})`);
-          const r = await this.probe(b.defId || i.defId, 0);
+          const defId = b?.defId || i.defId;
+          const cur = i.buyNow || b?.sell || b?.price || 0;
+          this.activity(`${i.name} : sondage du prix${cur ? ` (était à ${fmtNum(cur)})` : ''}`);
+          const r = defId ? await this.probe(defId, 0) : { items: [], lowest: 0 };
           if (r.stop) break;
-          if (r.collected) continue;
           const price = r.lowest >= 200 ? r.lowest : cur;
+          if (!(price >= 200)) {
+            failed++;
+            this.feed(`${i.name} : aucune annonce sur le marché et pas de prix précédent, laissé tel quel`, 'miss');
+            continue;
+          }
           await sleep(rand(500, 1200));
-          const l = await listItem(i.raw, price);
+          const l = i.raw ? await listItem(i.raw, price) : await listById(i.id, price);
           if (!l.success) {
             if (this.fatal(l, 'list')) break;
-            this.feed(`Remise en vente de ${i.name} échouée (statut ${l.status})${errText(l.error)}`, 'error');
+            failed++;
+            this.feed(`Remise en vente de ${i.name} à ${fmtNum(price)} échouée (statut ${l.status})${errText(l.error)}`, 'error');
             continue;
           }
           ok++;
-          diff += price - cur;
-          b.sell = price;
-          b.state = 'active';
-          this.saveBought();
-          const loss = b.price - netOf(price);
-          this.feed(`${i.name} relisté à ${fmtNum(price)} (${r.lowest ? `annonce la moins chère ${fmtNum(r.lowest)}` : 'aucune autre annonce, prix inchangé'}, ${loss >= 0 ? `perte si vendu ${fmtNum(loss)}` : `gain si vendu ${fmtNum(-loss)}`})`);
+          if (cur) diff += price - cur;
+          const why = r.lowest ? `annonce la moins chère ${fmtNum(r.lowest)}` : 'aucune autre annonce, prix inchangé';
+          if (b) {
+            b.sell = price;
+            b.state = 'active';
+            this.saveBought();
+            const loss = b.price - netOf(price);
+            this.feed(`${i.name} relisté à ${fmtNum(price)} (${why}, ${loss >= 0 ? `perte si vendu ${fmtNum(loss)}` : `gain si vendu ${fmtNum(-loss)}`})`);
+          } else this.feed(`${i.name} relisté à ${fmtNum(price)} (${why})`);
         }
+        // Secours : invendus qui n'ont pas pu être relistés au prix du marché, remis en vente en bloc à leur prix précédent
+        if (failed && !this.stopRequested) await this.relistAll(failed, 'échec de la remise en vente au prix du marché');
+        try {
+          repositories?.Item?.setDirty?.(ItemPile.TRANSFER);
+        } catch {}
         if (this.pile && ok) {
           this.pile = { ...this.pile, active: this.pile.active + ok, unsold: Math.max(0, this.pile.unsold - ok) };
           save(K_PILE, this.pile);
         }
-        if (!this.stopRequested) this.log(`Relister terminé : ${ok}/${todo.length} remis en vente${diff ? `, prix ${diff < 0 ? 'baissés' : 'montés'} de ${fmtNum(Math.abs(diff))} au total` : ''}. Perte en attente ${fmtNum(this.pendingLoss())}`, 'list');
+        if (!this.stopRequested) this.log(`Relister terminé : ${ok}/${todo.length} remis en vente au prix du marché${diff ? `, prix ${diff < 0 ? 'baissés' : 'montés'} de ${fmtNum(Math.abs(diff))} au total` : ''}. Perte en attente ${fmtNum(this.pendingLoss())}`, 'list');
       } catch (err) {
         this.log(`Relister : ${err instanceof Error ? err.message : String(err)}`);
       } finally {
@@ -1089,10 +1196,11 @@
   const CSS = `
 :host { all: initial; }
 * { box-sizing: border-box; }
-.box { position: fixed; top: 64px; left: 16px; z-index: 2147483647; width: 420px; max-height: min(820px, 92vh);
+.box { position: fixed; top: 64px; left: 16px; z-index: 2147483647; width: 420px; max-height: calc(100vh - 76px);
   display: flex; flex-direction: column; font: 12px/1.4 system-ui, sans-serif; color: #e6e7eb;
   background: #14161b; border: 1px solid #2a2e38; border-radius: 12px; box-shadow: 0 10px 30px #000a; overflow: hidden; }
 .box.hidden { display: none; }
+header, nav, .banner, .activity { flex: none; }
 header { display: flex; align-items: center; gap: 8px; padding: 10px 12px 8px; cursor: move; user-select: none; }
 header .title { font-weight: 700; font-size: 13px; }
 header .coins { margin-left: auto; font-size: 12px; font-weight: 700; color: #ffe066; background: #1e2129; padding: 2px 9px; border-radius: 10px; font-variant-numeric: tabular-nums; }
@@ -1110,7 +1218,7 @@ nav { display: flex; gap: 2px; padding: 0 8px; border-bottom: 1px solid #2a2e38;
 nav button { background: none; border-radius: 0; padding: 7px 12px; color: #8a8f9c; font-weight: 600; border-bottom: 2px solid transparent; }
 nav button.on { color: #e6e7eb; border-bottom-color: #4c6ef5; }
 nav button .badge { margin-left: 5px; padding: 0 6px; border-radius: 8px; background: #5c4012; color: #ffd8a8; font-size: 10px; }
-.body { flex: 1 1 auto; min-height: 140px; overflow-y: auto; padding: 10px 12px; }
+.body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 10px 12px; }
 .tab { display: none; flex-direction: column; gap: 10px; } .tab.on { display: flex; }
 h4 { margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #7c8190; }
 input { background: #0d0f13; color: inherit; border: 1px solid #2a2e38; border-radius: 6px; padding: 5px 7px; font: inherit; min-width: 0; }
@@ -1156,7 +1264,8 @@ button:disabled { opacity: .4; cursor: default; }
 .bar { height: 6px; background: #0d0f13; border-radius: 3px; overflow: hidden; display: flex; }
 .bar > span { height: 100%; transition: width .4s; }
 .bar .ok { background: #2f9e44; } .bar .use { background: #4c6ef5; } .bar .cap { background: repeating-linear-gradient(45deg, #4c6ef5 0 3px, #2a3570 3px 6px); } .bar .over { background: #e03131; }
-footer { border-top: 1px solid #2a2e38; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; background: #171a20; }
+footer { border-top: 1px solid #2a2e38; padding: 8px 12px 10px; display: flex; flex-direction: column; gap: 6px; background: #171a20; flex: none; }
+.recap { background: #1b1e25; border-radius: 10px; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
 footer.hidden { display: none; }
 .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 .tile { background: #1e2129; border-radius: 8px; padding: 6px 8px; min-width: 0; }
@@ -1172,13 +1281,14 @@ footer.hidden { display: none; }
 .note.warn { color: #ffa94d; }
 .raise { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #a9aebb; }
 .raise input { width: 52px; text-align: right; }
-details.speed { font-size: 11px; color: #a9aebb; }
-details.speed summary { cursor: pointer; user-select: none; }
-details.speed .grid { display: grid; grid-template-columns: 1fr auto; gap: 6px 8px; align-items: center; margin-top: 6px; }
-details.speed .pair { display: flex; align-items: center; gap: 4px; color: #7c8190; }
-details.speed .pair input { width: 54px; text-align: right; }
-details.speed .presets { display: flex; gap: 4px; }
-details.speed .presets button.on { background: #364fc7; color: #fff; }
+.speed { font-size: 11px; color: #a9aebb; display: flex; flex-direction: column; gap: 4px; }
+.speed .grid { display: grid; grid-template-columns: 1fr auto; gap: 6px 8px; align-items: center; }
+.speed .pair { display: flex; align-items: center; gap: 4px; color: #7c8190; }
+.speed .pair input { width: 60px; text-align: right; }
+.speed .presets { display: flex; gap: 4px; }
+.speed .presets button.on { background: #364fc7; color: #fff; }
+.speedline { background: none; padding: 0; font-size: 11px; font-weight: 500; color: #a9aebb; text-align: left; }
+.speedline:hover { color: #e6e7eb; }
 button.big { width: 100%; padding: 10px; font-size: 13px; }
 .hero { background: #1b1e25; border-radius: 10px; padding: 10px 12px; display: flex; align-items: baseline; gap: 10px; }
 .hero span { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #8a8f9c; }
@@ -1198,7 +1308,9 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
 .live .dot { width: 7px; height: 7px; border-radius: 50%; background: #5c6170; }
 .live.on .dot { background: #51cf66; animation: pulse 1.2s ease-in-out infinite; }
 .live .cd { margin-left: auto; color: #74c0fc; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
-.live .lbody { max-height: 110px; overflow-y: auto; padding: 0 8px 6px; }
+.live { flex: none; }
+.live .lbody { padding: 0 8px 6px; }
+.live .lbody .ev span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .live.closed .lbody { display: none; }
 .ev { display: grid; grid-template-columns: 52px 14px 1fr; gap: 4px; padding: 2px 4px; border-radius: 4px; font-size: 11px; line-height: 1.45; color: #c9ccd4; animation: fadein .35s ease-out; }
 .ev .tm { color: #6c7180; font-variant-numeric: tabular-nums; }
@@ -1212,7 +1324,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
 .jtools { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
 .jtools .chipbtn { padding: 3px 8px; font-size: 11px; font-weight: 500; background: #1e2129; }
 .jtools .chipbtn.on { background: #364fc7; color: #fff; }
-.jlist { background: #0d0f13; border-radius: 6px; padding: 4px; min-height: 200px; max-height: 480px; overflow-y: auto; }
+.jlist { background: #0d0f13; border-radius: 6px; padding: 4px; }
 `;
 
   function h(tag, props = {}, ...children) {
@@ -1285,27 +1397,31 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       this.draggable(header);
       this.activityEl = h('div', { className: 'activity' });
       this.bannerEl = h('div', { className: 'banner' });
-      this.tabs = { buy: this.buildBuyTab(), sales: this.buildSalesTab(), log: this.buildLogTab() };
+      this.tabs = { buy: this.buildBuyTab(), sales: this.buildSalesTab(), log: this.buildLogTab(), settings: this.buildSettingsTab() };
       this.tabBtns = {};
       const nav = h('nav');
-      for (const [id, label] of [['buy', 'Achats'], ['sales', 'Ventes'], ['log', 'Journal']]) {
+      for (const [id, label] of [['buy', 'Achats'], ['sales', 'Ventes'], ['log', 'Journal'], ['settings', 'Réglages']]) {
         this.tabBtns[id] = h('button', { textContent: label, onclick: () => this.showTab(id) });
         nav.append(this.tabBtns[id]);
       }
       this.salesBadge = h('span', { className: 'badge' });
       this.footer = this.buildFooter();
       this.live = this.buildLive();
-      this.box.append(header, this.bannerEl, this.activityEl, nav, h('div', { className: 'body' }, ...Object.values(this.tabs)), this.live, this.footer);
+      this.bodyEl = h('div', { className: 'body' }, ...Object.values(this.tabs));
+      this.box.append(header, this.bannerEl, this.activityEl, nav, this.bodyEl, this.live, this.footer);
       this.showTab('buy');
       this.renderEvents(true);
       this.baseTitle = document.title;
       setInterval(() => this.tick(), 1e3);
+      window.addEventListener('resize', () => this.fit());
+      this.fit();
     }
 
     showTab(id) {
       this.tab = id;
       for (const [k, el] of Object.entries(this.tabs)) el.classList.toggle('on', k === id);
       for (const [k, b] of Object.entries(this.tabBtns)) b.classList.toggle('on', k === id);
+      this.bodyEl.scrollTop = 0;
       this.footer.classList.toggle('hidden', id !== 'buy');
       this.live.classList.toggle('hidden', id === 'log');
       if (id === 'sales') this.renderSales();
@@ -1328,7 +1444,18 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         h('button', { className: 'small', textContent: 'Aucun', onclick: () => this.checkVisible(false) }),
       );
       this.setsEl = h('div', { className: 'sets' });
-      return h('section', { className: 'tab' }, h('div', { className: 'row' }, importBtn), this.filtersEl, this.setsEl);
+      this.recapEl = h('div', { style: 'display:flex;flex-direction:column;gap:8px' });
+      this.raiseInput = h('input', { type: 'number', min: '0', max: '300', step: '5', value: String(this.config.raisePct) });
+      this.raiseInput.onchange = () => {
+        const v = Math.min(300, Math.max(0, Math.floor(Number(this.raiseInput.value) || 0)));
+        this.raiseInput.value = String(v);
+        this.setConfig({ raisePct: v });
+        this.renderSets();
+      };
+      this.raiseRow = h('label', { className: 'raise', title: 'Si aucune annonce au prix de départ, le prix monte par paliers de 5 % jusqu’à ce plafond' }, 'Si introuvable, monter jusqu’à +', this.raiseInput, '% du prix de départ');
+      this.speedLine = h('button', { className: 'speedline', title: 'Ouvrir les réglages', onclick: () => this.showTab('settings') });
+      const recap = h('div', { className: 'recap' }, this.recapEl, this.raiseRow, this.speedLine);
+      return h('section', { className: 'tab' }, h('div', { className: 'row' }, importBtn), recap, this.filtersEl, this.setsEl);
     }
 
     visibleIn(set, inQueue) {
@@ -1368,7 +1495,9 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       }
       const statusOf = new Map(e.queue.map((q) => [q.defId, q]));
       const inQueue = new Set(statusOf.keys());
+      const top = this.bodyEl?.scrollTop ?? 0;
       this.setsEl.replaceChildren(...sets.map((s) => this.renderSet(s, statusOf, inQueue)));
+      if (this.bodyEl) this.bodyEl.scrollTop = top;
       this.renderFooter();
     }
 
@@ -1482,21 +1611,20 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
     // --- Pied de l'onglet Achats : projection, crédits, bouton principal ---
 
     buildFooter() {
-      this.recapEl = h('div', { style: 'display:flex;flex-direction:column;gap:8px' });
-      this.raiseInput = h('input', { type: 'number', min: '0', max: '300', step: '5', value: String(this.config.raisePct) });
-      this.raiseInput.onchange = () => {
-        const v = Math.min(300, Math.max(0, Math.floor(Number(this.raiseInput.value) || 0)));
-        this.raiseInput.value = String(v);
-        this.setConfig({ raisePct: v });
-        this.renderSets();
-      };
-      this.raiseRow = h('label', { className: 'raise', title: 'Si aucune annonce au prix de départ, le prix monte par paliers de 5 % jusqu’à ce plafond' }, 'Si introuvable, monter jusqu’à +', this.raiseInput, '% du prix de départ');
+      this.progressBar = h('div');
       this.mainBtn = h('button', { className: 'big go' });
       this.mainBtn.onclick = () => (this.engine.mode === 'buy' ? this.engine.stop('Achats arrêtés', true) : void this.engine.validate());
       this.resumeBtn = h('button', { className: 'big', onclick: () => void this.engine.runQueue() });
-      this.speedEl = h('details', { className: 'speed' });
+      // Pied fixe : seulement l'action principale (le récapitulatif est en haut de l'onglet Achats)
+      return h('footer', {}, this.progressBar, this.mainBtn, this.resumeBtn);
+    }
+
+    // --- Onglet Réglages : vitesse, ralentissement, pauses, quotas ---
+
+    buildSettingsTab() {
+      this.speedEl = h('div', { className: 'speed' });
       this.renderSpeed();
-      return h('footer', {}, this.recapEl, this.raiseRow, this.speedEl, this.mainBtn, this.resumeBtn);
+      return h('section', { className: 'tab' }, this.speedEl);
     }
 
     // Réglages de vitesse : préréglages, délais (s), ralentissement après limite EA ; appliqués immédiatement
@@ -1534,12 +1662,13 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           ? `Rythme actuel ralenti ×${dec(pace)} (délais ${dec((c.minDelayMs * pace) / 1e3)}–${dec((c.maxDelayMs * pace) / 1e3)} s) jusqu’à ${hm(this.engine.guard.paceUntil(c))} sans nouvelle limite.`
           : 'Rythme normal.';
       const resetBtn = pace > 1 ? h('button', { className: 'small', textContent: 'Revenir au rythme normal', onclick: () => (this.engine.guard.resetPace(), this.engine.log('Rythme remis à la normale'), this.renderSpeed()) }) : null;
-      const open = this.speedEl.open;
+      const summary = `Vitesse : ${active ?? 'personnalisée'} (${dec(c.minDelayMs / 1e3)}–${dec(c.maxDelayMs / 1e3)} s entre recherches)${pace > 1 ? ` · ralenti ×${dec(pace)}` : ''}`;
+      this.speedLine.textContent = `${summary} ›`;
       this.speedEl.replaceChildren(
-        h('summary', { textContent: `Vitesse : ${active ?? 'personnalisée'} (${dec(c.minDelayMs / 1e3)}–${dec(c.maxDelayMs / 1e3)} s entre recherches)${pace > 1 ? ` · ralenti ×${dec(pace)}` : ''}` }),
         h(
           'div',
           { className: 'grid' },
+          h('h4', { textContent: 'Vitesse', style: 'grid-column:1 / -1;margin-top:4px' }),
           h('span', { textContent: 'Préréglage' }),
           h('span', { className: 'presets' }, ...presets),
           h('span', { textContent: 'Délai entre recherches' }),
@@ -1553,6 +1682,11 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           h('span', { className: 'pair' }, '×', input('paceMax', 0.5, 1, 1)),
           h('span', { textContent: 'Retour au rythme normal après (sans limite)' }),
           h('span', { className: 'pair' }, input('paceResetMin', 5), 'min'),
+          h('h4', { textContent: 'Pauses après refus EA (0 = aucune, reprise immédiate)', style: 'grid-column:1 / -1;margin-top:4px' }),
+          h('span', { textContent: 'Après limite EA 426 / 429 / 512 / 521 (min)' }),
+          h('span', { className: 'pair' }, input('softPauseMin', 1), 'min'),
+          h('span', { textContent: 'Après captcha 458 / 460 / 494 (min)' }),
+          h('span', { className: 'pair' }, input('captchaPauseMin', 5), 'min'),
           h('h4', { textContent: 'Quotas (0 = illimité, cumulés avec SnipeFC27)', style: 'grid-column:1 / -1;margin-top:4px' }),
           h('span', { textContent: 'Recherches max par heure' }),
           h('span', { className: 'pair' }, input('quotaSearchHour', 50)),
@@ -1564,7 +1698,6 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         h('div', { className: 'row', style: 'margin-top:6px' }, h('span', { className: 'note grow', textContent: paceState }), resetBtn),
         h('div', { className: 'note', style: 'margin-top:4px', textContent: 'Plus rapide = plus de risque de limite EA ou de captcha.' }),
       );
-      this.speedEl.open = open;
       this.paceShown = pace;
     }
 
@@ -1575,7 +1708,14 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       const pk = e.picks();
       this.raiseRow.style.display = buying ? 'none' : '';
       this.mainBtn.className = buying ? 'big stop' : 'big go';
-      this.mainBtn.textContent = buying ? 'Arrêter les achats' : pk.count ? `Acheter ${pk.count} joueur${pk.count > 1 ? 's' : ''} et revendre au prix d'achat` : 'Coche des joueurs à acheter';
+      const q = e.queue;
+      const treated = q.filter((x) => !isOpen(x)).length;
+      this.progressBar.replaceChildren(...(buying ? [bar([['ok', q.filter((x) => x.price > 0).length], ['over', q.filter(isFailed).length]], q.length)] : []));
+      this.mainBtn.textContent = buying
+        ? `Arrêter les achats (${treated}/${q.length})`
+        : pk.count
+          ? `Acheter ${pk.count} joueur${pk.count > 1 ? 's' : ''} · ~${fmtNum(pk.spend)} crédits · coût ~${fmtNum(pk.tax)}`
+          : 'Coche des joueurs à acheter';
       this.mainBtn.disabled = e.mode === 'relist' || (!buying && !pk.count);
       const open = e.queue.filter(isOpen).length;
       this.resumeBtn.style.display = !e.running && open ? '' : 'none';
@@ -1769,7 +1909,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       const evs = this.engine.events;
       const newest = evs[0]?.id ?? 0;
       if (full || newest < this.shownEventId) {
-        this.liveList.replaceChildren(...evs.slice(0, 6).map((ev) => this.eventRow(ev)));
+        this.liveList.replaceChildren(...evs.slice(0, 3).map((ev) => this.eventRow(ev)));
         this.jList.replaceChildren(...evs.filter((ev) => this.eventMatches(ev)).slice(0, 300).map((ev) => this.eventRow(ev)));
       } else {
         const fresh = evs.filter((ev) => ev.id > this.shownEventId).reverse();
@@ -1778,7 +1918,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
           this.liveList.prepend(this.eventRow(ev));
           if (this.eventMatches(ev)) this.jList.prepend(this.eventRow(ev));
         }
-        while (this.liveList.childElementCount > 6) this.liveList.lastChild.remove();
+        while (this.liveList.childElementCount > 3) this.liveList.lastChild.remove();
         while (this.jList.childElementCount > 300) this.jList.lastChild.remove();
       }
       if (!evs.length) this.jList.replaceChildren(h('div', { className: 'empty', textContent: 'Journal vide.' }));
@@ -1814,6 +1954,13 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
     // --- Mise à jour ---
 
     update(s) {
+      // Les re-rendus ne doivent pas faire sauter la position de défilement
+      const top = this.bodyEl.scrollTop;
+      this.render(s);
+      if (this.bodyEl.scrollTop !== top) this.bodyEl.scrollTop = top;
+    }
+
+    render(s) {
       const locked = s.lockedUntil > Date.now();
       this.pill.className = `pill${s.running ? ' on' : locked ? ' lock' : ''}`;
       this.pill.textContent = s.mode === 'buy' ? 'Achats' : s.mode === 'relist' ? 'Relister' : locked ? 'Pause' : 'Prêt';
@@ -1842,6 +1989,13 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
       if (this.tab === 'sales') this.renderSales(s);
     }
 
+    // Le panneau tient toujours dans la fenêtre : hauteur max = espace sous son bord haut
+    fit() {
+      const top = Math.min(Math.max(0, this.box.getBoundingClientRect().top), Math.max(0, window.innerHeight - 200));
+      this.box.style.top = `${top}px`;
+      this.box.style.maxHeight = `${Math.max(200, window.innerHeight - top - 12)}px`;
+    }
+
     draggable(header) {
       header.onpointerdown = (e) => {
         if (e.target.tagName === 'BUTTON') return;
@@ -1851,6 +2005,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         const move = (ev) => {
           this.box.style.left = `${Math.max(0, ev.clientX - dx)}px`;
           this.box.style.top = `${Math.max(0, ev.clientY - dy)}px`;
+          this.fit();
         };
         const up = () => {
           window.removeEventListener('pointermove', move);
@@ -1891,6 +2046,12 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
     const at = Number(load(K_RESUME, 0));
     save(K_RESUME, 0);
     const lockIntent = load(K_LOCK_RESUME, null);
+    const cfg0 = loadConfig();
+    const kind = engine.guard.lockKind();
+    if ((kind === 'soft' && cfg0.softPauseMin <= 0) || (kind === 'hard' && cfg0.captchaPauseMin <= 0)) {
+      engine.guard.unlock();
+      engine.log('Pause en cours levée (aucune pause réglée)');
+    }
     if (lockIntent) engine.scheduleResume();
     else if ((at && Date.now() - at < 9e5) || load(K_ACTIVE, false)) {
       if (engine.queue.some(isOpen)) {
