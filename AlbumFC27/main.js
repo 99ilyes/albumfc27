@@ -105,7 +105,10 @@
   function save(key, value) {
     try {
       localStorage.setItem(key, JSON.stringify(value));
-    } catch {}
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // ---------- Interception réseau : isCollected par definitionId ----------
@@ -475,6 +478,9 @@
   const K_LOCK_RESUME = `${NS}:lockResume`;
   const K_EVENTS = `${NS}:events`;
   const K_IMPORT_AT = `${NS}:importAt`;
+  // Sets retirés à la main : non réimportés par le catalogue fut.gg (un envoi manuel les rétablit)
+  const K_HIDDEN = `${NS}:hiddenSets`;
+  const K_CATALOG_AT = `${NS}:catalogAt`;
 
   // Type d'un évènement du journal, déduit du message quand il n'est pas donné
   const EVENT_RULES = [
@@ -500,6 +506,7 @@
       toleranceAuto: raw.toleranceAuto !== false,
       afterBuy: AFTER_BUY[raw.afterBuy] ? raw.afterBuy : 'relist',
       markupPct: Number.isFinite(mk) && mk >= 0 ? Math.min(100, mk) : DEFAULT_MARKUP,
+      autoCatalog: raw.autoCatalog !== false,
       ...SPEED_DEFAULTS,
       ...PACE_DEFAULTS,
       ...QUOTA_DEFAULTS,
@@ -560,6 +567,8 @@
     version = 0;
     events = load(K_EVENTS, []);
     itemData = new Map(); // defId -> itemData EA (/defid), pour afficher les cartes
+    hiddenSets = new Set(load(K_HIDDEN, []));
+    catalog = { busy: false, text: '', at: Number(load(K_CATALOG_AT, 0)) || 0 };
     snipeState = null;
     eventSeq = this.events[0]?.id ?? 0;
     waitUntil = 0;
@@ -659,8 +668,8 @@
     // --- Sets ---
 
     saveSets() {
-      save(K_SETS, this.sets);
       this.touch();
+      return save(K_SETS, this.sets);
     }
     setList() {
       return Object.values(this.sets).sort((a, b) => b.at - a.at);
@@ -691,6 +700,8 @@
       const set = this.sets[key];
       if (!set) return;
       delete this.sets[key];
+      this.hiddenSets.add(key);
+      save(K_HIDDEN, [...this.hiddenSets]);
       const still = new Set(Object.values(this.sets).flatMap((s) => Object.keys(s.players ?? {})));
       for (const id of Object.keys(this.selection)) if (!still.has(id)) delete this.selection[id];
       save(K_SEL, this.selection);
@@ -807,32 +818,81 @@
       return true;
     }
 
-    // Set envoyé depuis une page Galerie de fut.gg (joueurs, defId, prix fut.gg)
-    importSet(data) {
+    // Set lu sur fut.gg (joueurs, defId, prix fut.gg) ; statut collecté conservé d'une version à l'autre
+    buildSet(data) {
       const list = Array.isArray(data?.players) ? data.players : [];
+      const slug = String(data?.slug || data?.name || 'set');
+      const key = `futgg:${slug}`;
+      const prev = this.sets[key]?.players ?? {};
       const players = {};
       for (const x of list) {
         const defId = validId(x?.defId);
         if (!defId || players[defId]) continue;
+        const net = netItems.get(defId)?.collected;
         players[defId] = {
           defId,
           name: String(x.name || defId).slice(0, 60),
-          rating: Number(x.rating) || 0,
+          rating: Number(x.rating) || prev[defId]?.rating || 0,
           minPrice: Number(x.price) >= 150 ? Math.round(Number(x.price)) : 0,
           rareflag: this.findPlayer(defId)?.rareflag ?? null,
-          collected: netItems.get(defId)?.collected === true || this.done.has(defId),
+          collected: net === true || this.done.has(defId) || (net === undefined && prev[defId]?.collected === true),
         };
       }
-      if (!Object.keys(players).length) return this.log('Import fut.gg : aucun joueur lu sur la page'), null;
-      const slug = String(data.slug || data.name || 'set');
-      const set = { kind: 'futgg', slug, key: `futgg:${slug}`, name: String(data.name || 'Set fut.gg').slice(0, 60), url: String(data.url || ''), needed: Number(data.needed) || 0, source: 'futgg', at: Date.now() };
+      if (!Object.keys(players).length) return null;
+      return { kind: 'futgg', slug, key, name: String(data.name || 'Set fut.gg').slice(0, 60), url: String(data.url || ''), needed: Number(data.needed) || 0, source: 'futgg', at: Date.now(), players };
+    }
+
+    // Set envoyé depuis une page Galerie de fut.gg
+    importSet(data) {
+      const set = this.buildSet(data);
+      if (!set) return this.log('Import fut.gg : aucun joueur lu sur la page'), null;
       const again = !!this.sets[set.key];
-      this.sets[set.key] = { ...set, players };
-      this.saveSets();
-      const all = Object.values(players);
+      this.sets[set.key] = set;
+      if (this.hiddenSets.delete(set.key)) save(K_HIDDEN, [...this.hiddenSets]);
+      if (!this.saveSets()) this.log('Stockage local plein : set non enregistré (perdu au rechargement)', 'warn');
+      const all = Object.values(set.players);
       const priced = all.filter((p) => p.minPrice).length;
       this.log(`Set « ${set.name} » ${again ? 'mis à jour' : 'importé'} : ${all.length} joueur(s), ${all.filter((p) => p.collected).length} déjà collecté(s)${priced < all.length ? `, ${all.length - priced} sans prix (sondage)` : ''}`);
       return set.key;
+    }
+
+    // Catalogue fut.gg : tous les sets de la Galerie, demandés au bridge (lecture fut.gg par le service worker)
+    requestCatalog(force) {
+      if (this.catalog.busy) return;
+      this.catalog = { ...this.catalog, busy: true, text: 'démarrage…' };
+      window.postMessage({ ns: NS, dir: 'to-ext', catalog: { force } }, window.location.origin);
+      this.touch();
+      this.emit();
+    }
+    // Progression : pas de nouvelle version (l'accueil la suit, la vue d'un set n'est pas reconstruite)
+    catalogStatus(patch) {
+      this.catalog = { ...this.catalog, ...patch };
+      if (patch.at) save(K_CATALOG_AT, patch.at);
+      if (!patch.busy) this.touch();
+      this.emit();
+    }
+    // Sets ajoutés dans l'ordre fut.gg ; un set déjà présent garde sa place, un set retiré à la main reste retiré
+    importCatalog(list, at, failed = 0) {
+      const base = Date.now();
+      const keys = [];
+      let added = 0;
+      let hidden = 0;
+      (Array.isArray(list) ? list : []).forEach((data, i) => {
+        const set = this.buildSet(data);
+        if (!set) return;
+        if (this.hiddenSets.has(set.key)) return void hidden++;
+        const prev = this.sets[set.key];
+        this.sets[set.key] = { ...set, at: prev?.at ?? base - i, syncedAt: prev?.syncedAt };
+        if (!prev) added++;
+        keys.push(set.key);
+      });
+      const stored = this.saveSets();
+      this.catalogStatus({ busy: false, text: '', at });
+      this.log(
+        `Catalogue fut.gg : ${keys.length} set(s) (${added} nouveau(x), ${keys.length - added} mis à jour)${hidden ? `, ${hidden} retiré(s) à la main ignoré(s)` : ''}${failed ? `, ${failed} page(s) sans joueur` : ''}`,
+      );
+      if (!stored) this.log('Stockage local plein : catalogue non enregistré, perdu au rechargement (retirer des sets puis « Réimporter »)', 'warn');
+      return keys;
     }
 
     // --- Contrôles communs ---
@@ -2076,6 +2136,13 @@
         h('b', { textContent: '+ Importer un set fut.gg' }),
         h('span', { className: 'a-block-hint', textContent: 'Ouvre un set de la Galerie sur fut.gg, puis clique « Envoyer à AlbumFC27 ».' }),
       );
+      const c = e.catalog;
+      const catalog = h(
+        'div',
+        { className: 'a-tile add', title: 'Lit tous les sets de la Galerie sur fut.gg (sets retirés à la main exclus)', onclick: () => e.requestCatalog(true) },
+        h('b', { textContent: c.busy ? 'Catalogue fut.gg…' : '↻ Réimporter tous les sets fut.gg' }),
+        h('span', { className: 'a-block-hint', textContent: c.busy ? c.text : `${c.at ? `Catalogue lu ${ago(c.at)}` : 'Catalogue jamais lu'}${this.config.autoCatalog ? ' · relu à l’ouverture (toutes les 6 h)' : ''}` }),
+      );
       const tiles = sets.map((s) => {
         const all = e.setPlayers(s);
         const got = all.filter((p) => p.collected).length;
@@ -2113,12 +2180,12 @@
             h(
               'ol',
               {},
-              h('li', { textContent: '« + Importer un set fut.gg » : ouvre un set de la Galerie, clique « Envoyer à AlbumFC27 ».' }),
+              h('li', { textContent: 'Tous les sets de la Galerie fut.gg sont importés à l’ouverture (« ↻ Réimporter tous les sets fut.gg » pour forcer), ou un par un avec « + Importer un set fut.gg ».' }),
               h('li', { textContent: 'Ouvre le set : les joueurs déjà collectés sont lus chez EA.' }),
               h('li', { textContent: 'Sélectionne les cartes manquantes, puis « Acheter maintenant », ou « Quick snipe » sur une carte.' }),
             ),
           );
-      this.body.replaceChildren(...[h('div', { className: 'a-grid' }, ...tiles, add), intro].filter(Boolean));
+      this.body.replaceChildren(...[h('div', { className: 'a-grid' }, ...tiles, add, catalog), intro].filter(Boolean));
     }
 
     // --- Set : joueurs en cartes EA ---
@@ -2606,6 +2673,9 @@
           h(
             'div',
             { className: 'grid' },
+            title('Catalogue fut.gg'),
+            h('span', { textContent: 'Importer tous les sets de la Galerie à l’ouverture (au plus toutes les 6 h)' }),
+            h('span', { className: 'pair' }, h('input', { type: 'checkbox', checked: c.autoCatalog, onchange: (ev) => this.setConfig({ autoCatalog: ev.target.checked }) })),
             title('Vitesse (achats, vérification, relist)'),
             h('span', { textContent: 'Préréglage' }),
             h('span', { className: 'presets' }, ...presets),
@@ -2648,7 +2718,7 @@
       if (!this.isOpen) return void this.tick();
       this.renderHead();
       this.renderStrip();
-      const sig = `${s.mode}|${s.version}|${s.snipe?.phase ?? ''}`;
+      const sig = `${s.mode}|${s.version}|${s.snipe?.phase ?? ''}|${this.setKey ? '' : this.engine.catalog.text}`;
       const typing = this.root.contains(document.activeElement) && document.activeElement.tagName === 'INPUT';
       if (sig !== this.lastSig && !typing) {
         this.lastSig = sig;
@@ -2688,6 +2758,7 @@
     engine.log(`Web App détectée, prêt${n ? ` (${n} set${n > 1 ? 's' : ''})` : ''}`);
     // Statut Galerie relu chez EA au démarrage
     if (n) setTimeout(() => !engine.running && void engine.syncGallery(), 5e3);
+    if (panel.config.autoCatalog) engine.requestCatalog(false);
     const at = Number(load(K_RESUME, 0));
     save(K_RESUME, 0);
     const lockIntent = load(K_LOCK_RESUME, null);
@@ -2708,7 +2779,15 @@
       if (cmd.type === 'stop') engine.stop('Arrêt demandé', true);
       else if (cmd.type === 'toggle-panel') panel.toggle();
       else if (cmd.type === 'relist') void engine.relist();
-      else if (cmd.type === 'import' && Number(cmd.data?.at) > Number(load(K_IMPORT_AT, 0))) {
+      else if (cmd.type === 'catalog-progress') engine.catalogStatus({ busy: true, text: `Catalogue fut.gg : ${cmd.text}` });
+      else if (cmd.type === 'catalog-fresh') engine.catalogStatus({ busy: false, text: '', at: Number(cmd.at) || engine.catalog.at });
+      else if (cmd.type === 'catalog-error') {
+        engine.catalogStatus({ busy: false, text: '' });
+        engine.log(`Catalogue fut.gg indisponible (${String(cmd.error || 'erreur').slice(0, 120)}) : import manuel possible`, 'warn');
+      } else if (cmd.type === 'catalog') {
+        const keys = engine.importCatalog(cmd.sets, Number(cmd.at) || Date.now(), Number(cmd.failed) || 0);
+        if (keys.length && !engine.running) void engine.syncGallery(keys);
+      } else if (cmd.type === 'import' && Number(cmd.data?.at) > Number(load(K_IMPORT_AT, 0))) {
         save(K_IMPORT_AT, Number(cmd.data.at));
         const key = engine.importSet(cmd.data);
         if (key) {
