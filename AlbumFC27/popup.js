@@ -27,7 +27,7 @@ function render(s) {
   const hm = (x) => new Date(x).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const rows = [
     ['Crédits', s.coins == null ? '?' : fmt(s.coins)],
-    ['Sets', s.sets?.length ? s.sets.join(', ') : '-'],
+    ['Sets', !s.sets?.length ? '-' : s.sets.length > 3 ? `${s.sets.length} sets` : s.sets.join(', ')],
     ['Dernier lot', q.total ? `${fmt(q.done)} / ${fmt(q.total)}${q.failed ? ` (${q.failed} non acheté)` : ''}` : '-'],
     ['En vente', `${fmt(s.onSale)}${s.unsold ? ` (${s.unsold} invendu)` : ''}`],
     ['Coût réel', real < 0 ? `gain ${fmt(-real)}` : fmt(real)],

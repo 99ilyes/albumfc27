@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AlbumFC27",
-  "version": "3.2.0",
-  "description": "Complète les sets de la Galerie FC 27 importés depuis fut.gg avec la méthode de FUT Simple Trader : statut Galerie lu chez EA, prix de référence du marché, achat avec tolérance en paliers, revente ou club.",
+  "version": "3.3.0",
+  "description": "Complète les sets de la Galerie FC 27 (catalogue fut.gg importé à l'ouverture) avec la méthode de FUT Simple Trader : statut Galerie lu chez EA, prix de référence du marché, achat avec tolérance en paliers, revente ou club.",
   "action": {
     "default_popup": "popup.html",
     "default_title": "AlbumFC27",
@@ -38,6 +38,7 @@
         "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*"
       ],
       "js": [
+        "futgg-parse.js",
         "bridge.js"
       ],
       "run_at": "document_idle"
@@ -47,6 +48,7 @@
         "https://www.fut.gg/*"
       ],
       "js": [
+        "futgg-parse.js",
         "futgg.js"
       ],
       "run_at": "document_idle"
