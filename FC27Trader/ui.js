@@ -710,15 +710,12 @@
           list.length > 1 ? 'Une cible différente à chaque recherche : pas d’attente du cache EA, toutes les cibles surveillées' : 'Ajoute au moins 2 cibles pour alterner',
           toggle(cfg.rotate, (v) => this.app.setConfig({ rotate: v })),
         ),
-        ...(cfg.rotate
-          ? [
-              setting(
-                'Grouper les cibles',
-                'Cibles de même club, ligue, nation ou rareté spéciale et de prix voisins : une seule recherche pour toutes, après calibrage du prix min (3 cartes hors cibles max)',
-                toggle(cfg.groupSearch, (v) => this.app.setConfig({ groupSearch: v })),
-              ),
-            ]
-          : []),
+        setting(
+          'Grouper les cibles',
+          `Automatique : cibles de même club, ligue, nation ou rareté spéciale et de prix voisins, une seule recherche pour toutes après calibrage du prix min (3 cartes hors cibles max). Groupes formés une fois toutes les cibles au prix vérifié.${cfg.rotate ? '' : ' Sans alternance, seul le groupe (ou la cible) choisi est cherché.'}`,
+          toggle(cfg.groupSearch, (v) => this.app.setConfig({ groupSearch: v })),
+        ),
+        ...(snipe && cfg.groupSearch ? [hint(s.groupInfo || 'Groupes : vérification des prix des cibles en cours')] : []),
       );
       // Après un snipe
       const seg = h(
@@ -1436,7 +1433,7 @@
       this.renderStrip();
       const a = this.album;
       const s = this.sniper;
-      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${s.cur?.id ?? ''}|${s.units.map((u) => u.id).join(',')}|${this.cfg.snipeFilters}|${this.cfg.rotate}|${this.cfg.groupSearch}`;
+      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${s.cur?.id ?? ''}|${s.units.map((u) => u.id).join(',')}|${s.groupInfo}|${this.cfg.snipeFilters}|${this.cfg.rotate}|${this.cfg.groupSearch}`;
       if (sig !== this.lastSig && !this.typing()) {
         this.lastSig = sig;
         if (this.tab === 'gallery' || this.tab === 'snipe') this.renderBody();

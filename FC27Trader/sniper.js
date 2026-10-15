@@ -93,6 +93,8 @@
     noGroup = new Map();
     regroupAt = 0;
     attrsWarned = false;
+    groupInfo = '';
+    lastGroupNote = '';
     snipes = load(K_SNIPES, {});
     prices = {};
     seen = new Set();
@@ -229,8 +231,9 @@
       this.cur = null;
       this.cursor = -1;
       this.regroupAt = 0;
+      this.groupInfo = '';
       this.albumDone.clear();
-      this.note(`Sniper : démarrage${this.cfg.rotate ? `, une cible différente à chaque recherche${this.cfg.groupSearch ? ', cibles de prix voisins groupées' : ''}` : ''}`);
+      this.note(`Sniper : démarrage${this.cfg.rotate ? ', une cible différente à chaque recherche' : ''}${this.cfg.groupSearch ? ', cibles de prix voisins groupées' : ''}`);
       if (this.cfg.rotate && this.filters.length < 2) this.note('Une seule cible : en ajouter une 2e pour alterner');
       let retries = 0;
       let lastErr = 0;
@@ -542,7 +545,7 @@
           continue;
         }
         const u = p.u;
-        this.useUnit(u);
+        if (!p.prep) this.useUnit(u);
         if (u.group && !u.minBuy) {
           if (!(await this.calibrate(u))) this.dissolve(u, 'calibrage impossible', true);
           continue;
@@ -655,7 +658,7 @@
     // Cibles ajoutées ou retirées pendant que le sniper tourne ; groupes défaits si l'option est coupée
     syncUnits() {
       const ids = new Set(this.filters.map((f) => f.id));
-      const grouping = this.cfg.rotate && this.cfg.groupSearch;
+      const grouping = this.cfg.groupSearch;
       const next = [];
       for (const u of this.units) {
         u.members = u.members.filter((m) => ids.has(m.id));
@@ -691,6 +694,11 @@
       const n = rotate ? this.units.length : this.filters.length;
       let poor = null;
       let freshAt = Infinity;
+      // Sans alternance, groupes demandés : prix de toutes les cibles vérifiés une fois pour pouvoir les grouper
+      if (!rotate && this.cfg.groupSearch && !this.regroupAt) {
+        const todo = this.units.find((u) => !u.group && !u.pricedAt && u.skipUntil <= now);
+        if (todo) return { u: todo, prep: true };
+      }
       for (let k = 0; k < n; k++) {
         const u = rotate ? this.units[(this.cursor + 1 + k) % n] : this.unitOf(this.filters[(this.idx + k) % n]);
         if (!u || u.skipUntil > now) continue;
@@ -739,11 +747,11 @@
     // ---------- Groupes : une recherche par critères communs pour plusieurs cibles de prix voisins ----------
 
     wantRegroup() {
-      if (!this.cfg.rotate || !this.cfg.groupSearch || Date.now() < this.regroupAt) return false;
+      if (!this.cfg.groupSearch || Date.now() < this.regroupAt) return false;
       const now = Date.now();
       const singles = this.units.filter((u) => !u.group && u.skipUntil <= now);
       if (singles.some((u) => !u.pricedAt)) return false;
-      return singles.filter((u) => this.groupable(u.members[0])).length >= 2;
+      return singles.length >= 2;
     }
     groupable(f) {
       return !!(f.auto && f.defId && !f.criteria && f.buyPrice && this.lowOf(f) && this.cards.get(Number(f.defId)));
@@ -795,7 +803,42 @@
           }
         }
       }
+      this.groupReport();
       if (formed) this.emit();
+    }
+    // Bilan des groupes : raison pour chaque cible ou paire non groupée (journal si le bilan change)
+    groupReport() {
+      const now = Date.now();
+      const card = (f) => this.cards.get(Number(f.defId));
+      const why = [];
+      const ok = [];
+      for (const u of this.units.filter((x) => !x.group && x.pricedAt && x.skipUntil <= now)) {
+        const f = u.members[0];
+        if (this.groupable(f)) ok.push(f);
+        else why.push(`${f.label} : ${!f.auto ? 'prix fixés (passer en automatique)' : f.criteria || !f.defId ? 'filtre de la Web App' : !card(f) ? 'club et ligue inconnus' : 'prix inconnus'}`);
+      }
+      const shared = (a, b) => ['club', 'league', 'nation'].some((k) => card(a)[k] > 0 && card(a)[k] === card(b)[k]) || (card(a).rarity >= 2 && card(a).rarity === card(b).rarity);
+      const paired = new Set();
+      for (let i = 0; i < ok.length; i++)
+        for (let j = i + 1; j < ok.length; j++) {
+          const [a, b] = [ok[i], ok[j]];
+          if (!shared(a, b)) continue;
+          paired.add(a).add(b);
+          const top = Math.max(a.buyPrice, b.buyPrice);
+          const low = Math.min(this.lowOf(a), this.lowOf(b));
+          const refused = [...this.noGroup].find(([k, t]) => t > now && k.split('|').includes(a.id) && k.split('|').includes(b.id));
+          if (top >= low) why.push(`${a.label} + ${b.label} : prix incompatibles (achat jusqu'à ${fmt(top)}, moins chère du marché ${fmt(low)})`);
+          else if (refused) why.push(`${a.label} + ${b.label} : trop de cartes hors cibles au calibrage, nouvel essai à ${X.hm(refused[1])}`);
+        }
+      const alone = ok.filter((f) => !paired.has(f));
+      if (alone.length) why.push(`${alone.map((f) => f.label).join(', ')} : aucun club, ligue, nation ou rareté spéciale en commun avec une autre cible`);
+      const n = this.units.filter((u) => u.group).length;
+      const text = `Groupes : ${n ? `${n} formé(s)` : 'aucun'}${why.length ? `. Non groupées : ${why.slice(0, 6).join(' ; ')}${why.length > 6 ? ' ; …' : ''}` : ''}`;
+      this.groupInfo = text;
+      if (text !== this.lastGroupNote) {
+        this.lastGroupNote = text;
+        this.note(text);
+      }
     }
     makeGroup(members, cards) {
       const crit = {};
@@ -842,7 +885,7 @@
     // Prix d'un membre modifiés : groupe défait si les prix ne sont plus compatibles, recalibré si le prix min ne convient plus
     refreshGroup(u) {
       const top = this.maxBuyOf(u);
-      if (!(top < Math.min(...u.members.map((m) => this.lowOf(m) || 0)))) return this.dissolve(u, 'prix devenus trop proches'), false;
+      if (!(top < Math.min(...u.members.map((m) => this.lowOf(m) || 0)))) return this.dissolve(u, 'prix devenus incompatibles'), false;
       if (u.minBuy && u.minBuy >= this.minBuyOf(u)) u.minBuy = u.lastMin = 0;
       return true;
     }
