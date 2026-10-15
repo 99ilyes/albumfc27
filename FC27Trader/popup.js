@@ -40,7 +40,7 @@ function render(st) {
         ['Snipes / ratés', `${ses.snipes ?? 0} / ${ses.misses ?? 0}`],
         ['Profit réel · par heure', `${signed(ses.realized ?? 0)}${perH === null ? '' : ` · ${signed(perH)} / h`}`],
         ['En attente de vente', `${s.pending?.count ?? 0} (${signed(s.pending?.expected ?? 0)})`],
-        ['Recherches 24 h', `${s.limits?.searchesDay ?? 0} / ${s.limits?.max?.searchesDay ?? '—'}`],
+        ['Recherches 24 h', `${s.limits?.searchesDay ?? 0} / ${s.limits?.max ? (s.limits.max.searchesDay ?? '∞') : '—'}`],
         ['Galerie : coût réel', albumCost < 0 ? `gain ${fmt(-albumCost)}` : fmt(albumCost)],
       ].flatMap(([k, v]) => [el('dt', { textContent: k }), el('dd', { textContent: String(v) })]),
     ),
