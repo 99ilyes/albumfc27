@@ -38,7 +38,12 @@
   const DEFAULT_TOLERANCE = 3;
   const MAX_TOLERANCE = 10;
   const DEFAULT_MARKUP = 5;
-  const AFTER_BUY = { relist: "Revendre au prix d'achat", markup: 'Revendre avec marge', keep: 'Garder au club' };
+  // Quick snipe (FST) : 4 min, vitesse rapide, achat sous le prix du marché avec 300 crédits de profit minimum, arrêt au premier achat
+  const SNIPE_MS = 4 * 6e4;
+  const SNIPE_PROFIT = 300;
+  const SNIPE_DELAY = [2e3, 4e3];
+  const SNIPE_MIN_STEPS = 10;
+  const AFTER_BUY = { keep: 'Garder au club', relist: "Revendre au prix d'achat", markup: 'Revendre avec marge' };
   const DEFID_CHUNK = 250;
   const FUTGG_GALLERY = 'https://www.fut.gg/fut-gallery/';
 
@@ -46,6 +51,7 @@
   const roundPrice = (p) => Math.max(0, Math.round(p / step(p)) * step(p));
   const priceDown = (p) => Math.max(150, p - step(p - 1));
   const tickUp = (p) => roundPrice(p + step(p));
+  const roundDown = (p) => (p > 0 ? Math.floor(p / step(p)) * step(p) : 0);
   const tickDown = (p) => Math.max(0, roundPrice(p - step(p - 1)));
   const tolCap = (p, n) => {
     let r = p;
@@ -491,6 +497,7 @@
     const mk = Number(raw.markupPct);
     const cfg = {
       tolerance: Number.isFinite(tol) && tol >= 0 ? Math.min(MAX_TOLERANCE, Math.floor(tol)) : DEFAULT_TOLERANCE,
+      toleranceAuto: raw.toleranceAuto !== false,
       afterBuy: AFTER_BUY[raw.afterBuy] ? raw.afterBuy : 'relist',
       markupPct: Number.isFinite(mk) && mk >= 0 ? Math.min(100, mk) : DEFAULT_MARKUP,
       ...SPEED_DEFAULTS,
@@ -516,21 +523,12 @@
     return out;
   }
 
-  const STATUS_LABEL = {
-    pending: 'en attente',
-    searching: 'recherche…',
-    listed: 'acheté',
-    kept: 'acheté, gardé au club',
-    bought: 'acheté, resté dans les non-assignés',
-    skipped: 'déjà dans la Galerie',
-    moved: 'prix monté',
-    notfound: 'non trouvé',
-    nocoins: 'crédits insuffisants',
-  };
   const isDone = (q) => q.status === 'listed' || q.status === 'kept' || q.status === 'bought' || q.status === 'skipped';
   const isFailed = (q) => q.status === 'notfound' || q.status === 'nocoins' || q.status === 'moved';
   // Coût réel d'un achat : prix payé moins le net de la revente (rien de récupéré si la carte n'est pas en vente)
   const costOf = (q) => (q.status === 'listed' ? q.price - netOf(q.sell || q.price) : q.price);
+  // Écart max (FST) : Auto = 3 paliers, sinon valeur manuelle
+  const tolOf = (cfg) => (cfg.toleranceAuto ? DEFAULT_TOLERANCE : cfg.tolerance);
   // Prix de revente prévu selon le réglage « Après achat »
   const sellFor = (p, cfg) => (cfg.afterBuy === 'keep' ? 0 : cfg.afterBuy === 'markup' ? markupPrice(p, cfg.markupPct) : roundPrice(p));
   const isOpen = (q) => q.status === 'pending' || q.status === 'searching';
@@ -561,6 +559,8 @@
     resumeAt = 0;
     version = 0;
     events = load(K_EVENTS, []);
+    itemData = new Map(); // defId -> itemData EA (/defid), pour afficher les cartes
+    snipeState = null;
     eventSeq = this.events[0]?.id ?? 0;
     waitUntil = 0;
     waitLabel = '';
@@ -598,6 +598,7 @@
         lastEventId: this.eventSeq,
         waitUntil: this.waitUntil,
         waitLabel: this.waitLabel,
+        snipe: this.snipeState,
       };
     }
     touch() {
@@ -698,19 +699,21 @@
     }
 
     // Sélection dédoublonnée entre sets, avec projection selon « Après achat » (revente : coût = taxe 5 % ; club : coût = prix payé)
-    picks() {
+    picks(defIds) {
       const cfg = this.getConfig();
       const list = [];
       const unpriced = [];
-      for (const [id, v] of Object.entries(this.selection)) {
+      for (const id of defIds ?? Object.keys(this.selection)) {
+        if (!this.isSelected(id)) continue;
         const p = this.findPlayer(id);
         if (!p || this.refreshCollected(p).collected) continue;
+        const v = this.selection[id];
         const start = Number(v) >= 150 ? Math.floor(Number(v)) : 0;
         if (!start) {
           unpriced.push(p);
           continue;
         }
-        list.push({ p, start, cap: tolCap(start, cfg.tolerance) });
+        list.push({ p, start, cap: tolCap(start, tolOf(cfg)) });
       }
       const sum = (f) => list.reduce((s, x) => s + f(x), 0);
       const back = (price) => (cfg.afterBuy === 'keep' ? 0 : netOf(sellFor(price, cfg)));
@@ -759,6 +762,7 @@
         }
         for (const it of r.items) {
           const defId = Number(it.resourceId || it.assetId || it.id);
+          if (byId.has(defId)) this.itemData.set(defId, it);
           for (const p of byId.get(defId) ?? []) {
             seen.add(defId);
             if (Number.isFinite(Number(it.rareflag))) p.rareflag = Number(it.rareflag);
@@ -778,6 +782,7 @@
         }
       }
       save(K_DONE, [...this.done]);
+      for (const s of sets) s.syncedAt = Date.now();
       this.saveSets();
       if (!keys) this.gallerySyncAt = Date.now();
       this.log(`Galerie EA lue : ${seen.size} joueur(s) vérifié(s)${got.size ? `, ${got.size} nouvellement collecté(s)` : ''}`);
@@ -1045,9 +1050,11 @@
 
     // --- Vérifier les prix : sondage des joueurs cochés, le prix trouvé devient le prix de départ (FST) ---
 
-    async checkPrices(resume = false) {
+    // ids : joueurs de la fenêtre d'achat (sinon tous les joueurs cochés)
+    async checkPrices(resume = false, ids) {
       this.checkedAt ??= {};
-      const list = this.selectedPlayers().filter(({ p }) => !resume || Date.now() - (this.checkedAt[p.defId] ?? 0) > 15 * 6e4);
+      const only = ids ? new Set(ids.map(Number)) : null;
+      const list = this.selectedPlayers().filter(({ p }) => (!only || only.has(p.defId)) && (!resume || Date.now() - (this.checkedAt[p.defId] ?? 0) > 15 * 6e4));
       if (!list.length) return this.log(resume ? 'Vérification des prix : tous les joueurs cochés ont été vérifiés' : 'Aucun joueur coché');
       if (!(await this.enter('check'))) return;
       let ok = 0;
@@ -1093,10 +1100,12 @@
 
     // --- Achat (méthode FST) : recherche au prix de départ, hausse d'un palier si rien, tolérance en paliers ---
 
-    async validate() {
+    // defIds : joueurs de la fenêtre d'achat (sinon tous les joueurs cochés)
+    async validate(defIds) {
       if (this.running) return;
-      const tol = this.getConfig().tolerance;
-      const queue = this.selectedPlayers().map(({ p, set }) => {
+      const tol = tolOf(this.getConfig());
+      const only = defIds ? new Set(defIds.map(Number)) : null;
+      const queue = this.selectedPlayers().filter(({ p }) => !only || only.has(p.defId)).map(({ p, set }) => {
         const v = Number(this.selection[p.defId]);
         const start = v >= 150 ? Math.floor(v) : 0;
         return { defId: p.defId, name: p.name, rating: p.rating, rareflag: p.rareflag ?? null, set: set.name, start, max: start, cap: tolCap(start, tol), status: 'pending', searches: 0, price: 0, sell: 0 };
@@ -1120,9 +1129,9 @@
       save(K_ACTIVE, true);
       const n = this.queue.length;
       const cfg = this.getConfig();
-      for (const e of this.queue) if (isOpen(e) && e.start) e.cap = tolCap(e.start, cfg.tolerance);
+      for (const e of this.queue) if (isOpen(e) && e.start) e.cap = tolCap(e.start, tolOf(cfg));
       const after = cfg.afterBuy === 'keep' ? 'gardés au club' : cfg.afterBuy === 'markup' ? `revendus avec +${cfg.markupPct} %` : "revendus au prix d'achat";
-      this.log(`Achat de ${n} joueur(s), tolérance ${cfg.tolerance} palier(s) EA au-dessus du prix de départ, ${after}`);
+      this.log(`Achat de ${n} joueur(s), écart max ${tolOf(cfg)} palier(s) EA au-dessus du prix de départ, ${after}`);
       try {
         // Statut Galerie relu chez EA avant d'acheter : les joueurs déjà collectés sont sautés
         if (await this.syncGallery(undefined, 5 * 6e4)) {
@@ -1207,7 +1216,7 @@
         if (c.error) return this.giveUp(e, 'notfound', `sondage en échec (statut ${c.error})`);
         if (!c.price) return this.giveUp(e, 'notfound', 'aucune annonce sur le marché');
         e.start = e.max = c.price;
-        e.cap = tolCap(c.price, this.getConfig().tolerance);
+        e.cap = tolCap(c.price, tolOf(this.getConfig()));
         this.feed(`${e.name} : prix du marché ${fmtNum(c.price)} (4e annonce la moins chère)`);
         await this.sleep(this.delay(), `Achat de ${e.name}`);
       }
@@ -1258,6 +1267,80 @@
       if (!this.stopRequested) this.giveUp(e, 'notfound', `non trouvé ≤ ${fmtNum(e.max)} après ${BUY_SEARCHES} recherches`);
     }
 
+    // « Racheter les sautés au prix vu » (FST) : prix de départ = annonce la moins chère relevée
+    async retrySkipped() {
+      if (this.running) return;
+      const tol = tolOf(this.getConfig());
+      let n = 0;
+      for (const e of this.queue) {
+        if (e.status !== 'moved' || !(e.seen > 0)) continue;
+        e.start = e.max = e.seen;
+        e.cap = tolCap(e.seen, tol);
+        e.status = 'pending';
+        e.note = '';
+        e.seen = 0;
+        this.setSelected(e.defId, true, e.start);
+        n++;
+      }
+      if (!n) return this.log('Aucun joueur sauté à racheter');
+      save(K_QUEUE, this.queue);
+      this.touch();
+      await this.runQueue();
+    }
+
+    // Quick snipe (FST) : prix du marché, puis recherches rapides pendant 4 min sous (prix × 0,95 − 300), arrêt au premier achat, mise en vente au prix du marché
+    async snipe(defId) {
+      const p = this.findPlayer(defId);
+      if (!p || this.refreshCollected(p).collected) return;
+      if (!(await this.enter('snipe'))) return;
+      const st = (this.snipeState = { defId: p.defId, name: p.name, phase: 'price', until: 0, maxBuy: 0, sell: 0, searches: 0 });
+      const e = { defId: p.defId, name: p.name, rating: p.rating, rareflag: p.rareflag ?? null, set: '', start: 0, max: 0, cap: 0, status: 'searching', searches: 0, price: 0, sell: 0 };
+      let bought = false;
+      try {
+        this.log(`Quick snipe ${p.name} : vérification du prix du marché`);
+        this.activity(`Quick snipe ${p.name} : prix du marché`);
+        const c = await this.checkPrice(p);
+        if (c.stop) return;
+        if (c.collected) return this.skipCollected(e);
+        if (!c.price) return this.log(`Quick snipe ${p.name} : ${c.error ? `sondage en échec (statut ${c.error})` : 'aucune annonce sur le marché'}`, 'miss');
+        const maxBuy = roundDown(netOf(c.price) - SNIPE_PROFIT);
+        if (maxBuy < 150) return this.log(`Quick snipe ${p.name} : marché ${fmtNum(c.price)}, pas de marge possible (profit minimum ${SNIPE_PROFIT})`, 'miss');
+        Object.assign(st, { phase: 'run', until: Date.now() + SNIPE_MS, maxBuy, sell: c.price });
+        this.log(`Quick snipe ${p.name} : achat ≤ ${fmtNum(maxBuy)}, revente ${fmtNum(c.price)} (profit ${SNIPE_PROFIT}+), 4 min`);
+        const seen = new Set();
+        let minBuy = 0;
+        let steps = 0;
+        while (!this.stopRequested && Date.now() < st.until) {
+          await this.sleep(rand(...SNIPE_DELAY) * this.guard.pace(this.getConfig()), `Quick snipe ${p.name}`);
+          if (this.stopRequested || Date.now() >= st.until) break;
+          // Prix min relevé d'un palier à chaque recherche (cache EA), remis à zéro après 10 paliers
+          if (++steps > SNIPE_MIN_STEPS || tickUp(minBuy || 150) >= maxBuy) (minBuy = 0), (steps = 0);
+          else minBuy = minBuy ? tickUp(minBuy) : 150;
+          this.activity(`Quick snipe ${p.name} : recherche ≤ ${fmtNum(maxBuy)}`);
+          const r = await this.search(p.defId, { minBuy, maxBuy });
+          st.searches++;
+          if (r.stop) return;
+          if (r.collected) return this.skipCollected(e);
+          if (r.error) continue;
+          const cands = r.items.filter((x) => x.buyNow <= maxBuy && !seen.has(x.tradeId));
+          for (const x of r.items) seen.add(x.tradeId);
+          for (const it of cands.slice(0, 2)) {
+            if (!(await this.affordable(it.buyNow))) return this.log(`Quick snipe ${p.name} : crédits insuffisants pour ${fmtNum(it.buyNow)}`, 'miss');
+            const res = await this.buyAndList(it, e, st.sell);
+            if (res === 'stop') return;
+            if (res === 'ok') return void (bought = true);
+          }
+        }
+      } catch (err) {
+        this.log(`Quick snipe : ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        if (!bought && !this.stopRequested && st.phase === 'run') this.log(`Quick snipe ${p.name} terminé sans achat (${st.searches} recherches)`, 'miss');
+        if (bought) this.log(`Quick snipe ${p.name} : acheté à ${fmtNum(e.price)}${e.sell ? `, en vente à ${fmtNum(e.sell)}` : ''}`, 'buy');
+        this.snipeState = null;
+        this.leave();
+      }
+    }
+
     markCollected(defId) {
       this.done.add(defId);
       save(K_DONE, [...this.done]);
@@ -1265,7 +1348,8 @@
       this.saveSets();
     }
 
-    async buyAndList(it, e) {
+    // listAt : prix de mise en vente imposé (Quick snipe), quel que soit « Après achat »
+    async buyAndList(it, e, listAt = 0) {
       const cfg = this.getConfig();
       await sleep(rand(cfg.buyDelayMinMs, cfg.buyDelayMaxMs));
       if (this.stopRequested) return 'stop';
@@ -1302,11 +1386,12 @@
         }
         this.feed(`${name} ${m.success ? 'gardé au club' : 'laissé dans les non-assignés (déplacement au club échoué)'}${why ? ` : ${why}` : ''}`);
       };
-      if (cfg.afterBuy === 'keep' || this.pileCount >= PILE_MAX || pileFull()) {
-        await keep(cfg.afterBuy === 'keep' ? '' : 'liste de transferts pleine');
+      const keepMode = !listAt && cfg.afterBuy === 'keep';
+      if (keepMode || this.pileCount >= PILE_MAX || pileFull()) {
+        await keep(keepMode ? '' : 'liste de transferts pleine');
         return 'ok';
       }
-      const l = await listItem(it.raw, sellFor(price, cfg));
+      const l = await listItem(it.raw, listAt || sellFor(price, cfg));
       if (!l.success) {
         if (this.fatal(l, 'list')) return 'stop';
         await keep(`mise en vente échouée (statut ${l.status})${errText(l.error)}`);
@@ -1468,141 +1553,180 @@
     }
   }
 
-  // ---------- Panneau ----------
+  // ---------- Interface : calque Galerie façon FUT Simple Trader ----------
+  // Calque dans le DOM de la page (pas de shadow DOM) : les cartes sont rendues par la Web App avec ses propres styles.
+  // Toutes les règles sont préfixées par #afc-root pour ne pas toucher la Web App.
 
+  const PAGE_CARDS = 36;
   const CSS = `
-:host { all: initial; }
-* { box-sizing: border-box; }
-.box { position: fixed; top: 64px; left: 16px; z-index: 2147483647; width: 420px; max-height: calc(100vh - 76px);
-  display: flex; flex-direction: column; font: 12px/1.4 system-ui, sans-serif; color: #e6e7eb;
-  background: #14161b; border: 1px solid #2a2e38; border-radius: 12px; box-shadow: 0 10px 30px #000a; overflow: hidden; }
-.box.hidden { display: none; }
-header, nav, .banner, .activity { flex: none; }
-header { display: flex; align-items: center; gap: 8px; padding: 10px 12px 8px; cursor: move; user-select: none; }
-header .title { font-weight: 700; font-size: 13px; }
-header .coins { margin-left: auto; font-size: 12px; font-weight: 700; color: #ffe066; background: #1e2129; padding: 2px 9px; border-radius: 10px; font-variant-numeric: tabular-nums; }
-.pill { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: #9aa0ad; }
-.pill::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: #5c6170; }
-.pill.on { color: #d3f9d8; } .pill.on::before { background: #51cf66; animation: pulse 1.2s ease-in-out infinite; }
-.pill.lock { color: #ffd8a8; } .pill.lock::before { background: #fd7e14; }
-@keyframes pulse { 50% { opacity: .3; } }
-.x { background: none; color: #8a8f9c; padding: 0 4px; font-size: 16px; line-height: 1; }
-.activity { padding: 0 12px 8px; font-size: 11px; color: #9aa0ad; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 15px; }
-.banner { margin: 0 12px 8px; padding: 6px 8px; border-radius: 8px; background: #3b2a12; color: #ffd8a8; font-size: 11px; display: flex; gap: 8px; align-items: center; }
-.banner button { margin-left: auto; padding: 3px 8px; font-size: 11px; background: #5c4012; }
-.banner:empty { display: none; }
-nav { display: flex; gap: 2px; padding: 0 8px; border-bottom: 1px solid #2a2e38; }
-nav button { background: none; border-radius: 0; padding: 7px 12px; color: #8a8f9c; font-weight: 600; border-bottom: 2px solid transparent; }
-nav button.on { color: #e6e7eb; border-bottom-color: #4c6ef5; }
-nav button .badge { margin-left: 5px; padding: 0 6px; border-radius: 8px; background: #5c4012; color: #ffd8a8; font-size: 10px; }
-.body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 10px 12px; }
-.tab { display: none; flex-direction: column; gap: 10px; } .tab.on { display: flex; }
-h4 { margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #7c8190; }
-input, select { background: #0d0f13; color: inherit; border: 1px solid #2a2e38; border-radius: 6px; padding: 5px 7px; font: inherit; min-width: 0; }
-input:focus, select:focus { outline: none; border-color: #4c6ef5; }
-input[type=number] { font-variant-numeric: tabular-nums; }
-button { border: 0; border-radius: 6px; padding: 6px 10px; font: inherit; font-weight: 600; cursor: pointer; background: #262a33; color: #e6e7eb; }
-button:hover:not(:disabled) { filter: brightness(1.18); }
-button:disabled { opacity: .4; cursor: default; }
-.row { display: flex; gap: 6px; align-items: center; }
-.grow { flex: 1; width: 0; }
-.blue { background: #364fc7; color: #fff; } .go { background: #2f9e44; color: #fff; } .stop { background: #c92a2a; color: #fff; }
-.small { padding: 3px 8px; font-size: 11px; font-weight: 500; }
-.ghost { background: none; color: #8a8f9c; font-weight: 500; }
-.hint { font-size: 11px; color: #8a8f9c; line-height: 1.5; } .hint:empty { display: none; }
-.empty { color: #9aa0ad; font-size: 12px; line-height: 1.7; padding: 4px 2px; }
-.empty b { color: #e6e7eb; }
-.empty ol { margin: 6px 0 0; padding-left: 18px; }
-.filters { display: flex; gap: 6px; align-items: center; font-size: 11px; color: #a9aebb; }
-.filters label { display: flex; gap: 4px; align-items: center; white-space: nowrap; }
-.sets { display: flex; flex-direction: column; gap: 6px; }
-.set { border: 1px solid #2a2e38; border-radius: 8px; overflow: hidden; }
-.shead { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 4px 8px; padding: 7px 8px; background: #1b1e25; cursor: pointer; user-select: none; }
-.shead .nm { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.shead .nm::before { content: '▸'; display: inline-block; width: 12px; color: #7c8190; transition: transform .15s; transform-origin: 3px 50%; }
-.set.open .shead .nm::before { transform: rotate(90deg); }
-.shead .prog { grid-column: 2 / span 2; display: flex; align-items: center; gap: 8px; font-size: 11px; color: #8a8f9c; }
-.shead .prog .bar { flex: 0 0 70px; }
-.shead input { grid-row: 1 / span 2; }
-.sbody { display: none; padding: 4px; flex-direction: column; gap: 2px; }
-.set.open .sbody { display: flex; }
-.p { display: grid; grid-template-columns: auto 1fr auto; align-items: center; column-gap: 8px; padding: 5px 6px; border-radius: 6px; }
-.p:hover { background: #1b1e25; }
-.p.got { opacity: .45; }
-.p.sel { background: #18233a; }
-.p .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-.p .n i { font-style: normal; color: #ffd43b; margin-right: 5px; }
-.p .m { grid-column: 2; font-size: 11px; color: #8a8f9c; }
-.p .m .loss { color: #ffa8a8; }
-.p .st { grid-column: 2; font-size: 11px; color: #74c0fc; }
-.p .st.ok { color: #51cf66; } .p .st.ko { color: #ff8787; }
-.p > input[type=checkbox] { grid-row: 1 / span 3; }
-.p > input[type=number] { grid-row: 1 / span 3; grid-column: 3; width: 84px; text-align: right; }
-.bar { height: 6px; background: #0d0f13; border-radius: 3px; overflow: hidden; display: flex; }
-.bar > span { height: 100%; transition: width .4s; }
-.bar .ok { background: #2f9e44; } .bar .use { background: #4c6ef5; } .bar .cap { background: repeating-linear-gradient(45deg, #4c6ef5 0 3px, #2a3570 3px 6px); } .bar .over { background: #e03131; }
-footer { border-top: 1px solid #2a2e38; padding: 8px 12px 10px; display: flex; flex-direction: column; gap: 6px; background: #171a20; flex: none; }
-.recap { background: #1b1e25; border-radius: 10px; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
-footer.hidden { display: none; }
-.tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
-.tile { background: #1e2129; border-radius: 8px; padding: 6px 8px; min-width: 0; }
-.tile span { display: block; font-size: 10px; color: #8a8f9c; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
-.tile b { display: block; font-size: 15px; font-variant-numeric: tabular-nums; }
-.tile small { display: block; font-size: 10px; color: #8a8f9c; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tile.neg b { color: #ff8787; } .tile.pos b { color: #51cf66; } .tile.warn b { color: #ffa94d; }
-.wallet { display: flex; flex-direction: column; gap: 4px; }
-.wallet .bar { height: 10px; border-radius: 5px; }
-.legend { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: #a9aebb; font-variant-numeric: tabular-nums; }
-.legend i { font-style: normal; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: 0; }
-.note { font-size: 11px; color: #8a8f9c; line-height: 1.5; } .note:empty { display: none; }
-.note.warn { color: #ffa94d; }
-.raise { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #a9aebb; }
-.raise input { width: 52px; text-align: right; }
-.opts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
-.speed { font-size: 11px; color: #a9aebb; display: flex; flex-direction: column; gap: 4px; }
-.speed .grid { display: grid; grid-template-columns: 1fr auto; gap: 6px 8px; align-items: center; }
-.speed .pair { display: flex; align-items: center; gap: 4px; color: #7c8190; }
-.speed .pair input { width: 60px; text-align: right; }
-.speed .presets { display: flex; gap: 4px; }
-.speed .presets button.on { background: #364fc7; color: #fff; }
-.speedline { background: none; padding: 0; font-size: 11px; font-weight: 500; color: #a9aebb; text-align: left; }
-.speedline:hover { color: #e6e7eb; }
-button.big { width: 100%; padding: 10px; font-size: 13px; }
-.hero { background: #1b1e25; border-radius: 10px; padding: 10px 12px; display: flex; align-items: baseline; gap: 10px; }
-.hero span { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #8a8f9c; }
-.hero b { font-size: 22px; font-variant-numeric: tabular-nums; }
-.hero b.neg { color: #ff8787; } .hero b.pos { color: #51cf66; }
-.hero small { margin-left: auto; font-size: 11px; color: #8a8f9c; text-align: right; }
-.sale { display: grid; grid-template-columns: 1fr auto; gap: 1px 8px; padding: 6px 8px; border-radius: 6px; background: #1b1e25; }
-.sale.unsold { box-shadow: inset 3px 0 #fd7e14; }
-.sale .m { font-size: 11px; color: #8a8f9c; }
-.sale .tag { font-size: 10px; padding: 0 6px; border-radius: 8px; background: #22284a; color: #a5b4fc; align-self: center; }
-.sale.unsold .tag { background: #3b2a12; color: #ffd8a8; }
-.salelist { display: flex; flex-direction: column; gap: 3px; }
-.live { border-top: 1px solid #2a2e38; background: #111318; display: flex; flex-direction: column; }
-.live.hidden { display: none; }
-.live .lhead { display: flex; align-items: center; gap: 8px; padding: 6px 12px; cursor: pointer; user-select: none; font-size: 11px; color: #a9aebb; }
-.live .lhead b { color: #e6e7eb; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
-.live .dot { width: 7px; height: 7px; border-radius: 50%; background: #5c6170; }
-.live.on .dot { background: #51cf66; animation: pulse 1.2s ease-in-out infinite; }
-.live .cd { margin-left: auto; color: #74c0fc; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
-.live { flex: none; }
-.live .lbody { padding: 0 8px 6px; }
-.live .lbody .ev span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.live.closed .lbody { display: none; }
-.ev { display: grid; grid-template-columns: 52px 14px 1fr; gap: 4px; padding: 2px 4px; border-radius: 4px; font-size: 11px; line-height: 1.45; color: #c9ccd4; animation: fadein .35s ease-out; }
-.ev .tm { color: #6c7180; font-variant-numeric: tabular-nums; }
-.ev .ic { text-align: center; font-weight: 700; }
-.ev.step { color: #7c8190; } .ev.step .ic { color: #5c6170; }
-.ev.major { color: #e6e7eb; }
-.ev.buy .ic, .ev.buy.major { color: #69db7c; } .ev.sell .ic { color: #ffd43b; } .ev.sell { color: #ffe066; }
-.ev.list .ic { color: #74c0fc; } .ev.miss .ic, .ev.error .ic { color: #ff8787; } .ev.error { color: #ffa8a8; }
-.ev.lock { color: #ffc078; background: #2b2012; } .ev.lock .ic, .ev.warn .ic { color: #ffa94d; }
-@keyframes fadein { from { background: #2a3a5a; } }
-.jtools { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
-.jtools .chipbtn { padding: 3px 8px; font-size: 11px; font-weight: 500; background: #1e2129; }
-.jtools .chipbtn.on { background: #364fc7; color: #fff; }
-.jlist { background: #0d0f13; border-radius: 6px; padding: 4px; }
+#afc-root { --ac: #00CAF6; --bg: #10151d; --panel: #161d27; --line: rgba(255,255,255,.07); --dim: #949db0; --ink: #fff; --ok: #3ddc84; --ko: #ff6b6b; --warn: #ffb347;
+  font: 14px/1.5 Roboto, Arial, sans-serif; color: #dfe4ec; }
+#afc-root * { box-sizing: border-box; }
+#afc-root .a-launch { position: fixed; left: 16px; bottom: 16px; z-index: 2147483000; display: flex; align-items: center; gap: 8px; max-width: 360px;
+  padding: 8px 14px; border-radius: 999px; background: #1f2834; border: 1px solid rgba(255,255,255,.12); color: #fff; font: 600 13px/1.2 Roboto, Arial, sans-serif;
+  box-shadow: 0 8px 24px rgba(0,0,0,.45); cursor: pointer; }
+#afc-root .a-launch:hover { border-color: var(--ac); }
+#afc-root .a-launch small { font-weight: 400; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#afc-root .a-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #5c6170; }
+#afc-root .a-dot.on { background: var(--ok); animation: afc-pulse 1.2s ease-in-out infinite; }
+#afc-root .a-dot.lock { background: var(--warn); }
+@keyframes afc-pulse { 50% { opacity: .3; } }
+#afc-root .a-layer { position: fixed; inset: 0; z-index: 2147483001; display: flex; align-items: center; justify-content: center; background: rgba(12,15,20,.7);
+  visibility: hidden; opacity: 0; transition: opacity .25s, visibility .25s; }
+#afc-root .a-layer.open { visibility: visible; opacity: 1; }
+#afc-root .a-layer.a-buy { z-index: 2147483002; }
+#afc-root .a-inner { position: relative; display: flex; flex-direction: column; width: calc(100% - 3rem); max-width: 1180px; height: calc(100% - 3rem); max-height: 900px;
+  background: rgba(31,40,52,.97); border-radius: .75rem; box-shadow: 0 .5rem 2rem rgba(15,0,0,.2); overflow: hidden; }
+#afc-root .a-buy .a-inner { max-width: 600px; height: auto; max-height: calc(100% - 2rem); }
+#afc-root .a-head { position: relative; display: flex; align-items: center; gap: .75rem; padding: 1.1rem 3rem 1rem 1.5rem; border-bottom: 1px solid var(--line); flex-shrink: 0; }
+#afc-root .a-head .a-text { min-width: 0; flex: 1; }
+#afc-root .a-eyebrow { font-size: .62rem; text-transform: uppercase; letter-spacing: .1em; font-weight: 700; color: #8b94a4; }
+#afc-root .a-title { font-size: 1.25rem; font-weight: 700; color: #fff; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#afc-root .a-sub { font-size: .78rem; color: var(--dim); margin-top: .2rem; }
+#afc-root .a-mark { flex: none; width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; background: var(--ac); color: #0b1118; font-weight: 900; font-size: 15px; }
+#afc-root .a-close { position: absolute; top: 50%; right: 1.1rem; transform: translateY(-50%); background: none; border: 0; color: #fff; font-size: 20px; line-height: 1; cursor: pointer; padding: 4px; }
+#afc-root .a-close:hover { opacity: .7; }
+#afc-root .a-back { flex: none; width: 32px; height: 32px; border-radius: 8px; border: 1px solid rgba(255,255,255,.16); background: none; color: #fff; font-size: 16px; cursor: pointer; }
+#afc-root .a-coins { flex: none; font-weight: 700; color: #ffd76a; font-variant-numeric: tabular-nums; font-size: .85rem; }
+#afc-root .a-nav { display: flex; gap: .25rem; padding: .5rem 1.5rem 0; border-bottom: 1px solid var(--line); flex-shrink: 0; }
+#afc-root .a-nav button { padding: .45rem .9rem; border: 0; border-bottom: 2px solid transparent; background: none; color: var(--dim); font: 600 .8rem Roboto, Arial, sans-serif; cursor: pointer; }
+#afc-root .a-nav button.active { color: #fff; border-bottom-color: var(--ac); }
+#afc-root .a-nav .badge { margin-left: 5px; padding: 0 6px; border-radius: 8px; background: #5c4012; color: #ffd8a8; font-size: 10px; }
+#afc-root .a-strip { display: flex; align-items: center; gap: .6rem; padding: .5rem 1.5rem; background: rgba(0,202,246,.07); border-bottom: 1px solid var(--line); font-size: .78rem; flex-shrink: 0; }
+#afc-root .a-strip.lock { background: rgba(255,179,71,.1); color: #ffd8a8; }
+#afc-root .a-strip .a-st { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#afc-root .a-strip.hidden { display: none; }
+#afc-root .a-body { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 1.25rem 1.5rem 1.5rem; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #4c5969 transparent; }
+#afc-root .a-actionbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; flex-shrink: 0; padding: .75rem 1.5rem; border-top: 1px solid var(--line); background: rgba(16,21,29,.85); }
+#afc-root .a-actionbar.hidden { display: none; }
+#afc-root .a-count { font-weight: 700; color: #fff; }
+#afc-root .a-btn { display: inline-flex; align-items: center; gap: .3rem; padding: .4rem .8rem; border: 1px solid rgba(255,255,255,.18); border-radius: .5rem; background: transparent;
+  color: #fff; font: 600 .75rem Roboto, Arial, sans-serif; cursor: pointer; transition: background .18s, border-color .18s; white-space: nowrap; }
+#afc-root .a-btn:hover:not(:disabled) { border-color: rgba(255,255,255,.4); }
+#afc-root .a-btn:disabled { opacity: .4; cursor: default; }
+#afc-root .a-btn.primary { background: var(--ac); border-color: var(--ac); color: #0b1118; }
+#afc-root .a-btn.danger { background: #c92a2a; border-color: #c92a2a; }
+#afc-root .a-btn.big { width: 100%; justify-content: center; padding: .75rem 1rem; font-size: .9rem; border-radius: .6rem; }
+#afc-root .a-btn.small { padding: .25rem .6rem; font-size: .7rem; }
+#afc-root .a-btn.ghost { border-color: transparent; color: var(--dim); }
+#afc-root .a-link { background: none; border: 0; padding: 0; color: var(--ac); font: inherit; cursor: pointer; }
+#afc-root .a-row { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+#afc-root .a-grow { flex: 1; min-width: 0; }
+#afc-root .a-pill { display: inline-flex; align-items: center; padding: .15rem .55rem; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; font-size: .68rem; font-weight: 600; color: #dfe4ec; white-space: nowrap; }
+#afc-root .a-pill.ok { border-color: rgba(61,220,132,.4); color: var(--ok); }
+#afc-root .a-pill.ko { border-color: rgba(255,107,107,.4); color: var(--ko); }
+#afc-root .a-pill.ac { border-color: rgba(0,202,246,.5); color: var(--ac); }
+#afc-root .a-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: .75rem; }
+#afc-root .a-tile { position: relative; display: flex; flex-direction: column; gap: .8rem; min-height: 150px; padding: 1rem 1.1rem; background: var(--panel); border: 1px solid var(--line);
+  border-radius: .75rem; cursor: pointer; transition: border-color .18s, transform .18s; }
+#afc-root .a-tile:hover { border-color: rgba(255,255,255,.22); transform: translateY(-1px); }
+#afc-root .a-tile.add { align-items: center; justify-content: center; text-align: center; border-style: dashed; color: var(--dim); }
+#afc-root .a-tile.add b { color: #fff; font-size: 1rem; }
+#afc-root .a-tile-top { display: flex; align-items: center; gap: .5rem; }
+#afc-root .a-tile-name { flex: 1; min-width: 0; font-size: .95rem; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#afc-root .a-tile-stats { display: flex; flex-wrap: wrap; gap: .4rem .9rem; font-size: .74rem; color: var(--dim); }
+#afc-root .a-tile-foot { margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: .5rem; font-size: .75rem; color: var(--ac); font-weight: 600; }
+#afc-root .a-x { background: none; border: 0; color: var(--dim); font-size: 15px; cursor: pointer; padding: 0 2px; }
+#afc-root .a-x:hover { color: #fff; }
+#afc-root .a-bar { height: 6px; background: rgba(255,255,255,.08); border-radius: 3px; overflow: hidden; display: flex; }
+#afc-root .a-bar > span { height: 100%; background: var(--ok); transition: width .4s; }
+#afc-root .a-bar > span.ac { background: var(--ac); } #afc-root .a-bar > span.ko { background: var(--ko); }
+#afc-root .a-tabs { display: inline-flex; gap: .25rem; padding: .25rem; background: var(--panel); border-radius: .6rem; }
+#afc-root .a-tabs button { padding: .35rem .75rem; border: 0; border-radius: .45rem; background: transparent; color: var(--dim); font: 600 .78rem Roboto, Arial, sans-serif; cursor: pointer; }
+#afc-root .a-tabs button.active { background: rgba(255,255,255,.1); color: #fff; }
+#afc-root .a-ctl { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin-bottom: 1rem; }
+#afc-root input.a-in, #afc-root select.a-in { background: #0d1117; color: #fff; border: 1px solid rgba(255,255,255,.14); border-radius: .45rem; padding: .35rem .6rem; font: .8rem Roboto, Arial, sans-serif; min-width: 0; }
+#afc-root input.a-in:focus, #afc-root select.a-in:focus { outline: none; border-color: var(--ac); }
+#afc-root input.a-num { width: 64px; text-align: right; font-variant-numeric: tabular-nums; }
+#afc-root .a-players { display: grid; grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: .6rem; }
+#afc-root .a-player { position: relative; display: flex; flex-direction: column; align-items: center; gap: .3rem; padding: 1.4rem .5rem .75rem; background: var(--panel);
+  border: 1px solid var(--line); border-radius: .65rem; min-width: 0; }
+#afc-root .a-player.is-collected { border-color: rgba(255,255,255,.12); }
+#afc-root .a-player.is-collected .a-card { opacity: .55; }
+#afc-root .a-player.is-selectable { cursor: pointer; transition: border-color .15s, background .15s, transform .15s; }
+#afc-root .a-player.is-selectable:hover { border-color: rgba(255,255,255,.22); transform: translateY(-1px); }
+#afc-root .a-player.is-selected { border-color: var(--ac); background: rgba(0,202,246,.07); }
+#afc-root .a-pick { position: absolute; top: .4rem; right: .45rem; width: 16px; height: 16px; border-radius: 999px; border: 1.5px solid rgba(255,255,255,.28); background: rgba(255,255,255,.04);
+  display: grid; place-items: center; font-size: 10px; color: transparent; }
+#afc-root .a-pick.on { background: var(--ac); border-color: var(--ac); color: #10151d; }
+#afc-root .a-got { position: absolute; top: .4rem; right: .45rem; width: 16px; height: 16px; border-radius: 999px; background: var(--ok); color: #10151d; display: grid; place-items: center; font-size: 10px; font-weight: 900; }
+#afc-root .a-card { position: relative; display: flex; justify-content: center; align-items: center; width: 80px; min-height: 104px; }
+#afc-root .a-card .item.small { margin: 0 auto; }
+#afc-root .a-fallback { width: 64px; height: 88px; display: grid; place-items: center; border-radius: .4rem; background: rgba(255,255,255,.06); font-size: 1.1rem; font-weight: 700; color: #fff; }
+#afc-root .a-pname { max-width: 100%; font-size: .78rem; font-weight: 700; color: #fff; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#afc-root .a-price { font-size: .7rem; color: var(--dim); text-align: center; }
+#afc-root .a-pstate { font-size: .66rem; text-align: center; color: var(--ac); }
+#afc-root .a-pstate.ok { color: var(--ok); } #afc-root .a-pstate.ko { color: var(--ko); }
+#afc-root .a-pbtn { margin-top: .2rem; padding: .25rem .6rem; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; background: rgba(255,255,255,.04); color: #aab3c2;
+  font: 700 .66rem Roboto, Arial, sans-serif; cursor: pointer; }
+#afc-root .a-pbtn:hover:not(:disabled), #afc-root .a-pbtn.busy { border-color: var(--ac); background: var(--ac); color: #0b1118; }
+#afc-root .a-pbtn:disabled { opacity: .35; cursor: default; }
+#afc-root .a-pager { display: flex; align-items: center; justify-content: center; gap: .9rem; margin-top: 1.25rem; font-size: .8rem; }
+#afc-root .a-empty { padding: 2rem; text-align: center; color: var(--dim); }
+#afc-root .a-empty ol { text-align: left; display: inline-block; margin: .8rem 0 0; line-height: 1.8; }
+#afc-root .a-block { display: flex; flex-direction: column; gap: .5rem; padding: .9rem 1rem; border: 1px solid rgba(255,255,255,.1); border-radius: .75rem; background: var(--panel); }
+#afc-root .a-block-title { font-size: .7rem; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; color: #8b94a4; }
+#afc-root .a-block-hint { font-size: .72rem; color: var(--dim); line-height: 1.45; }
+#afc-root .a-kv { display: flex; justify-content: space-between; gap: 1rem; font-size: .8rem; }
+#afc-root .a-kv b { color: #fff; font-variant-numeric: tabular-nums; }
+#afc-root .a-kv .warn { color: var(--warn); }
+#afc-root .a-seg { display: inline-flex; gap: .25rem; padding: .2rem; background: #0d1117; border-radius: .5rem; }
+#afc-root .a-seg button { padding: .3rem .7rem; border: 0; border-radius: .4rem; background: none; color: var(--dim); font: 600 .75rem Roboto, Arial, sans-serif; cursor: pointer; }
+#afc-root .a-seg button.active { background: rgba(255,255,255,.12); color: #fff; }
+#afc-root .a-opt { display: flex; gap: .6rem; align-items: flex-start; padding: .55rem .6rem; border: 1px solid transparent; border-radius: .55rem; cursor: pointer; }
+#afc-root .a-opt.active { border-color: var(--ac); background: rgba(0,202,246,.06); }
+#afc-root .a-opt .a-radio { flex: none; margin-top: 3px; width: 14px; height: 14px; border-radius: 50%; border: 2px solid rgba(255,255,255,.35); }
+#afc-root .a-opt.active .a-radio { border-color: var(--ac); background: radial-gradient(var(--ac) 45%, transparent 50%); }
+#afc-root .a-opt b { color: #fff; font-size: .82rem; }
+#afc-root .a-buybody { display: flex; flex-direction: column; gap: .75rem; padding: 1rem 1.5rem; overflow-y: auto; min-height: 0; flex: 1; scrollbar-width: thin; scrollbar-color: #4c5969 transparent; }
+#afc-root .a-brows { display: flex; flex-direction: column; gap: .3rem; max-height: 300px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #4c5969 transparent; }
+#afc-root .a-brow { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: .2rem .7rem; padding: .45rem .6rem; border-radius: .5rem; background: #121821; cursor: pointer; }
+#afc-root .a-brow.off { opacity: .45; }
+#afc-root .a-brow .a-bn { font-weight: 700; color: #fff; font-size: .8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#afc-root .a-brow .a-bn i { font-style: normal; color: #ffd76a; margin-right: .35rem; }
+#afc-root .a-brow .a-bs { grid-column: 2 / span 2; font-size: .7rem; color: var(--dim); }
+#afc-root .a-brow .a-bs.ok { color: var(--ok); } #afc-root .a-brow .a-bs.ko { color: var(--ko); } #afc-root .a-brow .a-bs.ac { color: var(--ac); }
+#afc-root .a-check { width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid rgba(255,255,255,.35); display: grid; place-items: center; font-size: 10px; color: transparent; }
+#afc-root .a-check.on { background: var(--ac); border-color: var(--ac); color: #0b1118; }
+#afc-root .a-buyfoot { display: flex; flex-direction: column; gap: .5rem; padding: .9rem 1.5rem 1.2rem; border-top: 1px solid var(--line); background: #1f2834; flex-shrink: 0; }
+#afc-root .a-cta-sub { text-align: center; font-size: .72rem; color: var(--dim); }
+#afc-root .a-sec { display: flex; flex-direction: column; gap: 10px; max-width: 760px; }
+#afc-root h4 { margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #8b94a4; }
+#afc-root .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+#afc-root .tile { background: var(--panel); border-radius: 8px; padding: 8px 10px; min-width: 0; }
+#afc-root .tile span { display: block; font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+#afc-root .tile b { display: block; font-size: 16px; color: #fff; font-variant-numeric: tabular-nums; }
+#afc-root .tile small { display: block; font-size: 10px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#afc-root .tile.neg b { color: var(--ko); } #afc-root .tile.pos b { color: var(--ok); } #afc-root .tile.warn b { color: var(--warn); }
+#afc-root .hero { background: var(--panel); border-radius: 10px; padding: 10px 12px; display: flex; align-items: baseline; gap: 10px; }
+#afc-root .hero span { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); }
+#afc-root .hero b { font-size: 22px; color: #fff; font-variant-numeric: tabular-nums; }
+#afc-root .hero b.neg { color: var(--ko); } #afc-root .hero b.pos { color: var(--ok); }
+#afc-root .hero small { margin-left: auto; font-size: 11px; color: var(--dim); text-align: right; }
+#afc-root .hint { font-size: 11px; color: var(--dim); line-height: 1.5; } #afc-root .hint:empty { display: none; }
+#afc-root .salelist { display: flex; flex-direction: column; gap: 3px; }
+#afc-root .sale { display: grid; grid-template-columns: 1fr auto; gap: 1px 8px; padding: 6px 8px; border-radius: 6px; background: var(--panel); font-size: 12px; }
+#afc-root .sale b { color: #fff; }
+#afc-root .sale.unsold { box-shadow: inset 3px 0 #fd7e14; }
+#afc-root .sale .m { font-size: 11px; color: var(--dim); }
+#afc-root .sale .tag { font-size: 10px; padding: 0 6px; border-radius: 8px; background: #22284a; color: #a5b4fc; align-self: center; }
+#afc-root .sale.unsold .tag { background: #3b2a12; color: #ffd8a8; }
+#afc-root .speed { font-size: 12px; color: #c4cad6; display: flex; flex-direction: column; gap: 4px; }
+#afc-root .speed .grid { display: grid; grid-template-columns: 1fr auto; gap: 8px 10px; align-items: center; }
+#afc-root .speed .pair { display: flex; align-items: center; gap: 4px; color: var(--dim); }
+#afc-root .speed .pair input { width: 64px; }
+#afc-root .speed .presets { display: flex; gap: 4px; }
+#afc-root .speed .presets .a-btn.on { background: var(--ac); border-color: var(--ac); color: #0b1118; }
+#afc-root .ev { display: grid; grid-template-columns: 58px 14px 1fr; gap: 4px; padding: 2px 6px; border-radius: 4px; font-size: 12px; line-height: 1.45; color: #c9ccd4; }
+#afc-root .ev .tm { color: #6c7180; font-variant-numeric: tabular-nums; }
+#afc-root .ev .ic { text-align: center; font-weight: 700; }
+#afc-root .ev.step { color: #7c8190; }
+#afc-root .ev.major { color: #e6e7eb; }
+#afc-root .ev.buy .ic, #afc-root .ev.buy.major { color: #69db7c; } #afc-root .ev.sell .ic, #afc-root .ev.sell { color: #ffe066; }
+#afc-root .ev.list .ic { color: #74c0fc; } #afc-root .ev.miss .ic, #afc-root .ev.error .ic { color: #ff8787; } #afc-root .ev.error { color: #ffa8a8; }
+#afc-root .ev.lock { color: #ffc078; background: #2b2012; } #afc-root .ev.lock .ic, #afc-root .ev.warn .ic { color: #ffa94d; }
+#afc-root .jtools { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+#afc-root .jlist { background: #0d1117; border-radius: 8px; padding: 4px; }
 `;
 
   function h(tag, props = {}, ...children) {
@@ -1610,11 +1734,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
     n.append(...children.filter((c) => c !== null && c !== undefined && c !== false && c !== ''));
     return n;
   }
-
-  // Barre segmentée : [[classe, valeur], ...] sur une échelle donnée
-  function bar(segments, scale) {
-    return h('div', { className: 'bar' }, ...segments.filter(([, v]) => v > 0).map(([cls, v]) => h('span', { className: cls, style: `width:${Math.min(100, (v / Math.max(1, scale)) * 100)}%` })));
-  }
+  const btn = (label, onclick, cls = '', extra = {}) => h('button', { type: 'button', className: `a-btn ${cls}`.trim(), textContent: label, onclick, ...extra });
 
   function tile(label, value, sub, cls = '') {
     return h('div', { className: `tile ${cls}` }, h('span', { textContent: label }), h('b', { textContent: value }), sub ? h('small', { textContent: sub, title: sub }) : null);
@@ -1635,505 +1755,650 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
     }
   }
 
-  class Panel {
+  const ago = (t) => {
+    const m = Math.floor((Date.now() - t) / 6e4);
+    return m < 1 ? "à l'instant" : m < 60 ? `il y a ${m} min` : m < 1440 ? `il y a ${Math.floor(m / 60)} h` : `il y a ${Math.floor(m / 1440)} j`;
+  };
+
+  // Carte rendue par la Web App (même méthode que FST) à partir de l'itemData EA ; null si indisponible
+  const cardCache = new Map();
+  function cardElement(defId, itemData) {
+    if (cardCache.has(defId)) return cardCache.get(defId);
+    if (!itemData) return null;
+    let el = null;
+    try {
+      const factory = window.factories?.Item;
+      const item = factory?.generateItemsFromItemData?.([{ ...itemData, dream: false }])?.[0];
+      const VF = window.UTItemViewFactory;
+      if (item && VF?.createSmallItem) {
+        const view = VF.createSmallItem(item);
+        view.init();
+        view.supportSecondaryViews = false;
+        view.render(item);
+        el = view.getRootElement();
+      }
+    } catch {
+      el = null;
+    }
+    cardCache.set(defId, el);
+    return el;
+  }
+
+  // Statut d'une ligne d'achat, libellés de FST
+  function rowStatus(q) {
+    if (!q) return null;
+    const m = {
+      pending: ['En attente', ''],
+      searching: ['Achat…', 'ac'],
+      listed: [`Mis en vente à ${fmtNum(q.sell)}`, 'ok'],
+      kept: ['Au club', 'ok'],
+      bought: ['Acheté · non-assignés', 'ok'],
+      skipped: ['Déjà dans la Galerie', 'ok'],
+      moved: [`Prix monté${q.seen ? ` · ${fmtNum(q.seen)} maintenant` : ''}`, 'ko'],
+      notfound: [/concurrence/.test(q.note ?? '') ? 'Surenchéri' : 'Non trouvé', 'ko'],
+      nocoins: ['Crédits insuffisants', 'ko'],
+    }[q.status] ?? [q.status, ''];
+    if (q.price && (q.status === 'kept' || q.status === 'bought')) m[0] += ` · payé ${fmtNum(q.price)}`;
+    return m;
+  }
+
+  class Layer {
     config = loadConfig();
-    filter = { text: '', showCollected: false };
-    open = new Set();
-    tab = 'buy';
-    lastSig = '';
+    tab = 'gallery';
+    setKey = null;
+    filter = 'missing';
+    text = '';
+    page = 0;
+    buyKey = null;
+    buyRows = [];
     jfilter = 'all';
     shownEventId = 0;
+    lastSig = '';
+    synced = new Map();
 
     constructor(engine) {
       this.engine = engine;
-      const host = document.createElement('div');
-      host.id = `${NS}-host`;
-      for (const ev of ['keydown', 'keyup', 'keypress']) host.addEventListener(ev, (e) => e.stopPropagation());
-      document.body.appendChild(host);
-      const shadow = host.attachShadow({ mode: 'open' });
-      this.box = h('div', { className: 'box' });
-      shadow.append(h('style', { textContent: CSS }), this.box);
-      const first = engine.setList()[0];
-      if (first) this.open.add(first.key);
+      document.getElementById('afc-style')?.remove();
+      document.head.append(h('style', { id: 'afc-style', textContent: CSS }));
+      this.root = h('div', { id: 'afc-root' });
+      // Les raccourcis clavier de la Web App ne doivent pas capter la saisie
+      for (const ev of ['keydown', 'keyup', 'keypress']) this.root.addEventListener(ev, (e) => e.stopPropagation());
+      document.body.appendChild(this.root);
       this.build();
-    }
-    toggle() {
-      this.box.classList.toggle('hidden');
-    }
-    show() {
-      this.box.classList.remove('hidden');
     }
     setConfig(patch) {
       this.config = { ...this.config, ...patch };
       save(K_CONFIG, this.config);
     }
+    get isOpen() {
+      return this.layer.classList.contains('open');
+    }
+    toggle() {
+      this.isOpen ? this.close() : this.show();
+    }
+    show() {
+      this.layer.classList.add('open');
+      this.launcher.style.display = 'none';
+      this.renderAll();
+    }
+    close() {
+      this.layer.classList.remove('open');
+      this.launcher.style.display = '';
+      this.closeBuy();
+    }
 
     build() {
-      this.pill = h('span', { className: 'pill' });
-      this.coinsEl = h('span', { className: 'coins', title: 'Crédits disponibles' });
-      const header = h('header', {}, h('span', { className: 'title', textContent: 'AlbumFC27' }), this.pill, this.coinsEl, h('button', { className: 'x', textContent: '×', title: 'Masquer', onclick: () => this.toggle() }));
-      this.draggable(header);
-      this.activityEl = h('div', { className: 'activity' });
-      this.bannerEl = h('div', { className: 'banner' });
-      this.tabs = { buy: this.buildBuyTab(), sales: this.buildSalesTab(), log: this.buildLogTab(), settings: this.buildSettingsTab() };
-      this.tabBtns = {};
-      const nav = h('nav');
-      for (const [id, label] of [['buy', 'Achats'], ['sales', 'Ventes'], ['log', 'Journal'], ['settings', 'Réglages']]) {
-        this.tabBtns[id] = h('button', { textContent: label, onclick: () => this.showTab(id) });
-        nav.append(this.tabBtns[id]);
-      }
+      this.launchDot = h('span', { className: 'a-dot' });
+      this.launchSub = h('small');
+      this.launcher = h('div', { className: 'a-launch', title: 'Ouvrir AlbumFC27', onclick: () => this.toggle() }, this.launchDot, h('span', { textContent: 'AlbumFC27' }), this.launchSub);
+
+      this.backBtn = h('button', { type: 'button', className: 'a-back', textContent: '←', title: 'Retour aux sets', onclick: () => this.openSet(null) });
+      this.eyebrowEl = h('div', { className: 'a-eyebrow' });
+      this.titleEl = h('div', { className: 'a-title' });
+      this.subEl = h('div', { className: 'a-sub' });
+      this.syncBtn = btn('', () => void this.syncCurrent(), 'small');
+      this.coinsEl = h('span', { className: 'a-coins', title: 'Crédits disponibles' });
+      const head = h(
+        'div',
+        { className: 'a-head' },
+        this.backBtn,
+        h('span', { className: 'a-mark', textContent: 'A' }),
+        h('div', { className: 'a-text' }, this.eyebrowEl, this.titleEl, this.subEl),
+        this.syncBtn,
+        this.coinsEl,
+        h('button', { type: 'button', className: 'a-close', textContent: '×', title: 'Fermer', onclick: () => this.close() }),
+      );
+      this.navBtns = {};
       this.salesBadge = h('span', { className: 'badge' });
-      this.footer = this.buildFooter();
-      this.live = this.buildLive();
-      this.bodyEl = h('div', { className: 'body' }, ...Object.values(this.tabs));
-      this.box.append(header, this.bannerEl, this.activityEl, nav, this.bodyEl, this.live, this.footer);
-      this.showTab('buy');
+      this.nav = h('div', { className: 'a-nav' });
+      for (const [id, label] of [['gallery', 'Galerie'], ['sales', 'Ventes'], ['log', 'Journal'], ['settings', 'Réglages']]) {
+        this.navBtns[id] = h('button', { type: 'button', textContent: label, onclick: () => this.showTab(id) });
+        this.nav.append(this.navBtns[id]);
+      }
+      this.stripText = h('span', { className: 'a-st' });
+      this.stripBtn = h('span');
+      this.strip = h('div', { className: 'a-strip hidden' }, h('span', { className: 'a-dot on' }), this.stripText, this.stripBtn);
+      this.body = h('div', { className: 'a-body' });
+      this.actionbar = h('div', { className: 'a-actionbar hidden' });
+      this.inner = h('div', { className: 'a-inner' }, head, this.nav, this.strip, this.body, this.actionbar);
+      this.layer = h('div', { className: 'a-layer' }, this.inner);
+      this.layer.addEventListener('mousedown', (e) => e.target === this.layer && this.close());
+
+      this.buyInner = h('div', { className: 'a-inner' });
+      this.buyLayer = h('div', { className: 'a-layer a-buy' }, this.buyInner);
+      this.buyLayer.addEventListener('mousedown', (e) => e.target === this.buyLayer && !this.engine.running && this.closeBuy());
+
+      this.salesSec = this.buildSalesTab();
+      this.logSec = this.buildLogTab();
+      this.settingsSec = h('div', { className: 'a-sec' });
+      this.root.append(this.launcher, this.layer, this.buyLayer);
       this.renderEvents(true);
-      this.baseTitle = document.title;
+      this.renderSpeed();
       setInterval(() => this.tick(), 1e3);
-      window.addEventListener('resize', () => this.fit());
-      this.fit();
+      this.renderAll();
     }
 
     showTab(id) {
       this.tab = id;
-      for (const [k, el] of Object.entries(this.tabs)) el.classList.toggle('on', k === id);
-      for (const [k, b] of Object.entries(this.tabBtns)) b.classList.toggle('on', k === id);
-      this.bodyEl.scrollTop = 0;
-      this.footer.classList.toggle('hidden', id !== 'buy');
-      this.live.classList.toggle('hidden', id === 'log');
-      if (id === 'sales') this.renderSales();
+      this.body.scrollTop = 0;
+      this.renderAll();
     }
 
-    // --- Onglet Achats ---
-
-    buildBuyTab() {
-      const importBtn = h('button', { className: 'blue', textContent: '+ Importer un set fut.gg', onclick: () => window.open(FUTGG_GALLERY, '_blank', 'noopener') });
-      const search = h('input', { type: 'search', placeholder: 'Filtrer par nom', className: 'grow' });
-      search.oninput = () => ((this.filter.text = search.value.trim().toLowerCase()), this.renderSets());
-      const showCol = h('input', { type: 'checkbox' });
-      showCol.onchange = () => ((this.filter.showCollected = showCol.checked), this.renderSets());
-      this.filtersEl = h(
-        'div',
-        { className: 'filters' },
-        search,
-        h('label', { title: 'Afficher aussi les joueurs déjà dans la Galerie' }, showCol, 'collectés'),
-        h('button', { className: 'small', textContent: 'Tout', title: 'Cocher tous les manquants affichés', onclick: () => this.checkVisible(true) }),
-        h('button', { className: 'small', textContent: 'Aucun', onclick: () => this.checkVisible(false) }),
-      );
-      this.setsEl = h('div', { className: 'sets' });
-      this.recapEl = h('div', { style: 'display:flex;flex-direction:column;gap:8px' });
-      const syncBtn = h('button', { textContent: '↻ Galerie EA', title: 'Relire chez EA les joueurs déjà collectés (même requête que FUT Simple Trader)' });
-      syncBtn.onclick = async () => {
-        if (this.engine.running) return this.engine.log('Lecture de la Galerie EA : attendre la fin de la tâche en cours (faite aussi avant chaque lot d’achats)');
-        syncBtn.disabled = true;
-        await this.engine.syncGallery();
-        syncBtn.disabled = false;
-      };
-      const tolInput = h('input', { type: 'number', min: '0', max: String(MAX_TOLERANCE), step: '1', value: String(this.config.tolerance) });
-      tolInput.onchange = () => {
-        const v = Math.min(MAX_TOLERANCE, Math.max(0, Math.floor(Number(tolInput.value) || 0)));
-        tolInput.value = String(v);
-        this.setConfig({ tolerance: v });
-        this.renderSets();
-      };
-      const afterSel = h('select', {}, ...Object.entries(AFTER_BUY).map(([v, label]) => h('option', { value: v, textContent: label, selected: v === this.config.afterBuy })));
-      const markInput = h('input', { type: 'number', min: '0', max: '100', step: '1', value: String(this.config.markupPct) });
-      const markWrap = h('span', { className: 'pair' }, '+', markInput, '%');
-      const showMark = () => (markWrap.style.display = this.config.afterBuy === 'markup' ? '' : 'none');
-      afterSel.onchange = () => (this.setConfig({ afterBuy: afterSel.value }), showMark(), this.renderSets());
-      markInput.onchange = () => {
-        const v = Math.min(100, Math.max(0, Number(markInput.value) || 0));
-        markInput.value = String(v);
-        this.setConfig({ markupPct: v });
-        this.renderSets();
-      };
-      showMark();
-      this.checkBtn = h('button', { className: 'small', onclick: () => (this.engine.mode === 'check' ? this.engine.stop('Vérification arrêtée', true) : void this.engine.checkPrices()) });
-      this.raiseRow = h(
-        'div',
-        { className: 'opts' },
-        h('label', { className: 'raise', title: 'Aucune annonce au prix de départ : le prix monte d’un palier EA par recherche, jusqu’à ce nombre de paliers. Au-delà : « prix monté », joueur sauté' }, 'Tolérance', tolInput, 'palier(s) EA'),
-        h('label', { className: 'raise' }, 'Après achat', afterSel, markWrap),
-        this.checkBtn,
-      );
-      this.speedLine = h('button', { className: 'speedline', title: 'Ouvrir les réglages', onclick: () => this.showTab('settings') });
-      const recap = h('div', { className: 'recap' }, this.recapEl, this.raiseRow, this.speedLine);
-      return h('section', { className: 'tab' }, h('div', { className: 'row' }, importBtn, syncBtn), recap, this.filtersEl, this.setsEl);
+    openSet(key) {
+      this.setKey = key;
+      this.page = 0;
+      this.text = '';
+      this.tab = 'gallery';
+      this.body.scrollTop = 0;
+      this.renderAll();
+      // Comme FST : statut Galerie relu chez EA à l'entrée du set (si ancien ou cartes non chargées)
+      if (key) {
+        const s = this.engine.sets[key];
+        const stale = !s?.syncedAt || Date.now() - s.syncedAt > 5 * 6e4 || Object.values(s.players ?? {}).some((p) => !this.engine.itemData.has(p.defId));
+        if (stale && !this.engine.running && !this.synced.get(key)) void this.syncCurrent();
+      }
     }
 
-    visibleIn(set, inQueue) {
-      const t = this.filter.text;
-      return this.engine.setPlayers(set).filter((p) => (this.filter.showCollected || !p.collected || inQueue.has(p.defId)) && (!t || p.name.toLowerCase().includes(t)));
+    async syncCurrent() {
+      const key = this.setKey;
+      if (this.engine.running) return this.engine.log('Lecture de la Galerie EA : attendre la fin de la tâche en cours');
+      this.synced.set(key ?? '*', true);
+      this.syncing = true;
+      this.renderHead();
+      await this.engine.syncGallery(key ? [key] : undefined);
+      this.syncing = false;
+      this.synced.set(key ?? '*', false);
+      this.renderAll();
     }
 
-    checkVisible(on, onlySet) {
+    // --- Rendu général ---
+
+    renderAll() {
+      this.renderHead();
+      this.renderStrip();
+      this.renderBody();
+      this.renderLauncher();
+      if (this.buyKey) this.renderBuy();
+    }
+
+    renderHead() {
       const e = this.engine;
-      const inQueue = new Set(e.queue.map((q) => q.defId));
-      for (const s of onlySet ? [onlySet] : e.setList()) for (const p of this.visibleIn(s, inQueue)) if (!p.collected) e.setSelected(p.defId, on);
-      this.renderSets();
+      const set = this.setKey && this.tab === 'gallery' ? e.sets[this.setKey] : null;
+      this.backBtn.style.display = set ? '' : 'none';
+      this.eyebrowEl.textContent = set ? 'Gallery Solver · Set' : 'AlbumFC27 · Gallery Solver';
+      this.titleEl.textContent = set ? set.name : { gallery: 'Galerie', sales: 'Ventes', log: 'Journal', settings: 'Réglages' }[this.tab];
+      if (set) {
+        const all = e.setPlayers(set);
+        const got = all.filter((p) => p.collected).length;
+        this.subEl.textContent = `Collectés ${got} / ${all.length}${set.needed ? ` · ${set.needed} cartes requises` : ''}`;
+      } else this.subEl.textContent = this.tab === 'gallery' ? `${e.setList().length} set(s) importé(s) depuis fut.gg` : '';
+      this.syncBtn.style.display = this.tab === 'gallery' ? '' : 'none';
+      const at = set ? set.syncedAt : e.gallerySyncAt;
+      this.syncBtn.textContent = this.syncing ? 'Synchronisation…' : at ? `↻ Synchronisé ${ago(at)}` : '↻ Non synchronisé';
+      this.syncBtn.title = 'Relire chez EA les cartes collectées (même requête que FST)';
+      this.syncBtn.disabled = this.syncing || e.running;
+      const c = coins();
+      this.coinsEl.textContent = c == null ? '' : `${fmtNum(c)} crédits`;
+      for (const [k, b] of Object.entries(this.navBtns)) b.classList.toggle('active', k === this.tab);
+      const unsold = Object.values(e.bought).filter(isUnsold).length;
+      this.salesBadge.textContent = String(unsold);
+      if (unsold) this.navBtns.sales.append(this.salesBadge);
+      else this.salesBadge.remove();
     }
 
-    renderSets() {
+    renderStrip() {
+      const e = this.engine;
+      const locked = e.guard.lockedUntil() > Date.now();
+      this.strip.classList.toggle('hidden', !e.running && !locked);
+      this.strip.classList.toggle('lock', locked && !e.running);
+      const stopLabel = { buy: 'Arrêter les achats', relist: 'Arrêter le relist', check: 'Arrêter la vérification', snipe: 'Arrêter le snipe' }[e.mode];
+      if (e.running) this.stripBtn.replaceChildren(btn(stopLabel ?? 'Arrêter', () => e.stop(`${stopLabel ?? 'Arrêt'} demandé`, true), 'small danger'));
+      else if (locked) this.stripBtn.replaceChildren(btn('Lever', () => confirm('Lever la pause ? Seulement si aucun captcha n’est affiché.') && e.unlock(), 'small'));
+      else this.stripBtn.replaceChildren();
+      this.tick();
+    }
+
+    renderLauncher() {
+      const e = this.engine;
+      const locked = e.guard.lockedUntil() > Date.now();
+      this.launchDot.className = `a-dot${e.running ? ' on' : locked ? ' lock' : ''}`;
+    }
+
+    tick() {
+      const e = this.engine;
+      const left = e.waitUntil - Date.now();
+      const s = e.snipeState;
+      let txt = e.running && left > 0 ? `${e.waitLabel || 'Prochaine action'} dans ${fmtWait(left)}` : e.running ? e.activityText || 'En cours…' : '';
+      if (s?.phase === 'run') txt = `Quick snipe ${s.name} : achat ≤ ${fmtNum(s.maxBuy)}, revente ${fmtNum(s.sell)} · ${s.searches} recherche(s) · reste ${fmtWait(s.until - Date.now())}`;
+      const locked = e.guard.lockedUntil() > Date.now();
+      if (!e.running && locked) txt = `${e.guard.lockKind() === 'soft' ? 'Pause limite EA' : 'Pause anti-captcha'} jusqu'à ${hm(e.guard.lockedUntil())}${e.resumeAt ? `, reprise vers ${hm(e.resumeAt)}` : ''}`;
+      this.stripText.textContent = txt;
+      this.launchSub.textContent = e.running ? txt : locked ? txt : e.lastMessage;
+      if (this.tab === 'gallery' && this.setKey === null && !this.syncing && this.isOpen) {
+        const at = e.gallerySyncAt;
+        this.syncBtn.textContent = at ? `↻ Synchronisé ${ago(at)}` : '↻ Non synchronisé';
+      }
+    }
+
+    renderBody() {
+      const top = this.body.scrollTop;
+      const tab = this.tab;
+      if (tab === 'gallery') this.setKey && this.engine.sets[this.setKey] ? this.renderSet() : ((this.setKey = null), this.renderHome());
+      else if (tab === 'sales') {
+        this.renderSales();
+        this.body.replaceChildren(this.salesSec);
+      } else if (tab === 'log') this.body.replaceChildren(this.logSec);
+      else {
+        this.renderSpeed();
+        this.body.replaceChildren(this.settingsSec);
+      }
+      if (tab !== 'gallery' || !this.setKey) this.actionbar.classList.add('hidden');
+      this.body.scrollTop = top;
+    }
+
+    // --- Accueil : sets importés ---
+
+    renderHome() {
       const e = this.engine;
       const sets = e.setList();
-      this.filtersEl.style.display = sets.length ? '' : 'none';
-      if (!sets.length) {
-        this.setsEl.replaceChildren(
+      const add = h(
+        'div',
+        { className: 'a-tile add', onclick: () => window.open(FUTGG_GALLERY, '_blank', 'noopener') },
+        h('b', { textContent: '+ Importer un set fut.gg' }),
+        h('span', { className: 'a-block-hint', textContent: 'Ouvre un set de la Galerie sur fut.gg, puis clique « Envoyer à AlbumFC27 ».' }),
+      );
+      const tiles = sets.map((s) => {
+        const all = e.setPlayers(s);
+        const got = all.filter((p) => p.collected).length;
+        const missing = all.filter((p) => !p.collected);
+        const left = missing.reduce((t, p) => t + (p.minPrice || 0), 0);
+        const sel = missing.filter((p) => e.isSelected(p.defId)).length;
+        return h(
+          'div',
+          { className: 'a-tile', onclick: () => this.openSet(s.key) },
           h(
             'div',
-            { className: 'empty' },
-            h('b', { textContent: 'Aucun set importé.' }),
+            { className: 'a-tile-top' },
+            h('span', { className: 'a-tile-name', textContent: s.name, title: s.name }),
+            s.url ? h('button', { type: 'button', className: 'a-x', textContent: '↗', title: 'Ouvrir sur fut.gg (renvoyer pour mettre à jour)', onclick: (ev) => (ev.stopPropagation(), window.open(s.url, '_blank', 'noopener')) }) : null,
+            h('button', { type: 'button', className: 'a-x', textContent: '×', title: 'Retirer le set', disabled: e.running, onclick: (ev) => (ev.stopPropagation(), confirm(`Retirer le set « ${s.name} » ?`) && e.removeSet(s.key)) }),
+          ),
+          h(
+            'div',
+            { className: 'a-tile-stats' },
+            h('span', { textContent: `${all.length} joueurs` }),
+            s.needed ? h('span', { textContent: `${s.needed} cartes requises` }) : null,
+            left ? h('span', { textContent: `manquants ~${fmtNum(left)} crédits (fut.gg)` }) : null,
+            sel ? h('span', { className: 'a-pill ac', textContent: `${sel} sélectionné(s)` }) : null,
+          ),
+          h('div', { className: 'a-bar' }, h('span', { style: `width:${all.length ? (got / all.length) * 100 : 0}%` })),
+          h('div', { className: 'a-tile-foot' }, h('span', { style: 'color:#dfe4ec;font-weight:400', textContent: `Collectés ${got} / ${all.length}` }), h('span', { textContent: 'Voir les joueurs →' })),
+        );
+      });
+      const intro = sets.length
+        ? null
+        : h(
+            'div',
+            { className: 'a-empty' },
+            h('b', { style: 'color:#fff', textContent: 'Aucun set importé.' }),
             h(
               'ol',
               {},
-              h('li', { textContent: '« Importer un set fut.gg » : ouvre un set de la Galerie, clique le bouton vert « Envoyer à AlbumFC27 ».' }),
-              h('li', { textContent: 'Coche les joueurs manquants (prix de départ = prix fut.gg, modifiable).' }),
-              h('li', { textContent: '« Vérifier les prix » (facultatif) : prix de départ = 4e annonce la moins chère du marché.' }),
-              h('li', { textContent: '« Acheter » : achat de l’annonce la moins chère sous le prix de départ (+ tolérance en paliers EA), puis revente ou club selon « Après achat ».' }),
-              h('li', { textContent: 'Onglet Ventes : « Relister » remet les invendus au prix le plus bas du marché.' }),
+              h('li', { textContent: '« + Importer un set fut.gg » : ouvre un set de la Galerie, clique « Envoyer à AlbumFC27 ».' }),
+              h('li', { textContent: 'Ouvre le set : les joueurs déjà collectés sont lus chez EA.' }),
+              h('li', { textContent: 'Sélectionne les cartes manquantes, puis « Acheter maintenant », ou « Quick snipe » sur une carte.' }),
             ),
-          ),
-        );
-        this.renderFooter();
-        return;
-      }
-      const statusOf = new Map(e.queue.map((q) => [q.defId, q]));
-      const inQueue = new Set(statusOf.keys());
-      const top = this.bodyEl?.scrollTop ?? 0;
-      this.setsEl.replaceChildren(...sets.map((s) => this.renderSet(s, statusOf, inQueue)));
-      if (this.bodyEl) this.bodyEl.scrollTop = top;
-      this.renderFooter();
+          );
+      this.body.replaceChildren(...[h('div', { className: 'a-grid' }, ...tiles, add), intro].filter(Boolean));
     }
 
-    setCounts(s) {
+    // --- Set : joueurs en cartes EA ---
+
+    renderSet() {
       const e = this.engine;
-      const all = e.setPlayers(s);
-      const missing = all.filter((p) => !p.collected);
-      const sel = missing.filter((p) => e.isSelected(p.defId));
-      const cost = sel.reduce((t, p) => t + (Number(e.selection[p.defId]) || 0), 0);
-      return { all, missing, sel, cost };
-    }
-
-    setProgress(s, c) {
-      const got = c.all.length - c.missing.length;
-      const parts = [`${got}/${c.all.length} collectés`, s.needed ? `${s.needed} requis` : '', c.sel.length ? `${c.sel.length} coché(s) ~${fmtNum(c.cost)}` : ''];
-      return [bar([['ok', got]], c.all.length), h('span', { textContent: parts.filter(Boolean).join(' · ') })];
-    }
-
-    renderSet(s, statusOf, inQueue) {
-      const e = this.engine;
-      const busy = e.mode === 'buy' || e.mode === 'check';
-      const c = this.setCounts(s);
-      const isOpenSet = this.open.has(s.key) || !!this.filter.text;
-      const allBox = h('input', { type: 'checkbox', title: 'Cocher tous les manquants', checked: c.missing.length > 0 && c.sel.length === c.missing.length, disabled: busy || !c.missing.length });
-      allBox.indeterminate = c.sel.length > 0 && c.sel.length < c.missing.length;
-      allBox.onclick = (ev) => ev.stopPropagation();
-      allBox.onchange = () => this.checkVisible(allBox.checked, s);
-      const tools = h('span', { className: 'row' });
-      if (s.url) tools.append(h('button', { className: 'small', textContent: '↗', title: 'Ouvrir sur fut.gg (renvoyer pour mettre à jour)', onclick: (ev) => (ev.stopPropagation(), window.open(s.url, '_blank', 'noopener')) }));
-      tools.append(h('button', { className: 'small', textContent: '×', title: 'Retirer le set', disabled: busy, onclick: (ev) => (ev.stopPropagation(), confirm(`Retirer le set « ${s.name} » ?`) && e.removeSet(s.key)) }));
-      const prog = h('div', { className: 'prog' }, ...this.setProgress(s, c));
-      const head = h('div', { className: 'shead' }, allBox, h('span', { className: 'nm', textContent: s.name, title: s.name }), tools, prog);
-      const wrap = h('div', { className: `set${isOpenSet ? ' open' : ''}` }, head);
-      wrap.dataset.key = s.key;
-      head.onclick = () => {
-        if (this.open.has(s.key)) this.open.delete(s.key);
-        else this.open.add(s.key);
-        wrap.classList.toggle('open');
-        if (wrap.classList.contains('open') && !wrap.querySelector('.sbody')) wrap.append(this.renderRows(this.visibleIn(s, inQueue), statusOf));
+      const set = e.sets[this.setKey];
+      const all = e.setPlayers(set);
+      const queue = new Map(e.queue.map((q) => [q.defId, q]));
+      const lists = { all, collected: all.filter((p) => p.collected), missing: all.filter((p) => !p.collected) };
+      const tabs = h(
+        'div',
+        { className: 'a-tabs' },
+        ...[
+          ['all', 'Tous'],
+          ['collected', 'Collectés'],
+          ['missing', 'Manquants'],
+        ].map(([id, label]) => h('button', { type: 'button', className: this.filter === id ? 'active' : '', textContent: `${label} ${lists[id].length}`, onclick: () => ((this.filter = id), (this.page = 0), this.renderBody()) })),
+      );
+      const search = h('input', { type: 'search', className: 'a-in', placeholder: 'Rechercher un joueur', value: this.text });
+      search.oninput = () => {
+        this.text = search.value.trim().toLowerCase();
+        this.page = 0;
+        this.renderGrid(lists, queue);
       };
-      if (isOpenSet) wrap.append(this.renderRows(this.visibleIn(s, inQueue), statusOf));
-      return wrap;
-    }
-
-    rowMeta(p, start, selected, q) {
-      if (p.collected) return q ? [] : ['déjà dans la Galerie'];
-      const ref = p.minPrice ? `fut.gg ${fmtNum(p.minPrice)}` : 'pas de prix fut.gg';
-      if (!start) return [`${ref} · ${selected ? 'prix trouvé par sondage au lancement' : 'saisir un prix ou laisser vide (sondage)'}`];
-      const cap = tolCap(start, this.config.tolerance);
-      const cost = start - (this.config.afterBuy === 'keep' ? 0 : netOf(sellFor(start, this.config)));
-      return [`${start !== p.minPrice ? `${ref} · ` : ''}${fmtNum(start)}${cap > start ? ` → max ${fmtNum(cap)}` : ''} · `, h('span', { className: 'loss', textContent: cost >= 0 ? `coût ${fmtNum(cost)}` : `gain ${fmtNum(-cost)}` })];
-    }
-
-    renderRows(visible, statusOf) {
-      const e = this.engine;
       const busy = e.mode === 'buy' || e.mode === 'check';
-      const rows = visible.map((p) => {
-        const selected = e.isSelected(p.defId) && !p.collected;
-        const q = statusOf.get(p.defId);
-        const startOf = () => (selected ? Number(e.selection[p.defId]) || 0 : p.minPrice || 0);
-        const cb = h('input', { type: 'checkbox', checked: selected, disabled: busy || p.collected });
-        const price = h('input', { type: 'number', min: '150', step: String(step(p.minPrice || 200)), value: startOf() ? String(startOf()) : '', placeholder: 'sondage', disabled: busy || p.collected, title: 'Prix de départ (vide = sondage du marché)' });
-        const meta = h('span', { className: 'm' }, ...this.rowMeta(p, startOf(), selected, q));
-        const row = h('div', { className: `p${p.collected && !q ? ' got' : ''}${selected ? ' sel' : ''}` });
-        const changed = () => {
-          meta.replaceChildren(...this.rowMeta(p, cb.checked ? Number(e.selection[p.defId]) || 0 : Number(price.value) || 0, cb.checked, q));
-          row.classList.toggle('sel', cb.checked);
-          this.renderFooter();
-          this.refreshSetHeads();
-        };
-        cb.onchange = () => {
-          e.setSelected(p.defId, cb.checked, Math.floor(Number(price.value)) >= 150 ? Math.floor(Number(price.value)) : 0);
-          changed();
-        };
+      const selAll = btn('Tout sélectionner', () => {
+        for (const p of lists.missing) if (!e.isSelected(p.defId)) e.setSelected(p.defId, true);
+        this.renderBody();
+      }, 'small ghost', { disabled: busy });
+      this.gridWrap = h('div');
+      this.body.replaceChildren(h('div', { className: 'a-ctl' }, tabs, search, h('span', { className: 'a-grow' }), selAll), this.gridWrap);
+      this.renderGrid(lists, queue);
+      this.renderActionbar(set);
+    }
+
+    renderGrid(lists, queue) {
+      const e = this.engine;
+      const t = this.text;
+      const list = lists[this.filter].filter((p) => !t || p.name.toLowerCase().includes(t));
+      const pages = Math.max(1, Math.ceil(list.length / PAGE_CARDS));
+      this.page = Math.min(this.page, pages - 1);
+      const shown = list.slice(this.page * PAGE_CARDS, (this.page + 1) * PAGE_CARDS);
+      const busy = e.mode === 'buy' || e.mode === 'check';
+      const cards = shown.map((p) => {
+        const sel = !p.collected && e.isSelected(p.defId);
+        const selectable = !p.collected && !busy;
+        const q = queue.get(p.defId);
+        const card = h('div', { className: 'a-card' });
+        const el = cardElement(p.defId, e.itemData.get(p.defId));
+        card.append(el ?? h('div', { className: 'a-fallback', textContent: p.rating ? String(p.rating) : '?' }));
+        const price = Number(e.selection[p.defId]) || p.minPrice || 0;
+        const st = q && !p.collected ? rowStatus(q) : q && q.price ? rowStatus(q) : null;
+        const sniping = e.snipeState?.defId === p.defId;
+        const node = h(
+          'div',
+          { className: `a-player${p.collected ? ' is-collected' : ''}${selectable ? ' is-selectable' : ''}${sel ? ' is-selected' : ''}` },
+          p.collected ? h('span', { className: 'a-got', textContent: '✓', title: 'Collecté' }) : h('span', { className: `a-pick${sel ? ' on' : ''}`, textContent: '✓' }),
+          card,
+          h('div', { className: 'a-pname', textContent: p.name, title: p.name }),
+          h('div', { className: 'a-price', textContent: p.collected ? 'Collecté' : price ? `${fmtNum(price)} crédits${e.selection[p.defId] && Number(e.selection[p.defId]) !== p.minPrice ? '' : ' · fut.gg'}` : 'sans prix' }),
+          st ? h('div', { className: `a-pstate ${st[1]}`, textContent: st[0] }) : null,
+          !p.collected
+            ? h('button', {
+                type: 'button',
+                className: `a-pbtn${sniping ? ' busy' : ''}`,
+                textContent: sniping ? 'Snipe en cours…' : '⚡ Quick snipe',
+                title: 'Prix du marché, puis recherches rapides pendant 4 min sous le prix (profit 300+), arrêt au premier achat, mise en vente au prix du marché',
+                disabled: e.running,
+                onclick: (ev) => (ev.stopPropagation(), void e.snipe(p.defId)),
+              })
+            : null,
+        );
+        if (selectable)
+          node.onclick = () => {
+            e.setSelected(p.defId, !e.isSelected(p.defId));
+            this.renderGrid(lists, queue);
+            this.renderActionbar(e.sets[this.setKey]);
+          };
+        return node;
+      });
+      const pager =
+        pages > 1
+          ? h(
+              'div',
+              { className: 'a-pager' },
+              btn('‹', () => ((this.page = Math.max(0, this.page - 1)), this.renderGrid(lists, queue)), 'small', { disabled: this.page === 0 }),
+              h('span', { textContent: `Page ${this.page + 1} sur ${pages}` }),
+              btn('›', () => ((this.page = Math.min(pages - 1, this.page + 1)), this.renderGrid(lists, queue)), 'small', { disabled: this.page >= pages - 1 }),
+            )
+          : null;
+      this.gridWrap.replaceChildren(cards.length ? h('div', { className: 'a-players' }, ...cards) : h('div', { className: 'a-empty', textContent: 'Aucun joueur ici.' }), pager ?? '');
+    }
+
+    selectedOf(set) {
+      const e = this.engine;
+      return e.setPlayers(set).filter((p) => !p.collected && e.isSelected(p.defId));
+    }
+
+    renderActionbar(set) {
+      const e = this.engine;
+      const sel = this.selectedOf(set);
+      const pk = e.picks(sel.map((p) => String(p.defId)));
+      this.actionbar.classList.remove('hidden');
+      this.actionbar.replaceChildren(
+        h('div', { className: 'a-row' }, h('span', { className: 'a-count', textContent: `${sel.length} sélectionné(s)` }), sel.length ? h('span', { className: 'a-block-hint', textContent: `~${fmtNum(pk.spend)} crédits${pk.unpriced.length ? `, ${pk.unpriced.length} sans prix` : ''}` }) : null),
+        h(
+          'div',
+          { className: 'a-row' },
+          btn('Effacer', () => {
+            for (const p of sel) e.setSelected(p.defId, false);
+            this.renderBody();
+          }, 'ghost', { disabled: !sel.length || e.mode === 'buy' }),
+          btn(e.mode === 'buy' ? 'Achats en cours…' : 'Acheter maintenant', () => this.openBuy(set.key), 'primary', { disabled: !sel.length && !(e.mode === 'buy') }),
+        ),
+      );
+    }
+
+    // --- Fenêtre « Acheter des cartes Galerie » (FST) ---
+
+    openBuy(key) {
+      const set = this.engine.sets[key];
+      if (!set) return;
+      this.buyKey = key;
+      const running = this.engine.mode === 'buy' || this.engine.mode === 'check';
+      // Lignes : cartes sélectionnées du set, ou le lot en cours
+      this.buyRows = running || (this.buyRan && this.buyRanKey === key) ? this.engine.queue.map((q) => q.defId) : this.selectedOf(set).map((p) => p.defId);
+      if (!running && !(this.buyRan && this.buyRanKey === key)) this.buyRan = false;
+      this.buyLayer.classList.add('open');
+      this.renderBuy();
+    }
+    closeBuy() {
+      this.buyKey = null;
+      this.buyRan = false;
+      this.buyLayer.classList.remove('open');
+      if (this.isOpen) this.renderBody();
+    }
+
+    async runBuy(ids) {
+      this.buyRan = true;
+      this.buyRanKey = this.buyKey;
+      this.buyRows = ids;
+      await this.engine.validate(ids);
+      this.buyRows = this.engine.queue.map((q) => q.defId);
+      this.renderBuy();
+    }
+
+    renderBuy() {
+      const e = this.engine;
+      const set = e.sets[this.buyKey];
+      if (!set) return this.closeBuy();
+      const cfg = this.config;
+      const running = e.mode === 'buy' || e.mode === 'check';
+      const queue = new Map(e.queue.map((q) => [q.defId, q]));
+      const showRun = running || this.buyRan;
+      const rows = this.buyRows.map((id) => ({ id, p: e.findPlayer(id), q: showRun ? queue.get(id) : null })).filter((r) => r.p);
+      const on = rows.filter((r) => !r.p.collected && e.isSelected(r.id));
+      const pk = e.picks(on.map((r) => String(r.id)));
+      const wallet = coins();
+      const relist = cfg.afterBuy !== 'keep';
+
+      const head = h(
+        'div',
+        { className: 'a-head' },
+        h('div', { className: 'a-text' }, h('div', { className: 'a-eyebrow', textContent: 'Galerie · Achat' }), h('div', { className: 'a-title', textContent: `Acheter des cartes Galerie · ${set.name}` }), h('div', { className: 'a-sub', textContent: running ? 'Achat des cartes sélectionnées au prix du marché, patiente…' : 'Choisis les cartes, la gestion des prix et ce qui se passe après l’achat. Un seul bouton lance tout.' })),
+        h('button', { type: 'button', className: 'a-close', textContent: '×', title: 'Fermer', onclick: () => this.closeBuy(), disabled: running }),
+      );
+
+      // Liste des cartes
+      const listRows = rows.map(({ id, p, q }) => {
+        const inc = !p.collected && e.isSelected(id);
+        const v = Number(e.selection[id]) || 0;
+        let st = q ? rowStatus(q) : null;
+        if (!st) st = p.collected ? ['Déjà dans la Galerie', 'ok'] : v ? [`${fmtNum(v)} crédits${v === p.minPrice ? ' · prix fut.gg' : ''}`, ''] : ['Sans prix · vérifié avant l’achat', 'ac'];
+        const price = h('input', { type: 'number', className: 'a-in a-num', min: '150', step: String(step(v || p.minPrice || 200)), value: v ? String(v) : '', placeholder: 'auto', title: 'Prix de départ (vide = vérifié sur le marché)', disabled: running || p.collected || showRun });
+        price.onclick = (ev) => ev.stopPropagation();
         price.onchange = () => {
           const raw = Math.floor(Number(price.value));
-          const v = raw > 0 ? Math.max(150, Math.floor(raw / step(raw)) * step(raw)) : 0;
-          price.value = v ? String(v) : '';
-          cb.checked = true;
-          e.setSelected(p.defId, true, v);
-          changed();
+          const val = raw > 0 ? Math.max(150, Math.floor(raw / step(raw)) * step(raw)) : 0;
+          e.setSelected(id, true, val);
+          this.renderBuy();
         };
-        row.append(cb, h('span', { className: 'n' }, p.rating ? h('i', { textContent: String(p.rating) }) : null, p.name), price, meta);
-        if (q) {
-          const parts = [STATUS_LABEL[q.status] ?? q.status];
-          if (q.price) parts.push(`à ${fmtNum(q.price)}${q.sell ? `, en vente à ${fmtNum(q.sell)}` : ''}`);
-          else if (isOpen(q) && q.max > q.start) parts.push(`prix relevé à ${fmtNum(q.max)}`);
-          if (isFailed(q) && q.note) parts.push(q.note);
-          row.append(h('span', { className: `st${isDone(q) ? ' ok' : isFailed(q) ? ' ko' : ''}`, textContent: parts.join(' · ') }));
-        }
+        const row = h(
+          'div',
+          { className: `a-brow${inc || q ? '' : ' off'}` },
+          h('span', { className: `a-check${inc || (q && showRun) ? ' on' : ''}`, textContent: '✓' }),
+          h('span', { className: 'a-bn' }, p.rating ? h('i', { textContent: String(p.rating) }) : null, p.name),
+          showRun ? h('span') : price,
+          h('span', { className: `a-bs ${st[1]}`, textContent: st[0] + (q?.note && isFailed(q) && q.status !== 'moved' ? ` · ${q.note}` : '') }),
+        );
+        if (!running && !showRun && !p.collected) row.onclick = () => (e.setSelected(id, !inc), this.renderBuy());
         return row;
       });
-      if (!rows.length) rows.push(h('div', { className: 'empty', textContent: 'Aucun joueur à afficher (tous collectés ou filtrés).' }));
-      return h('div', { className: 'sbody' }, ...rows);
-    }
+      const listHead = h(
+        'div',
+        { className: 'a-row' },
+        h('b', { style: 'color:#fff;font-size:.8rem', textContent: showRun ? `${rows.filter((r) => r.q?.price > 0).length} / ${rows.length} achetée(s)` : `${on.length} / ${rows.length} cartes` }),
+        !running && !showRun ? h('button', { type: 'button', className: 'a-link', textContent: on.length === rows.length ? 'Tout désélectionner' : 'Tout sélectionner', onclick: () => {
+          const all = on.length !== rows.length;
+          for (const r of rows) if (!r.p.collected) e.setSelected(r.id, all);
+          this.renderBuy();
+        } }) : null,
+        h('span', { className: 'a-grow' }),
+        !showRun ? btn(e.mode === 'check' ? 'Vérification…' : 'Vérifier sur la Web App', () => void this.checkRows(on.map((r) => r.id)), 'small', { disabled: e.running || !on.length, title: 'Sonde le marché : prix de départ = 4e annonce la moins chère' }) : null,
+      );
+      const listBlock = h('div', { className: 'a-block' }, listHead, !showRun ? h('div', { className: 'a-block-hint', textContent: 'Touche une ligne pour inclure ou retirer une carte.' }) : null, h('div', { className: 'a-brows' }, ...listRows));
 
-    // Met à jour les en-têtes de sets sans reconstruire les lignes (garde le focus)
-    refreshSetHeads() {
-      const e = this.engine;
-      for (const el of this.setsEl.querySelectorAll('.set')) {
-        const s = e.sets[el.dataset.key];
-        if (!s) continue;
-        const c = this.setCounts(s);
-        const box = el.querySelector('.shead input[type=checkbox]');
-        if (box) {
-          box.checked = c.missing.length > 0 && c.sel.length === c.missing.length;
-          box.indeterminate = c.sel.length > 0 && c.sel.length < c.missing.length;
-        }
-        el.querySelector('.shead .prog')?.replaceChildren(...this.setProgress(s, c));
-      }
-    }
+      // Résumé
+      const tol = tolOf(cfg);
+      const over = wallet !== null && pk.spend > wallet;
+      const summary = h(
+        'div',
+        { className: 'a-block' },
+        h('div', { className: 'a-block-title', textContent: 'Résumé' }),
+        h('div', { className: 'a-kv' }, h('span', { textContent: 'Cartes' }), h('b', { textContent: `${on.length} / ${rows.length}` })),
+        h('div', { className: 'a-kv' }, h('span', { textContent: 'Coût' }), h('b', { textContent: `~${fmtNum(pk.spend)} crédits` })),
+        pk.capSpend > pk.spend ? h('div', { className: 'a-kv' }, h('span', { textContent: '' }), h('span', { className: 'a-block-hint', textContent: `jusqu'à ${fmtNum(pk.capSpend)} avec la hausse (+${tol} paliers)` })) : null,
+        wallet !== null ? h('div', { className: 'a-kv' }, h('span', { textContent: 'Solde' }), h('b', { className: over ? 'warn' : '', textContent: `${fmtNum(wallet)} · ${over ? 'au-delà du solde' : 'dans le solde'}` })) : null,
+        h('div', { className: 'a-kv' }, h('span', { textContent: 'Prix' }), h('b', { textContent: pk.unpriced.length ? `fut.gg, ${pk.unpriced.length} vérifié(s) d’abord` : 'prix fut.gg / vérifiés' })),
+        over ? h('div', { className: 'a-block-hint', textContent: 'Les cartes que le solde ne couvre pas sont sautées.' }) : null,
+      );
 
-    // --- Pied de l'onglet Achats : projection, crédits, bouton principal ---
-
-    buildFooter() {
-      this.progressBar = h('div');
-      this.mainBtn = h('button', { className: 'big go' });
-      this.mainBtn.onclick = () => (this.engine.mode === 'buy' ? this.engine.stop('Achats arrêtés', true) : void this.engine.validate());
-      this.resumeBtn = h('button', { className: 'big', onclick: () => void this.engine.runQueue() });
-      // Pied fixe : seulement l'action principale (le récapitulatif est en haut de l'onglet Achats)
-      return h('footer', {}, this.progressBar, this.mainBtn, this.resumeBtn);
-    }
-
-    // --- Onglet Réglages : vitesse, ralentissement, pauses, quotas ---
-
-    buildSettingsTab() {
-      this.speedEl = h('div', { className: 'speed' });
-      this.renderSpeed();
-      return h('section', { className: 'tab' }, this.speedEl);
-    }
-
-    // Réglages de vitesse : préréglages, délais (s), ralentissement après limite EA ; appliqués immédiatement
-    renderSpeed() {
-      const c = this.config;
-      const keys = Object.keys(SPEED_DEFAULTS);
-      const active = SPEED_PRESETS.find(([, v]) => keys.every((k) => v[k] === c[k]))?.[0];
-      const dec = (n) => String(Math.round(n * 10) / 10).replace('.', ',');
-      const pace = this.engine.guard.pace(c);
-      // scale : 1e3 pour des secondes stockées en ms ; min : valeur plancher
-      const input = (k, stepV, scale = 1, min = 0) => {
-        const i = h('input', { type: 'number', min: String(min), step: String(stepV), value: String(c[k] / scale) });
-        i.onchange = () => {
-          const v = Math.round(Math.max(min, Number(String(i.value).replace(',', '.')) || 0) * scale * 10) / 10;
-          const patch = { [k]: scale > 1 ? Math.round(v) : v };
-          // min ≤ max : la borne modifiée entraîne l'autre
-          if (k === 'minDelayMs' && v > c.maxDelayMs) patch.maxDelayMs = v;
-          if (k === 'maxDelayMs' && v < c.minDelayMs) patch.minDelayMs = v;
-          if (k === 'buyDelayMinMs' && v > c.buyDelayMaxMs) patch.buyDelayMaxMs = v;
-          if (k === 'buyDelayMaxMs' && v < c.buyDelayMinMs) patch.buyDelayMinMs = v;
-          this.setConfig(patch);
-          // Reconstruction différée : retirer le champ encore focalisé pendant son « change » lève une erreur
-          setTimeout(() => this.renderSpeed());
-        };
-        return i;
+      // Écart max
+      const tolInput = h('input', { type: 'number', className: 'a-in a-num', min: '0', max: String(MAX_TOLERANCE), value: String(cfg.tolerance), disabled: cfg.toleranceAuto || running });
+      tolInput.onchange = () => {
+        const v = Math.min(MAX_TOLERANCE, Math.max(0, Math.floor(Number(tolInput.value) || 0)));
+        this.setConfig({ tolerance: v });
+        this.renderBuy();
       };
-      const pair = (a, b, stepS) => h('span', { className: 'pair' }, input(a, stepS, 1e3), '–', input(b, stepS, 1e3), 's');
-      const presets = SPEED_PRESETS.map(([name, v]) =>
-        h('button', { className: `small${name === active ? ' on' : ''}`, textContent: name, onclick: () => (this.setConfig({ ...v }), this.renderSpeed()) }),
+      const seg = h(
+        'div',
+        { className: 'a-seg' },
+        h('button', { type: 'button', className: cfg.toleranceAuto ? 'active' : '', textContent: 'Auto', disabled: running, onclick: () => (this.setConfig({ toleranceAuto: true }), this.renderBuy()) }),
+        h('button', { type: 'button', className: cfg.toleranceAuto ? '' : 'active', textContent: 'Manuel', disabled: running, onclick: () => (this.setConfig({ toleranceAuto: false }), this.renderBuy()) }),
       );
-      const off = c.paceStep <= 1 || c.paceMax <= 1 || c.paceResetMin <= 0;
-      const paceState = off
-        ? 'Ralentissement désactivé : seule la pause après limite EA s’applique.'
-        : pace > 1
-          ? `Rythme actuel ralenti ×${dec(pace)} (délais ${dec((c.minDelayMs * pace) / 1e3)}–${dec((c.maxDelayMs * pace) / 1e3)} s) jusqu’à ${hm(this.engine.guard.paceUntil(c))} sans nouvelle limite.`
-          : 'Rythme normal.';
-      const resetBtn = pace > 1 ? h('button', { className: 'small', textContent: 'Revenir au rythme normal', onclick: () => (this.engine.guard.resetPace(), this.engine.log('Rythme remis à la normale'), this.renderSpeed()) }) : null;
-      const summary = `Vitesse : ${active ?? 'personnalisée'} (${dec(c.minDelayMs / 1e3)}–${dec(c.maxDelayMs / 1e3)} s entre recherches)${pace > 1 ? ` · ralenti ×${dec(pace)}` : ''}`;
-      this.speedLine.textContent = `${summary} ›`;
-      this.speedEl.replaceChildren(
+      const tolBlock = h(
+        'div',
+        { className: 'a-block' },
+        h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: 'Écart max' }), seg, h('span', { className: 'a-row', style: 'gap:.3rem' }, tolInput, h('span', { className: 'a-block-hint', textContent: 'paliers' }))),
+        h('div', { className: 'a-block-hint', textContent: cfg.toleranceAuto ? 'De combien une carte peut coûter plus que son prix connu. Auto : 3 paliers EA (+150 sur une carte à 500, +3 000 sur une carte à 100k).' : `Une carte peut coûter jusqu’à ${cfg.tolerance} palier(s) EA de plus que son prix connu ; plus chère, elle est sautée et reproposée à la fin.` }),
+      );
+
+      // Après achat
+      const markInput = h('input', { type: 'number', className: 'a-in a-num', min: '0', max: '100', value: String(cfg.markupPct), disabled: running });
+      markInput.onclick = (ev) => ev.stopPropagation();
+      markInput.onchange = () => (this.setConfig({ markupPct: Math.min(100, Math.max(0, Number(markInput.value) || 0)) }), this.renderBuy());
+      const desc = {
+        keep: 'Les cartes sont placées dans ton club après l’achat. Coût = prix payé.',
+        relist: 'Chaque carte est remise en vente au prix payé. La taxe EA de 5 % est ce que la carte Galerie te coûte.',
+        markup: 'Chaque carte est remise en vente un peu au-dessus du prix payé, ce qui couvre la plus grande partie de la taxe EA de 5 %. Se vend un peu plus lentement.',
+      };
+      const opts = Object.entries(AFTER_BUY).map(([k, label]) =>
         h(
           'div',
-          { className: 'grid' },
-          h('h4', { textContent: 'Vitesse', style: 'grid-column:1 / -1;margin-top:4px' }),
-          h('span', { textContent: 'Préréglage' }),
-          h('span', { className: 'presets' }, ...presets),
-          h('span', { textContent: 'Délai entre recherches' }),
-          pair('minDelayMs', 'maxDelayMs', 0.5),
-          h('span', { textContent: 'Délai avant achat' }),
-          pair('buyDelayMinMs', 'buyDelayMaxMs', 0.1),
-          h('h4', { textContent: 'Ralentissement après limite EA', style: 'grid-column:1 / -1;margin-top:4px' }),
-          h('span', { textContent: 'Multiplier les délais à chaque limite (1 = jamais)' }),
-          h('span', { className: 'pair' }, '×', input('paceStep', 0.1, 1, 1)),
-          h('span', { textContent: 'Ralentissement maximal' }),
-          h('span', { className: 'pair' }, '×', input('paceMax', 0.5, 1, 1)),
-          h('span', { textContent: 'Retour au rythme normal après (sans limite)' }),
-          h('span', { className: 'pair' }, input('paceResetMin', 5), 'min'),
-          h('h4', { textContent: 'Pauses après refus EA (0 = aucune, reprise immédiate)', style: 'grid-column:1 / -1;margin-top:4px' }),
-          h('span', { textContent: 'Après limite EA 426 / 429 / 512 / 521 (min)' }),
-          h('span', { className: 'pair' }, input('softPauseMin', 1), 'min'),
-          h('span', { textContent: 'Après captcha 458 / 460 / 494 (min)' }),
-          h('span', { className: 'pair' }, input('captchaPauseMin', 5), 'min'),
-          h('h4', { textContent: 'Quotas (0 = illimité, cumulés avec SnipeFC27)', style: 'grid-column:1 / -1;margin-top:4px' }),
-          h('span', { textContent: 'Recherches max par heure' }),
-          h('span', { className: 'pair' }, input('quotaSearchHour', 50)),
-          h('span', { textContent: 'Recherches max par 24 h' }),
-          h('span', { className: 'pair' }, input('quotaSearchDay', 100)),
-          h('span', { textContent: 'Achats max par 24 h' }),
-          h('span', { className: 'pair' }, input('quotaBuyDay', 10)),
+          { className: `a-opt${cfg.afterBuy === k ? ' active' : ''}`, onclick: () => !running && (this.setConfig({ afterBuy: k }), this.renderBuy()) },
+          h('span', { className: 'a-radio' }),
+          h('div', { className: 'a-grow' }, h('div', { className: 'a-row' }, h('b', { textContent: label }), k === 'markup' ? h('span', { className: 'a-row', style: 'gap:.3rem' }, '+', markInput, '%') : null), cfg.afterBuy === k ? h('div', { className: 'a-block-hint', textContent: desc[k] }) : null),
         ),
-        h('div', { className: 'row', style: 'margin-top:6px' }, h('span', { className: 'note grow', textContent: paceState }), resetBtn),
-        h('div', { className: 'note', style: 'margin-top:4px', textContent: 'Plus rapide = plus de risque de limite EA ou de captcha.' }),
       );
-      this.paceShown = pace;
-    }
+      const back = relist ? `Retour après taxe ~${fmtNum(pk.back)} · coût net ${pk.cost < 0 ? `+${fmtNum(-pk.cost)}` : fmtNum(pk.cost)}` : `Coût ${fmtNum(pk.spend)} (cartes gardées)`;
+      const afterBlock = h('div', { className: 'a-block' }, h('div', { className: 'a-block-title', textContent: 'Après achat' }), ...opts, on.length ? h('div', { className: 'a-block-hint', style: 'color:#dfe4ec', textContent: back }) : null);
 
-    renderFooter() {
-      const e = this.engine;
-      const buying = e.mode === 'buy';
-      this.recapEl.replaceChildren(...(buying ? this.progressView() : this.recapView()));
-      const pk = e.picks();
-      this.raiseRow.style.display = buying ? 'none' : '';
-      const checking = e.mode === 'check';
-      this.checkBtn.textContent = checking ? 'Arrêter la vérification' : 'Vérifier les prix';
-      this.checkBtn.title = 'Sonde le marché pour chaque joueur coché : prix de départ = 4e annonce la moins chère (méthode FUT Simple Trader)';
-      this.checkBtn.disabled = (e.running && !checking) || (!checking && !pk.count);
-      this.mainBtn.className = buying ? 'big stop' : 'big go';
-      const q = e.queue;
-      const treated = q.filter((x) => !isOpen(x)).length;
-      this.progressBar.replaceChildren(...(buying ? [bar([['ok', q.filter((x) => x.price > 0).length], ['over', q.filter(isFailed).length]], q.length)] : []));
-      this.mainBtn.textContent = buying
-        ? `Arrêter les achats (${treated}/${q.length})`
-        : pk.count
-          ? `Acheter ${pk.count} joueur${pk.count > 1 ? 's' : ''} · ~${fmtNum(pk.spend)} crédits · ${pk.cost < 0 ? `gain ~${fmtNum(-pk.cost)}` : `coût ~${fmtNum(pk.cost)}`}`
-          : 'Coche des joueurs à acheter';
-      this.mainBtn.disabled = e.mode === 'relist' || e.mode === 'check' || (!buying && !pk.count);
-      const open = e.queue.filter(isOpen).length;
-      this.resumeBtn.style.display = !e.running && open ? '' : 'none';
-      this.resumeBtn.textContent = `Reprendre le lot en cours (${open} restant${open > 1 ? 's' : ''})`;
-    }
-
-    recapView() {
-      const e = this.engine;
-      const pk = e.picks();
-      if (!pk.count) {
-        const last = e.queue.length ? this.lastRunLine() : '';
-        return [h('div', { className: 'note', textContent: last || 'Coche des joueurs pour voir les crédits nécessaires et la perte projetée.' })];
-      }
-      const wallet = coins();
-      const tight = wallet !== null && pk.spend > wallet;
-      const out = [
-        h(
-          'div',
-          { className: 'tiles' },
-          tile('À dépenser', `${fmtNum(pk.spend)}`, pk.capSpend > pk.spend ? `jusqu'à ${fmtNum(pk.capSpend)} avec tolérance` : `${pk.list.length} joueur(s)`, tight ? 'warn' : ''),
-          tile('Récupéré', `${fmtNum(pk.back)}`, this.config.afterBuy === 'keep' ? 'gardés au club' : 'net, à la revente'),
-          tile('Coût réel', pk.cost < 0 ? `+${fmtNum(-pk.cost)}` : `${fmtNum(pk.cost)}`, pk.capCost > pk.cost ? `jusqu'à ${fmtNum(pk.capCost)} avec tolérance` : this.config.afterBuy === 'keep' ? 'prix payé' : 'taxe EA 5 %', pk.cost < 0 ? 'pos' : 'neg'),
-        ),
-      ];
-      if (wallet !== null) {
-        const scale = Math.max(wallet, pk.capSpend);
-        const use = Math.min(pk.spend, wallet);
-        out.push(
-          h(
-            'div',
-            { className: 'wallet' },
-            bar([['use', use], ['cap', Math.max(0, Math.min(pk.capSpend, wallet) - use)], ['over', Math.max(0, pk.capSpend - Math.max(wallet, use))]], scale),
-            h(
-              'div',
-              { className: 'legend' },
-              h('span', {}, h('i', { style: 'background:#4c6ef5' }), `engagé ${fmtNum(pk.spend)}`),
-              h('span', {}, h('i', { style: 'background:#2a3570' }), 'tolérance'),
-              h('span', { textContent: tight ? `manque ${fmtNum(pk.spend - wallet)}` : `reste ${fmtNum(wallet - pk.spend)} / ${fmtNum(wallet)}` }),
-            ),
-          ),
+      // Pied : bouton unique, progression, bilan
+      const foot = h('div', { className: 'a-buyfoot' });
+      if (running) {
+        const q = e.queue;
+        const done = q.filter((x) => !isOpen(x)).length;
+        foot.append(
+          ...[
+          h('div', { className: 'a-kv' }, h('b', { textContent: e.mode === 'check' ? 'Vérification des prix' : 'Achat des cartes' }), h('span', { textContent: e.mode === 'buy' ? `${done} / ${q.length}` : '' })),
+          e.mode === 'buy' ? h('div', { className: 'a-bar' }, h('span', { className: 'ac', style: `width:${q.length ? (done / q.length) * 100 : 0}%` })) : null,
+          btn('Arrêter', () => e.stop(e.mode === 'check' ? 'Vérification arrêtée' : 'Achats arrêtés', true), 'big danger'),
+          ].filter(Boolean),
+        );
+      } else if (this.buyRan) {
+        const q = e.queue;
+        const bought = q.filter((x) => x.price > 0).length;
+        const listed = q.filter((x) => x.status === 'listed').length;
+        const failed = q.filter(isFailed).length;
+        const skipped = q.filter((x) => x.status === 'moved' && x.seen > 0);
+        const open = q.filter(isOpen).length;
+        foot.append(
+          ...[
+          h('div', { className: 'a-cta-sub', style: 'color:#fff;font-size:.82rem', textContent: `Achetés ${bought} · mis en vente ${listed} · échecs ${failed}${skipped.length ? ` · sautés ${skipped.length}` : ''}${open ? ' · arrêté avant la fin' : ''}` }),
+          skipped.length ? btn(`Racheter ${skipped.length} carte(s) sautée(s) au prix vu`, () => void e.retrySkipped(), 'big primary') : null,
+          open ? btn(`Reprendre (${open} restante(s))`, () => void e.runQueue(), 'big primary') : null,
+          btn('Terminé', () => this.closeBuy(), `big${skipped.length || open ? '' : ' primary'}`),
+          ].filter(Boolean),
+        );
+      } else {
+        const n = on.length;
+        const label = pk.unpriced.length ? `Vérifier${relist ? ', acheter & remettre en vente' : ' & acheter'} ${n} carte(s)` : relist ? `Acheter & remettre en vente ${n} carte(s)` : `Acheter ${n} carte(s) · ${fmtNum(pk.spend)}`;
+        foot.append(
+          btn(label, () => void this.runBuy(on.map((r) => r.id)), 'big primary', { disabled: !n || e.running }),
+          h('div', { className: 'a-cta-sub', textContent: pk.unpriced.length ? `les prix manquants sont vérifiés d’abord · ~${fmtNum(pk.spend)} crédits` : `${fmtNum(pk.spend)} crédits en tout` }),
         );
       }
-      const notes = [];
-      if (pk.unpriced.length) notes.push(`${pk.unpriced.length} joueur(s) sans prix : prix trouvé par sondage au lancement (ou « Vérifier les prix »), non compté ci-dessus.`);
-      if (tight) notes.push('Crédits insuffisants pour tout acheter : les derniers joueurs seront sautés (ils restent cochés).');
-      if (notes.length) out.push(h('div', { className: `note${tight ? ' warn' : ''}`, textContent: notes.join(' ') }));
-      return out;
+      const top = this.buyBody?.scrollTop ?? 0;
+      this.buyBody = h('div', { className: 'a-buybody' }, listBlock, showRun ? null : summary, showRun ? null : tolBlock, showRun ? null : afterBlock);
+      this.buyInner.replaceChildren(head, this.buyBody, foot);
+      this.buyBody.scrollTop = top;
     }
 
-    lastRunLine() {
-      const q = this.engine.queue;
-      const got = q.filter((x) => x.price > 0);
-      const fail = q.filter(isFailed).length;
-      return `Dernier lot : ${got.length}/${q.length} achetés, ${fmtNum(got.reduce((s, x) => s + x.price, 0))} dépensés, coût réel ~${fmtNum(got.reduce((s, x) => s + costOf(x), 0))}${fail ? `, ${fail} non acheté(s) (toujours cochés)` : ''}.`;
+    async checkRows(ids) {
+      if (!ids.length) return;
+      await this.engine.checkPrices(false, ids);
+      this.renderBuy();
     }
 
-    progressView() {
-      const q = this.engine.queue;
-      const got = q.filter((x) => x.price > 0);
-      const fail = q.filter(isFailed).length;
-      const open = q.filter(isOpen).length;
-      const spent = got.reduce((s, x) => s + x.price, 0);
-      const planned = q.reduce((s, x) => s + (x.price || x.start || 0), 0);
-      const cur = q.find((x) => x.status === 'searching') ?? q.find(isOpen);
-      const sets = [...new Set(q.map((x) => x.set))];
-      const setLine = cur
-        ? (() => {
-            const inSet = q.filter((x) => x.set === cur.set);
-            return `Set ${sets.indexOf(cur.set) + 1}/${sets.length} « ${cur.set} » : ${inSet.filter((x) => !isOpen(x)).length}/${inSet.length} traités`;
-          })()
-        : '';
-      return [
-        h(
-          'div',
-          { className: 'tiles' },
-          tile('Achetés', `${got.length} / ${q.length}`, `${open} restant(s)${fail ? `, ${fail} non acheté(s)` : ''}`, 'pos'),
-          tile('Dépensé', fmtNum(spent), `prévu ~${fmtNum(planned)}`),
-          tile('Coût réel', fmtNum(got.reduce((s, x) => s + costOf(x), 0)), 'après revente / club', 'neg'),
-        ),
-        bar([['ok', got.length], ['over', fail]], q.length),
-        setLine ? h('div', { className: 'note', style: 'color:#e6e7eb', textContent: setLine }) : null,
-        cur ? h('div', { className: 'note', textContent: `En cours : ${cur.name}${cur.max ? ` ≤ ${fmtNum(cur.max)}${cur.max > cur.start ? ` (relevé, tolérance ${fmtNum(cur.cap)})` : ''}` : ' (sondage)'}` }) : null,
-      ].filter(Boolean);
-    }
-
-    // --- Onglet Ventes ---
+    // --- Ventes ---
 
     buildSalesTab() {
       this.heroEl = h('div', { className: 'hero' });
       this.statsEl = h('div', { className: 'tiles' });
-      this.relistBtn = h('button', { className: 'big go' });
-      this.relistBtn.onclick = () => (this.engine.mode === 'relist' ? this.engine.stop('Relister arrêté', true) : void this.engine.relist());
+      this.relistBtn = btn('', () => (this.engine.mode === 'relist' ? this.engine.stop('Relister arrêté', true) : void this.engine.relist()), 'big primary');
       this.pileEl = h('div', { className: 'hint' });
       this.salesEl = h('div', { className: 'salelist' });
-      const reset = h('button', { className: 'small ghost', textContent: 'Remettre les compteurs à zéro' });
-      reset.onclick = () => confirm('Remettre à zéro dépensé, vendus, perte réalisée et taxe ?') && this.engine.resetTotals();
+      const reset = btn('Remettre les compteurs à zéro', () => confirm('Remettre à zéro dépensé, vendus, perte réalisée et taxe ?') && this.engine.resetTotals(), 'small ghost');
       return h(
-        'section',
-        { className: 'tab' },
+        'div',
+        { className: 'a-sec' },
         this.heroEl,
         this.statsEl,
         this.relistBtn,
-        h('div', { className: 'hint', textContent: "Relister : encaisse les ventes, puis sonde le marché pour chaque invendu acheté par AlbumFC27 et le remet en vente au prix de l'annonce la moins chère trouvée (plus haut ou plus bas qu'avant)." }),
+        h('div', { className: 'hint', textContent: "Relister : encaisse les ventes, puis sonde le marché pour chaque invendu de la liste de transferts et le remet en vente au prix de l'annonce la moins chère vue." }),
         this.pileEl,
         h('h4', { textContent: 'Joueurs achetés encore en vente' }),
         this.salesEl,
-        h('div', { className: 'row' }, h('span', { className: 'grow' }), reset),
+        h('div', { className: 'a-row' }, h('span', { className: 'a-grow' }), reset),
       );
     }
 
@@ -2154,9 +2419,9 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         tile('Dépensé', fmtNum(t.spent), `taxe payée ${fmtNum(t.tax)}${t.kept ? `, ${fmtNum(t.kept)} gardé(s) au club (${fmtNum(t.keptSpent)})` : ''}`),
       );
       const relisting = e.mode === 'relist';
-      this.relistBtn.className = relisting ? 'big stop' : 'big go';
+      this.relistBtn.className = `a-btn big ${relisting ? 'danger' : 'primary'}`;
       this.relistBtn.textContent = relisting ? 'Arrêter' : `Relister les invendus${s.unsold ? ` (${s.unsold})` : ''}`;
-      this.relistBtn.disabled = e.mode === 'buy' || e.mode === 'check';
+      this.relistBtn.disabled = e.running && !relisting;
       const p = e.pile;
       this.pileEl.textContent = p ? `Liste de transferts lue à ${hm(p.at)} : ${p.active} en vente, ${p.unsold} invendu(s), ${p.sold} vente(s) encaissée(s).` : '';
       const sorted = items.sort((a, b) => Number(isUnsold(b)) - Number(isUnsold(a)) || (b.at ?? 0) - (a.at ?? 0));
@@ -2174,33 +2439,11 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
                 h('span', { className: 'm', textContent: loss >= 0 ? `perte ${fmtNum(loss)}` : `gain ${fmtNum(-loss)}` }),
               );
             })
-          : [h('div', { className: 'empty', textContent: 'Aucun joueur acheté en vente.' })]),
+          : [h('div', { className: 'a-empty', textContent: 'Aucun joueur acheté en vente.' })]),
       );
     }
 
-    // --- Bandeau « En direct » et journal ---
-
-    buildLive() {
-      this.liveDot = h('span', { className: 'dot' });
-      this.liveCd = h('span', { className: 'cd' });
-      this.liveList = h('div');
-      const wrap = h('div', { className: `live${load(`${NS}:liveClosed`, false) ? ' closed' : ''}` });
-      const head = h('div', { className: 'lhead', title: 'Afficher / masquer' }, this.liveDot, h('b', { textContent: 'En direct' }), this.liveCd);
-      head.onclick = () => {
-        wrap.classList.toggle('closed');
-        save(`${NS}:liveClosed`, wrap.classList.contains('closed'));
-      };
-      wrap.append(head, h('div', { className: 'lbody' }, this.liveList));
-      return wrap;
-    }
-
-    tick() {
-      const e = this.engine;
-      const left = e.waitUntil - Date.now();
-      const txt = e.running && left > 0 ? `${e.waitLabel || 'Prochaine action'} dans ${fmtWait(left)}` : e.running ? e.activityText || 'En cours…' : '';
-      this.liveCd.textContent = txt;
-      this.activityEl.textContent = e.running ? txt : e.lastMessage;
-    }
+    // --- Journal ---
 
     eventRow(ev) {
       const icons = { buy: '✓', sell: '€', list: '↗', miss: '✗', lock: '⏸', error: '!', warn: '!', info: '•', step: '·' };
@@ -2219,20 +2462,14 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
     renderEvents(full = false) {
       const evs = this.engine.events;
       const newest = evs[0]?.id ?? 0;
-      if (full || newest < this.shownEventId) {
-        this.liveList.replaceChildren(...evs.slice(0, 3).map((ev) => this.eventRow(ev)));
-        this.jList.replaceChildren(...evs.filter((ev) => this.eventMatches(ev)).slice(0, 300).map((ev) => this.eventRow(ev)));
-      } else {
+      if (full || newest < this.shownEventId) this.jList.replaceChildren(...evs.filter((ev) => this.eventMatches(ev)).slice(0, 300).map((ev) => this.eventRow(ev)));
+      else {
         const fresh = evs.filter((ev) => ev.id > this.shownEventId).reverse();
-        if (fresh.length) this.jList.querySelector('.empty')?.remove();
-        for (const ev of fresh) {
-          this.liveList.prepend(this.eventRow(ev));
-          if (this.eventMatches(ev)) this.jList.prepend(this.eventRow(ev));
-        }
-        while (this.liveList.childElementCount > 3) this.liveList.lastChild.remove();
+        if (fresh.length) this.jList.querySelector('.a-empty')?.remove();
+        for (const ev of fresh) if (this.eventMatches(ev)) this.jList.prepend(this.eventRow(ev));
         while (this.jList.childElementCount > 300) this.jList.lastChild.remove();
       }
-      if (!evs.length) this.jList.replaceChildren(h('div', { className: 'empty', textContent: 'Journal vide.' }));
+      if (!evs.length) this.jList.replaceChildren(h('div', { className: 'a-empty', textContent: 'Journal vide.' }));
       this.shownEventId = newest;
     }
 
@@ -2244,87 +2481,115 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         ['trade', 'Achats / ventes'],
         ['issues', 'Problèmes'],
       ].map(([id, label]) => {
-        const b = h('button', { className: `chipbtn${id === 'all' ? ' on' : ''}`, textContent: label });
-        b.onclick = () => {
+        const b = btn(label, () => {
           this.jfilter = id;
-          for (const c of chips) c.classList.toggle('on', c === b);
+          for (const c of chips) c.classList.toggle('primary', c === b);
           this.renderEvents(true);
-        };
+        }, `small${id === 'all' ? ' primary' : ''}`);
         return b;
       });
-      const copy = h('button', { className: 'small', textContent: 'Copier' });
-      copy.onclick = async () => {
+      const copy = btn('Copier', async () => {
         const ok = await copyText(this.engine.events.map((ev) => `${new Date(ev.t).toLocaleString()} [${ev.type}] ${ev.msg}`).join('\n'));
         copy.textContent = ok ? 'Copié' : 'Échec';
         setTimeout(() => (copy.textContent = 'Copier'), 1500);
-      };
-      const clear = h('button', { className: 'small', textContent: 'Effacer', onclick: () => this.engine.clearEvents() });
-      return h('section', { className: 'tab' }, h('div', { className: 'jtools' }, ...chips, h('span', { style: 'flex:1' }), copy, clear), this.jList);
+      }, 'small');
+      const clear = btn('Effacer', () => this.engine.clearEvents(), 'small');
+      return h('div', { className: 'a-sec', style: 'max-width:none' }, h('div', { className: 'jtools' }, ...chips, h('span', { className: 'a-grow' }), copy, clear), this.jList);
     }
 
-    // --- Mise à jour ---
+    // --- Réglages : vitesse, ralentissement, pauses, quotas (appliqués immédiatement) ---
+
+    renderSpeed() {
+      const c = this.config;
+      const keys = Object.keys(SPEED_DEFAULTS);
+      const active = SPEED_PRESETS.find(([, v]) => keys.every((k) => v[k] === c[k]))?.[0];
+      const dec = (n) => String(Math.round(n * 10) / 10).replace('.', ',');
+      const pace = this.engine.guard.pace(c);
+      // scale : 1e3 pour des secondes stockées en ms ; min : valeur plancher
+      const input = (k, stepV, scale = 1, min = 0) => {
+        const i = h('input', { type: 'number', className: 'a-in a-num', min: String(min), step: String(stepV), value: String(c[k] / scale) });
+        i.onchange = () => {
+          const v = Math.round(Math.max(min, Number(String(i.value).replace(',', '.')) || 0) * scale * 10) / 10;
+          const patch = { [k]: scale > 1 ? Math.round(v) : v };
+          // min ≤ max : la borne modifiée entraîne l'autre
+          if (k === 'minDelayMs' && v > c.maxDelayMs) patch.maxDelayMs = v;
+          if (k === 'maxDelayMs' && v < c.minDelayMs) patch.minDelayMs = v;
+          if (k === 'buyDelayMinMs' && v > c.buyDelayMaxMs) patch.buyDelayMaxMs = v;
+          if (k === 'buyDelayMaxMs' && v < c.buyDelayMinMs) patch.buyDelayMinMs = v;
+          this.setConfig(patch);
+          // Reconstruction différée : retirer le champ encore focalisé pendant son « change » lève une erreur
+          setTimeout(() => this.renderSpeed());
+        };
+        return i;
+      };
+      const pair = (a, b, stepS) => h('span', { className: 'pair' }, input(a, stepS, 1e3), '–', input(b, stepS, 1e3), 's');
+      const presets = SPEED_PRESETS.map(([name, v]) => btn(name, () => (this.setConfig({ ...v }), this.renderSpeed()), `small${name === active ? ' on' : ''}`));
+      const off = c.paceStep <= 1 || c.paceMax <= 1 || c.paceResetMin <= 0;
+      const paceState = off
+        ? 'Ralentissement désactivé : seule la pause après limite EA s’applique.'
+        : pace > 1
+          ? `Rythme actuel ralenti ×${dec(pace)} (délais ${dec((c.minDelayMs * pace) / 1e3)}–${dec((c.maxDelayMs * pace) / 1e3)} s) jusqu’à ${hm(this.engine.guard.paceUntil(c))} sans nouvelle limite.`
+          : 'Rythme normal.';
+      const resetBtn = pace > 1 ? btn('Revenir au rythme normal', () => (this.engine.guard.resetPace(), this.engine.log('Rythme remis à la normale'), this.renderSpeed()), 'small') : null;
+      const title = (t) => h('h4', { textContent: t, style: 'grid-column:1 / -1;margin-top:8px' });
+      this.settingsSec.replaceChildren(
+        h(
+          'div',
+          { className: 'speed' },
+          h(
+            'div',
+            { className: 'grid' },
+            title('Vitesse (achats, vérification, relist)'),
+            h('span', { textContent: 'Préréglage' }),
+            h('span', { className: 'presets' }, ...presets),
+            h('span', { textContent: 'Délai entre recherches' }),
+            pair('minDelayMs', 'maxDelayMs', 0.5),
+            h('span', { textContent: 'Délai avant achat' }),
+            pair('buyDelayMinMs', 'buyDelayMaxMs', 0.1),
+            title('Ralentissement après limite EA'),
+            h('span', { textContent: 'Multiplier les délais à chaque limite (1 = jamais)' }),
+            h('span', { className: 'pair' }, '×', input('paceStep', 0.1, 1, 1)),
+            h('span', { textContent: 'Ralentissement maximal' }),
+            h('span', { className: 'pair' }, '×', input('paceMax', 0.5, 1, 1)),
+            h('span', { textContent: 'Retour au rythme normal après (sans limite)' }),
+            h('span', { className: 'pair' }, input('paceResetMin', 5), 'min'),
+            title('Pauses après refus EA (0 = aucune, reprise immédiate)'),
+            h('span', { textContent: 'Après limite EA 426 / 429 / 512 / 521 (min)' }),
+            h('span', { className: 'pair' }, input('softPauseMin', 1), 'min'),
+            h('span', { textContent: 'Après captcha 458 / 460 / 494 (min)' }),
+            h('span', { className: 'pair' }, input('captchaPauseMin', 5), 'min'),
+            title('Quotas (0 = illimité, cumulés avec SnipeFC27)'),
+            h('span', { textContent: 'Recherches max par heure' }),
+            h('span', { className: 'pair' }, input('quotaSearchHour', 50)),
+            h('span', { textContent: 'Recherches max par 24 h' }),
+            h('span', { className: 'pair' }, input('quotaSearchDay', 100)),
+            h('span', { textContent: 'Achats max par 24 h' }),
+            h('span', { className: 'pair' }, input('quotaBuyDay', 10)),
+          ),
+          h('div', { className: 'a-row', style: 'margin-top:8px' }, h('span', { className: 'hint a-grow', textContent: paceState }), resetBtn),
+          h('div', { className: 'hint', textContent: `Quick snipe : vitesse rapide fixe (${SNIPE_DELAY[0] / 1e3}–${SNIPE_DELAY[1] / 1e3} s entre recherches, ralentie après une limite EA), 4 min. Plus rapide = plus de risque de limite EA ou de captcha.` }),
+        ),
+      );
+      this.paceShown = pace;
+    }
+
+    // --- Mise à jour depuis le moteur ---
 
     update(s) {
-      // Les re-rendus ne doivent pas faire sauter la position de défilement
-      const top = this.bodyEl.scrollTop;
-      this.render(s);
-      if (this.bodyEl.scrollTop !== top) this.bodyEl.scrollTop = top;
-    }
-
-    render(s) {
-      const locked = s.lockedUntil > Date.now();
-      this.pill.className = `pill${s.running ? ' on' : locked ? ' lock' : ''}`;
-      this.pill.textContent = s.mode === 'buy' ? 'Achats' : s.mode === 'relist' ? 'Relister' : s.mode === 'check' ? 'Prix' : locked ? 'Pause' : 'Prêt';
-      this.coinsEl.textContent = s.coins == null ? '? crédits' : `${fmtNum(s.coins)} crédits`;
-      if (locked) {
-        const what = s.lockKind === 'soft' ? 'Pause limite EA (trop de requêtes)' : 'Pause anti-captcha';
-        const btn = h('button', { textContent: 'Lever', onclick: () => confirm('Lever la pause ? Seulement si aucun captcha n’est affiché.') && this.engine.unlock() });
-        this.bannerEl.replaceChildren(h('span', { textContent: `${what} jusqu'à ${hm(s.lockedUntil)}${s.resumeAt ? `, reprise automatique vers ${hm(s.resumeAt)}` : ''}` }), btn);
-        document.title = `⏸ ${s.lockKind === 'soft' ? 'Pause limite' : 'Pause captcha'} · ${this.baseTitle}`;
-      } else {
-        this.bannerEl.replaceChildren();
-        if (this.baseTitle && document.title.startsWith('⏸')) document.title = this.baseTitle;
-      }
-      this.salesBadge.textContent = String(s.unsold);
-      if (s.unsold) this.tabBtns.sales.append(this.salesBadge);
-      else this.salesBadge.remove();
-      if (s.pace !== this.paceShown && !this.speedEl.contains(this.speedEl.getRootNode().activeElement)) this.renderSpeed();
       if (s.lastEventId !== this.shownEventId) this.renderEvents();
-      this.live.classList.toggle('on', s.running);
-      this.tick();
-      const sig = `${s.mode}|${s.version}`;
-      if (sig !== this.lastSig) {
+      this.renderLauncher();
+      if (!this.isOpen) return void this.tick();
+      this.renderHead();
+      this.renderStrip();
+      const sig = `${s.mode}|${s.version}|${s.snipe?.phase ?? ''}`;
+      const typing = this.root.contains(document.activeElement) && document.activeElement.tagName === 'INPUT';
+      if (sig !== this.lastSig && !typing) {
         this.lastSig = sig;
-        this.renderSets();
-      } else this.renderFooter();
+        if (this.tab === 'gallery') this.renderBody();
+      }
       if (this.tab === 'sales') this.renderSales(s);
-    }
-
-    // Le panneau tient toujours dans la fenêtre : hauteur max = espace sous son bord haut
-    fit() {
-      const top = Math.min(Math.max(0, this.box.getBoundingClientRect().top), Math.max(0, window.innerHeight - 200));
-      this.box.style.top = `${top}px`;
-      this.box.style.maxHeight = `${Math.max(200, window.innerHeight - top - 12)}px`;
-    }
-
-    draggable(header) {
-      header.onpointerdown = (e) => {
-        if (e.target.tagName === 'BUTTON') return;
-        const r = this.box.getBoundingClientRect();
-        const dx = e.clientX - r.left;
-        const dy = e.clientY - r.top;
-        const move = (ev) => {
-          this.box.style.left = `${Math.max(0, ev.clientX - dx)}px`;
-          this.box.style.top = `${Math.max(0, ev.clientY - dy)}px`;
-          this.fit();
-        };
-        const up = () => {
-          window.removeEventListener('pointermove', move);
-          window.removeEventListener('pointerup', up);
-        };
-        window.addEventListener('pointermove', move);
-        window.addEventListener('pointerup', up);
-      };
+      if (this.tab === 'settings' && s.pace !== this.paceShown && !typing) this.renderSpeed();
+      if (this.buyKey && !(typing && this.buyLayer.contains(document.activeElement))) this.renderBuy();
     }
   }
 
@@ -2351,7 +2616,7 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         postStats(s);
       },
     );
-    panel = new Panel(engine);
+    panel = new Layer(engine);
     const n = engine.setList().length;
     engine.log(`Web App détectée, prêt${n ? ` (${n} set${n > 1 ? 's' : ''})` : ''}`);
     // Statut Galerie relu chez EA au démarrage
@@ -2380,11 +2645,8 @@ button.big { width: 100%; padding: 10px; font-size: 13px; }
         save(K_IMPORT_AT, Number(cmd.data.at));
         const key = engine.importSet(cmd.data);
         if (key) {
-          if (!engine.running) void engine.syncGallery([key]);
-          panel.open.add(key);
-          panel.showTab('buy');
           panel.show();
-          engine.emit();
+          panel.openSet(key);
         }
       }
     };

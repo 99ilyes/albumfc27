@@ -45,7 +45,7 @@ function render(s) {
         ? el('button', { className: 'stop', textContent: 'Arrêter', onclick: () => send({ type: 'stop' }) })
         : el('button', { className: 'start', textContent: `Relister les invendus${s.unsold ? ` (${s.unsold})` : ''}`, onclick: () => send({ type: 'relist' }) }),
     ),
-    el('button', { className: 'ghost', textContent: 'Afficher / masquer le panneau', onclick: () => send({ type: 'toggle-panel' }) }),
+    el('button', { className: 'ghost', textContent: 'Ouvrir / fermer AlbumFC27', onclick: () => send({ type: 'toggle-panel' }) }),
   );
 }
 
