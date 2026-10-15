@@ -27,26 +27,18 @@
     return Math.max(Math.ceil(m / step(m)) * step(m), tickUp(p));
   };
 
-  // Revente du sniper, par rapport à la moins chère du marché
-  const SELL_MODES = {
-    under: { label: '1 palier sous la moins chère', info: 'vente rapide (conseillé)', sell: (m) => priceDown(m) },
-    market: { label: 'Au prix de la moins chère', info: 'vente un peu plus lente', sell: (m) => m },
-    plus5: { label: 'Moins chère +5 %', info: 'vente lente, peut rester invendue', sell: (m) => markupPrice(m, 5) },
-    plus10: { label: 'Moins chère +10 %', info: 'vente très lente, souvent invendue', sell: (m) => markupPrice(m, 10) },
-  };
-  const MIN_GAIN = 150;
-  // Prix du sniper : vente selon le mode choisi, achat max = plus haut prix qui rapporte gainPct % du prix d'achat (taxe EA déduite, 150 min), toujours sous la moins chère
-  function computePrices({ lowestOnMarket, minPrice, sellMode, gainPct }) {
-    const sell = (SELL_MODES[sellMode] ?? SELL_MODES.under).sell(lowestOnMarket);
-    const under = priceDown(lowestOnMarket);
-    const floor = Math.max(minPrice ? nextPrice(minPrice) : 0, 150);
-    const goal = (b) => Math.max(MIN_GAIN, Math.round((b * gainPct) / 100));
-    const base = { status: 'ok', buyPrice: under, sellPrice: sell, targetProfit: goal(under), profit: 0 };
-    if (under < floor) return { ...base, status: 'belowListable' };
-    let buy = under;
-    for (let i = 0; i < 5e3 && buy > floor && profitOf(buy, sell) < goal(buy); i++) buy = priceDown(buy);
+  // Prix du sniper (logique Stevie's Sniper) : vente un palier sous la moins chère, achat baissé palier par palier jusqu'au profit visé (2 % de la moins chère arrondi au palier, 150 min, ou profit min choisi en crédits)
+  function computePrices({ lowestOnMarket, minPrice, minProfit }) {
+    const sell = priceDown(lowestOnMarket);
+    const s = step(lowestOnMarket);
+    const target = minProfit > 0 ? Math.round(minProfit) : Math.max(150, Math.round((lowestOnMarket * 0.02) / s) * s);
+    const floor = minPrice ? nextPrice(minPrice) : 0;
+    const base = { status: 'ok', buyPrice: sell, sellPrice: sell, targetProfit: target, profit: 0 };
+    if (minPrice && sell < floor) return { ...base, status: 'belowListable' };
+    let buy = sell;
+    for (let i = 0; i < 5e3 && buy > Math.max(floor, 150) && profitOf(buy, sell) < target; i++) buy = priceDown(buy);
     const profit = profitOf(buy, sell);
-    return { ...base, status: profit > 0 ? 'ok' : 'noProfit', buyPrice: buy, targetProfit: goal(buy), profit };
+    return { ...base, status: profit > 0 ? 'ok' : 'noProfit', buyPrice: buy, profit };
   }
 
   const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('fr-FR'));
@@ -97,7 +89,7 @@
     }
   }
 
-  Object.assign(X, { step, nextPrice, priceDown, roundUp, net, profitOf, perHour, breakEven, roundPrice, tickUp, tickDown, markupPrice, SELL_MODES, computePrices });
+  Object.assign(X, { step, nextPrice, priceDown, roundUp, net, profitOf, perHour, breakEven, roundPrice, tickUp, tickDown, markupPrice, computePrices });
   Object.assign(X, { fmt, fmtSigned, rand, randInt, sleep, hm, clockIn, fmtMin, fmtClock, fmtWait, errText, errMsg, load, save });
 
   // ---------- Préréglages (moteur SnipeFC27) ----------
@@ -135,8 +127,7 @@
     delayPreset: 'safe',
     mistakePrevention: true,
     recheckEvery: 50,
-    sellMode: 'under',
-    gainPct: 5,
+    minProfit: 0,
     snipeSound: true,
     limitsPreset: 'prudent',
     maxBuysPerSearch: 2,
@@ -166,8 +157,6 @@
       save(K_CONFIG, { ...out, merged: true });
     }
     if (!X.DELAY_PRESETS[out.delayPreset]) out.delayPreset = 'safe';
-    if (!SELL_MODES[out.sellMode]) out.sellMode = 'under';
-    out.gainPct = Math.min(50, Math.max(1, Math.floor(out.gainPct) || 5));
     if (!X.BREAK_PRESETS[out.breakPreset]) out.breakPreset = 'safe';
     return out;
   };

@@ -710,7 +710,7 @@
       if (r.success && !r.data.length) this.lockout('Aucune annonce même sans filtre : marché restreint par EA (soft ban probable)');
     }
     computePrices(lowest, minPrice) {
-      return X.computePrices({ lowestOnMarket: lowest, minPrice, sellMode: this.cfg.sellMode, gainPct: this.cfg.gainPct });
+      return X.computePrices({ lowestOnMarket: lowest, minPrice, minProfit: this.cfg.minProfit });
     }
     async priceFilter(f) {
       const p = await this.priceCheck(f, f.label);
@@ -728,7 +728,8 @@
       f.buyPrice = r.buyPrice;
       f.sellPrice = r.sellPrice;
       this.saveFilters();
-      this.note(`Achat jusqu'à ${fmt(r.buyPrice)}, vente ${fmt(r.sellPrice)}, profit ${fmt(r.profit)}${r.profit < r.targetProfit ? ` (gain visé ${fmt(r.targetProfit)} impossible : minimum EA atteint)` : ''}`);
+      const how = this.cfg.minProfit > 0 ? 'profit min choisi' : '2 % du prix, 150 minimum';
+      this.note(`Achat jusqu'à ${fmt(r.buyPrice)}, vente ${fmt(r.sellPrice)} (${how} : ${fmt(r.targetProfit)}${r.profit < r.targetProfit ? `, profit réduit à ${fmt(r.profit)}` : ''})`);
       return true;
     }
     async settleBids(items, bids) {

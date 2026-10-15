@@ -698,7 +698,7 @@
         ptitle.append(h('span', { className: 'a-block-hint', textContent: 'Automatique' }), toggle(!!f.auto, (v) => this.app.patchTarget(f.id, { auto: v }), snipe));
         const gain = f.buyPrice && f.sellPrice ? profitOf(f.buyPrice, f.sellPrice) : null;
         const line = h('div', { style: 'font-size:.82rem;color:#fff', textContent: f.buyPrice ? `Achat ≤ ${fmt(f.buyPrice)} · Vente ${fmt(f.sellPrice)}${gain === null ? '' : ` · Profit ${fmt(gain)}`}` : 'Prix calculés au lancement' });
-        if (f.auto) this.pricesEl.replaceChildren(ptitle, line, hint(`Revente : ${(X.SELL_MODES[cfg.sellMode] ?? X.SELL_MODES.under).label.toLowerCase()}. Achat max : le plus haut prix qui rapporte ${cfg.gainPct} % du prix d’achat après taxe EA (150 min). Prix revérifiés ${cfg.recheckEvery > 0 ? `toutes les ${cfg.recheckEvery} recherches, ` : ''}toutes les 15 min et après chaque snipe.`));
+        if (f.auto) this.pricesEl.replaceChildren(ptitle, line, hint(`Vente un palier sous la moins chère du marché. Achat baissé palier par palier jusqu’au profit visé (${cfg.minProfit > 0 ? `${fmt(cfg.minProfit)} min` : '2 % du prix, 150 min'}), taxe EA déduite. Prix revérifiés ${cfg.recheckEvery > 0 ? `toutes les ${cfg.recheckEvery} recherches, ` : ''}toutes les 15 min et après chaque snipe.`));
         else {
           const num = (k) => {
             const i = h('input', { type: 'number', className: 'a-in', min: '0', step: '50', value: String(f[k] || ''), disabled: snipe });
@@ -1404,12 +1404,11 @@
         ),
         block(
           'Sniper',
-          row('Prix de revente', 'Par rapport à la carte la moins chère du marché. Plus haut = plus de profit, mais vente plus lente.', select('sellMode', X.SELL_MODES)),
-          row('Gain visé par carte (%)', 'Profit net après taxe EA 5 %, en % du prix d’achat (150 minimum). Plus haut = achats moins chers mais plus rares. 1 à 50.', num('gainPct', 1, 50)),
-          hint(`Exemples (moins chère du marché → achat max / revente / profit) : ${[2e3, 1e4, 5e4].map((m) => {
-            const r = X.computePrices({ lowestOnMarket: m, minPrice: null, sellMode: c.sellMode, gainPct: c.gainPct });
+          row('Profit minimum par carte', '0 = 2 % du prix de la moins chère (arrondi au palier), 150 minimum. Sinon montant fixe en crédits.', num('minProfit')),
+          hint(`Vente un palier sous la moins chère du marché. Exemples (moins chère → achat max / vente / profit) : ${[2e3, 1e4, 5e4].map((m) => {
+            const r = X.computePrices({ lowestOnMarket: m, minPrice: null, minProfit: c.minProfit });
             return `${fmt(m)} → ${fmt(r.buyPrice)} / ${fmt(r.sellPrice)} / +${fmt(r.profit)}`;
-          }).join(' · ')}. Snipes invendus remis en vente 1 palier sous la moins chère, jamais à perte.`),
+          }).join(' · ')}.`),
           row('Achats max par recherche', '1 à 5', num('maxBuysPerSearch', 1, 5)),
           row('Revérifier les prix toutes les N recherches', '0 = jamais (toujours toutes les 15 min et après un snipe)', num('recheckEvery')),
           row('Prévention des erreurs', 'Pas d’achat si la recherche renvoie plus de 15 résultats', toggle(c.mistakePrevention, (v) => set({ mistakePrevention: v }))),
