@@ -1221,6 +1221,7 @@
       this.albumTiles = h('div', { className: 'tiles' });
       this.salesEl = h('div', { className: 'salelist' });
       this.onSaleEl = h('div', { className: 'salelist' });
+      this.refreshBtn = h('button', { type: 'button', className: 'a-link', textContent: '↻ Actualiser', title: 'Relit la liste de transferts chez EA', onclick: () => this.app.refreshPile() });
       const resetS = h('button', { type: 'button', className: 'a-link', textContent: 'Réinitialiser', onclick: () => confirm('Remettre à zéro le suivi du sniper ?') && this.sniper.resetSession() });
       const resetA = h('button', { type: 'button', className: 'a-link', textContent: 'Réinitialiser', onclick: () => confirm('Remettre à zéro dépensé, vendus, perte réalisée et taxe de la Galerie ?') && this.album.resetTotals() });
       const title = (t, extra) => h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: t }), extra);
@@ -1231,7 +1232,7 @@
         h('div', { className: 'a-block' }, title('Sniper', resetS), this.snipeTiles),
         h('div', { className: 'a-block' }, title('Galerie (achat direct)', resetA), this.albumHero, this.albumTiles),
         block('Dernières ventes', this.salesEl),
-        block('Cartes Galerie en vente', this.onSaleEl),
+        h('div', { className: 'a-block' }, title('Cartes Galerie en vente', this.refreshBtn), hint('Cartes achetées en direct pour la Galerie, recalées sur la liste de transferts à chaque lecture.'), this.onSaleEl),
       );
     }
     renderSales() {
@@ -1244,6 +1245,7 @@
       this.relistBtn.textContent = relisting ? 'Arrêter' : `Relister les invendus${unsold ? ` (${unsold} Galerie)` : ''}`;
       this.relistBtn.disabled = (s.running && !relisting) || a.running;
       this.relistBtn.title = s.running && !relisting ? 'Arrête d’abord le sniper (les invendus du sniper sont remis en vente seuls pendant ses pauses)' : '';
+      this.refreshBtn.disabled = a.running || relisting;
       const p = a.pile;
       this.pileEl.textContent = p ? `Lue à ${hm(p.at)} : ${p.active} en vente, ${p.unsold} invendu(s), ${p.sold} vente(s) encaissée(s).` : '';
       // Sniper

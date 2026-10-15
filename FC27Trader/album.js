@@ -399,6 +399,40 @@
       this.touch();
       return { name: b.name || i.name, buy: b.price, profit: n - b.price };
     }
+    // Liste de transferts complète lue : cartes absentes (vendues, retirées, déplacées hors extension) plus suivies
+    reconcile(items) {
+      const byId = new Map(items.map((i) => [String(i.id), i]));
+      let gone = 0;
+      for (const [id, b] of Object.entries(this.bought)) {
+        const i = byId.get(id);
+        if (!i) {
+          delete this.bought[id];
+          gone++;
+        } else if (i.state !== 'sold') {
+          b.state = i.state;
+          if (i.buyNow > 0) b.sell = i.buyNow;
+        }
+      }
+      this.saveBought();
+      if (gone) {
+        this.touch();
+        this.log(`${gone} carte(s) Galerie absente(s) de la liste de transferts : retirée(s) du suivi`);
+      }
+      return gone;
+    }
+    // Relecture de la liste de transferts hors tâche (ouverture, bouton Actualiser)
+    async refreshPile() {
+      const r = await X.readTradePile();
+      if (!r.success) return this.log(`Lecture de la liste de transferts impossible (statut ${r.status})${errText(r.error)}`, 'error');
+      if (!r.fresh && !r.data.length) return this.log('Liste de transferts non lue par la Web App : ouvre Transferts > Liste de transferts puis « Actualiser »', 'warn');
+      this.ctx.onSold(r.data.filter((i) => i.state === 'sold'));
+      const rest = r.data.filter((i) => i.state !== 'sold');
+      this.reconcile(rest);
+      this.pile = { at: Date.now(), active: rest.filter((i) => i.state === 'active').length, unsold: rest.filter((i) => i.state !== 'active').length, sold: r.data.length - rest.length };
+      save(K_PILE, this.pile);
+      this.touch();
+      this.emit();
+    }
     onListed(id, price) {
       const b = this.bought[id];
       if (!b) return;
@@ -928,16 +962,7 @@
         if (!c.success) this.log(`Encaissement des ventes échoué (statut ${c.status})${errText(c.error)}`, 'error');
       }
       const rest = pile.data.filter((i) => i.state !== 'sold');
-      const byId = new Map(rest.map((i) => [String(i.id), i]));
-      for (const [id, b] of Object.entries(this.bought)) {
-        const i = byId.get(id);
-        if (!i) delete this.bought[id];
-        else {
-          b.state = i.state;
-          if (i.buyNow > 0) b.sell = i.buyNow;
-        }
-      }
-      this.saveBought();
+      this.reconcile(rest);
       this.pileCount = rest.length;
       this.pile = { at: Date.now(), active: rest.filter((i) => i.state === 'active').length, unsold: rest.filter((i) => i.state !== 'active').length, sold: sold.length };
       save(K_PILE, this.pile);

@@ -173,6 +173,14 @@
       afterTask: () => app.resume(),
       onSold: (items) => sniper.recordSales(items),
     });
+    // Chaque lecture réseau de la liste de transferts (sniper, Galerie ou Web App) recale le suivi des cartes Galerie
+    X.onPile((auctions) =>
+      album.reconcile(auctions.map((a) => ({ id: Number(a.itemData?.id), state: X.tradeState(String(a.tradeState ?? ''), Number(a.currentBid ?? 0)), buyNow: Number(a.buyNowPrice ?? 0) }))),
+    );
+    app.refreshPile = () => {
+      if (album.running || sniper.task === 'relist') return;
+      void album.refreshPile();
+    };
     app.sniper = sniper;
     app.album = album;
     ui = new X.UI(app);
@@ -182,6 +190,8 @@
     album.log(`${X.APP} prêt${n ? ` (${n} set${n > 1 ? 's' : ''} Galerie)` : ''}`);
     if (n) setTimeout(() => !album.running && void album.syncGallery(), 5e3);
     if (app.cfg.autoCatalog) album.requestCatalog(false);
+    // Suivi des cartes Galerie recalé sur la vraie liste de transferts au démarrage
+    if (Object.keys(album.bought).length) setTimeout(() => !album.running && !sniper.running && app.refreshPile(), 8e3);
 
     // Reprises : achats Galerie interrompus (rechargement, pause), puis sniper
     const { K_RESUME, K_ACTIVE, K_LOCK_RESUME } = X.ALBUM_KEYS;
