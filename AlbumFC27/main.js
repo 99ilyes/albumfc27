@@ -724,6 +724,21 @@
         spend: sum((x) => x.start),
         capSpend: sum((x) => x.cap),
         back: sum((x) => back(x.start)),
+        // Taxe EA de 5 % prélevée à la revente (aucune si gardé au club)
+        tax: cfg.afterBuy === 'keep' ? 0 : sum((x) => sellFor(x.start, cfg) - back(x.start)),
+        // Cartes couvertes par le solde, dans l'ordre d'achat (sans compter les crédits des reventes)
+        fit: (() => {
+          const w = coins();
+          if (w === null) return list.length;
+          let left = w;
+          let n = 0;
+          for (const x of list) {
+            if (x.start > left) break;
+            left -= x.start;
+            n++;
+          }
+          return n;
+        })(),
         cost: sum((x) => x.start - back(x.start)),
         capCost: sum((x) => x.cap - back(x.cap)),
       };
@@ -1204,6 +1219,29 @@
       return c === null || c >= price || (await refreshCoins()) >= price;
     }
 
+    // Crédits insuffisants : encaisse les ventes de la liste de transferts toutes les 2 min jusqu'à couvrir need.
+    // false si plus rien n'est en vente (rien ne rentrera) ou si arrêt demandé.
+    async waitCredits(need, name) {
+      while (!this.stopRequested) {
+        const rest = await this.syncPile();
+        if (!rest) return false;
+        const c = coins();
+        if (c === null || c >= need) return true;
+        const active = rest.filter((i) => i.state === 'active');
+        if (!active.length) {
+          const unsold = rest.filter((i) => i.state !== 'active').length;
+          this.log(`Crédits insuffisants pour ${name} (${fmtNum(c)} / ${fmtNum(need)}) et aucune carte en vente${unsold ? ` (${unsold} invendu(s) : « Relister » dans l'onglet Ventes)` : ''}`, 'warn');
+          return false;
+        }
+        const pending = active.reduce((t, i) => t + netOf(i.buyNow || 0), 0);
+        this.log(`Crédits insuffisants pour ${name} (${fmtNum(c)} / ${fmtNum(need)}) : attente des ventes (${active.length} en vente, ~${fmtNum(pending)} nets attendus), nouvel essai dans 2 min`, 'warn');
+        this.waitingCredits = { need, name };
+        await this.sleep(12e4, `Attente des ventes pour ${name}`);
+        this.waitingCredits = null;
+      }
+      return false;
+    }
+
     async buyOne(e) {
       if (!e.start) {
         // Sans prix de départ : prix de référence trouvé par sondage
@@ -1222,7 +1260,7 @@
       }
       let fails = 0;
       let minBuy = 0;
-      for (let n = 0; n < BUY_SEARCHES; n++) {
+      search: for (let n = 0; n < BUY_SEARCHES; n++) {
         if (this.stopRequested) return;
         if (n) await this.sleep(this.delay(), `Nouvelle recherche pour ${e.name}`);
         if (this.stopRequested) return;
@@ -1232,7 +1270,7 @@
           e.seen = seen;
           return this.giveUp(e, 'moved', `prix au-delà de la tolérance (${fmtNum(e.cap)})${seen ? `, annonce la moins chère ${fmtNum(seen)}` : ''} : modifier le prix pour réessayer`);
         }
-        if (!(await this.affordable(150))) return this.giveUp(e, 'nocoins', `crédits insuffisants (${fmtNum(coins())})`);
+        if (!(await this.affordable(150)) && !(await this.waitCredits(150, e.name))) return this.stopRequested ? undefined : this.giveUp(e, 'nocoins', `crédits insuffisants (${fmtNum(coins())})`);
         e.status = 'searching';
         this.activity(`${e.name} : recherche ≤ ${fmtNum(e.max)}${e.max > e.start ? ` (relevé, tolérance ${fmtNum(e.cap)})` : ''}`);
         const r = await this.search(e.defId, { minBuy, maxBuy: e.max });
@@ -1251,7 +1289,14 @@
           continue;
         }
         for (const it of cands) {
-          if (!(await this.affordable(it.buyNow))) return this.giveUp(e, 'nocoins', `crédits insuffisants pour ${fmtNum(it.buyNow)} (${fmtNum(coins())} disponibles)`);
+          if (!(await this.affordable(it.buyNow))) {
+            // Solde insuffisant : attente des ventes, puis nouvelle recherche (l'annonce a pu partir), non décomptée
+            if (await this.waitCredits(it.buyNow, e.name)) {
+              n--;
+              continue search;
+            }
+            return this.stopRequested ? undefined : this.giveUp(e, 'nocoins', `crédits insuffisants pour ${fmtNum(it.buyNow)} (${fmtNum(coins())} disponibles)`);
+          }
           const res = await this.buyAndList(it, e);
           if (res === 'stop' || res === 'ok') return;
           fails++;
@@ -1600,6 +1645,10 @@
 #afc-root .a-actionbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; flex-shrink: 0; padding: .75rem 1.5rem; border-top: 1px solid var(--line); background: rgba(16,21,29,.85); }
 #afc-root .a-actionbar.hidden { display: none; }
 #afc-root .a-count { font-weight: 700; color: #fff; }
+#afc-root .a-proj { display: flex; flex-wrap: wrap; gap: .2rem .9rem; font-size: .75rem; color: var(--dim); }
+#afc-root .a-proj b { color: #fff; font-variant-numeric: tabular-nums; }
+#afc-root .a-proj b.neg { color: var(--ko); } #afc-root .a-proj b.pos { color: var(--ok); }
+#afc-root .a-proj .warn { color: var(--warn); font-weight: 600; } #afc-root .a-proj .dim { color: #6f7889; }
 #afc-root .a-btn { display: inline-flex; align-items: center; gap: .3rem; padding: .4rem .8rem; border: 1px solid rgba(255,255,255,.18); border-radius: .5rem; background: transparent;
   color: #fff; font: 600 .75rem Roboto, Arial, sans-serif; cursor: pointer; transition: background .18s, border-color .18s; white-space: nowrap; }
 #afc-root .a-btn:hover:not(:disabled) { border-color: rgba(255,255,255,.4); }
@@ -2174,8 +2223,22 @@
       const sel = this.selectedOf(set);
       const pk = e.picks(sel.map((p) => String(p.defId)));
       this.actionbar.classList.remove('hidden');
+      const keep = this.config.afterBuy === 'keep';
+      const proj = sel.length
+        ? h(
+            'div',
+            { className: 'a-proj' },
+            h('span', {}, 'Achat ', h('b', { textContent: `~${fmtNum(pk.spend)}` })),
+            keep ? null : h('span', {}, 'Revente nette ', h('b', { textContent: `~${fmtNum(pk.back)}` })),
+            keep ? null : h('span', {}, 'Taxe EA 5 % ', h('b', { className: 'neg', textContent: `~${fmtNum(pk.tax)}` })),
+            h('span', {}, `Coût réel${keep ? ' (gardées au club)' : ''} `, h('b', { className: pk.cost > 0 ? 'neg' : 'pos', textContent: pk.cost < 0 ? `+${fmtNum(-pk.cost)}` : `~${fmtNum(pk.cost)}` })),
+            pk.capCost > pk.cost ? h('span', { className: 'dim', textContent: `jusqu'à ${fmtNum(pk.capCost)} avec l'écart max` }) : null,
+            pk.unpriced.length ? h('span', { className: 'dim', textContent: `+ ${pk.unpriced.length} sans prix (vérifié(s) avant l'achat)` }) : null,
+            pk.fit < pk.list.length ? h('span', { className: 'warn', textContent: `Solde : ${pk.fit} / ${pk.list.length} carte(s) couverte(s)` }) : null,
+          )
+        : null;
       this.actionbar.replaceChildren(
-        h('div', { className: 'a-row' }, h('span', { className: 'a-count', textContent: `${sel.length} sélectionné(s)` }), sel.length ? h('span', { className: 'a-block-hint', textContent: `~${fmtNum(pk.spend)} crédits${pk.unpriced.length ? `, ${pk.unpriced.length} sans prix` : ''}` }) : null),
+        h('div', { className: 'a-row a-grow' }, h('span', { className: 'a-count', textContent: `${sel.length} sélectionné(s)` }), proj),
         h(
           'div',
           { className: 'a-row' },
@@ -2287,9 +2350,13 @@
         h('div', { className: 'a-kv' }, h('span', { textContent: 'Cartes' }), h('b', { textContent: `${on.length} / ${rows.length}` })),
         h('div', { className: 'a-kv' }, h('span', { textContent: 'Coût' }), h('b', { textContent: `~${fmtNum(pk.spend)} crédits` })),
         pk.capSpend > pk.spend ? h('div', { className: 'a-kv' }, h('span', { textContent: '' }), h('span', { className: 'a-block-hint', textContent: `jusqu'à ${fmtNum(pk.capSpend)} avec la hausse (+${tol} paliers)` })) : null,
-        wallet !== null ? h('div', { className: 'a-kv' }, h('span', { textContent: 'Solde' }), h('b', { className: over ? 'warn' : '', textContent: `${fmtNum(wallet)} · ${over ? 'au-delà du solde' : 'dans le solde'}` })) : null,
+        relist ? h('div', { className: 'a-kv' }, h('span', { textContent: 'Revente nette' }), h('b', { textContent: `~${fmtNum(pk.back)} crédits` })) : null,
+        relist ? h('div', { className: 'a-kv' }, h('span', { textContent: 'Taxe EA (5 %)' }), h('b', { style: 'color:var(--ko)', textContent: `~${fmtNum(pk.tax)} crédits` })) : null,
+        h('div', { className: 'a-kv' }, h('span', { textContent: relist ? 'Coût réel' : 'Coût réel (gardées au club)' }), h('b', { style: `color:var(${pk.cost > 0 ? '--ko' : '--ok'})`, textContent: pk.cost < 0 ? `+${fmtNum(-pk.cost)} crédits` : `~${fmtNum(pk.cost)} crédits` })),
+        pk.capCost > pk.cost ? h('div', { className: 'a-kv' }, h('span', { textContent: '' }), h('span', { className: 'a-block-hint', textContent: `coût réel jusqu'à ${fmtNum(pk.capCost)} avec l'écart max` })) : null,
+        wallet !== null ? h('div', { className: 'a-kv' }, h('span', { textContent: 'Solde' }), h('b', { className: over ? 'warn' : '', textContent: `${fmtNum(wallet)} · ${over ? `couvre ${pk.fit} / ${pk.list.length} carte(s)` : 'dans le solde'}` })) : null,
         h('div', { className: 'a-kv' }, h('span', { textContent: 'Prix' }), h('b', { textContent: pk.unpriced.length ? `fut.gg, ${pk.unpriced.length} vérifié(s) d’abord` : 'prix fut.gg / vérifiés' })),
-        over ? h('div', { className: 'a-block-hint', textContent: 'Les cartes que le solde ne couvre pas sont sautées.' }) : null,
+        over ? h('div', { className: 'a-block-hint', textContent: 'Achats un par un dans l’ordre de la liste (du moins cher au plus cher). Quand le solde ne couvre plus une carte, le lot attend les ventes de la liste de transferts (relecture toutes les 2 min) puis reprend. Sans carte en vente (ou « Garder au club »), la carte est sautée et reste sélectionnée.' }) : null,
       );
 
       // Écart max
