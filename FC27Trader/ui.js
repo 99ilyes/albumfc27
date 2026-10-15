@@ -706,7 +706,7 @@
       this.sRotate.replaceChildren(
         setting(
           'Alterner les cibles',
-          list.length > 1 ? 'Change de cible toutes les 450 à 900 recherches' : 'Ajoute au moins 2 cibles pour alterner',
+          list.length > 1 ? `Change de cible toutes les ${X.rotateText(cfg)} recherches` : 'Ajoute au moins 2 cibles pour alterner',
           toggle(cfg.rotate, (v) => this.app.setConfig({ rotate: v })),
         ),
       );
@@ -1323,7 +1323,7 @@
       const f = this.jfilter;
       if (f === 'all') return true;
       if (f === 'main') return ev.type !== 'step';
-      if (f === 'trade') return ev.type === 'buy' || ev.type === 'sell' || ev.type === 'list';
+      if (f === 'trade') return ev.type === 'buy' || ev.type === 'sell' || ev.type === 'list' || ev.type === 'miss';
       return ev.type === 'miss' || ev.type === 'error' || ev.type === 'warn' || ev.type === 'lock';
     }
     renderEvents(full = false) {
@@ -1392,6 +1392,7 @@
           'Sniper',
           row('Profit minimum par carte', '0 = 2 % du prix, 150 minimum', num('minProfit')),
           row('Achats max par recherche', '1 à 5', num('maxBuysPerSearch', 1, 5)),
+          row('Recherches avant de changer de cible', '0 = aléatoire entre 450 et 900 (avec « Alterner les cibles »)', num('rotateEvery')),
           row('Revérifier les prix toutes les N recherches', '0 = jamais (toujours toutes les 15 min et après un snipe)', num('recheckEvery')),
           row('Prévention des erreurs', 'Pas d’achat si la recherche renvoie plus de 15 résultats', toggle(c.mistakePrevention, (v) => set({ mistakePrevention: v }))),
           row('Son à chaque snipe', '', toggle(c.snipeSound, (v) => (set({ snipeSound: v }), v && X.beep()))),
@@ -1418,7 +1419,7 @@
       this.renderStrip();
       const a = this.album;
       const s = this.sniper;
-      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${this.cfg.snipeFilters}|${this.cfg.rotate}`;
+      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${this.cfg.activeFilter}|${this.cfg.snipeFilters}|${this.cfg.rotate}|${this.cfg.rotateEvery}`;
       if (sig !== this.lastSig && !this.typing()) {
         this.lastSig = sig;
         if (this.tab === 'gallery' || this.tab === 'snipe') this.renderBody();

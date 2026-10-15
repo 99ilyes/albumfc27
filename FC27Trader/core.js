@@ -127,6 +127,7 @@
     snipeSound: true,
     limitsPreset: 'prudent',
     maxBuysPerSearch: 2,
+    rotateEvery: 0,
     tolerance: 3,
     toleranceAuto: true,
     afterBuy: 'relist',
@@ -156,6 +157,7 @@
     if (!X.BREAK_PRESETS[out.breakPreset]) out.breakPreset = 'safe';
     return out;
   };
+  X.rotateText = (cfg) => (cfg.rotateEvery > 0 ? fmt(Math.floor(cfg.rotateEvery)) : '450 à 900');
   X.saveConfig = (cfg) => save(K_CONFIG, { ...cfg, merged: true });
   X.parseFilters = (json) => {
     try {

@@ -209,7 +209,7 @@
       this.pricedAt = 0;
       this.tooManyNoted = false;
       this.note(`Sniper : démarrage${this.cfg.rotate ? ', alternance des cibles' : ''}`);
-      if (this.cfg.rotate && this.filters.length < 2) this.note('Une seule cible : en ajouter une 2e pour alterner toutes les 450 à 900 recherches');
+      if (this.cfg.rotate && this.filters.length < 2) this.note(`Une seule cible : en ajouter une 2e pour alterner toutes les ${X.rotateText(this.cfg)} recherches`);
       let retries = 0;
       let lastErr = 0;
       try {
@@ -454,11 +454,16 @@
       this.resumeClock();
     }
 
+    rotateSpan() {
+      const n = Math.floor(this.cfg.rotateEvery);
+      return n > 0 ? n : randInt(...ROTATE);
+    }
     async loop() {
       if (!(await this.prepareFilter())) return;
       let key = this.breakKey();
       await this.restoreBreakClock(key);
-      this.rotateAt = this.run.searches + randInt(...ROTATE);
+      this.rotateAt = this.run.searches + this.rotateSpan();
+      let rotateEvery = this.cfg.rotateEvery;
       let win = { n: 0, start: Date.now() };
       let sinceCheck = 0;
       let errors = 0;
@@ -498,16 +503,21 @@
           this.albumDone = false;
           if (!this.dropFilter(this.idx, 'carte obtenue pour la Galerie')) return;
           if (!(await this.prepareFilter())) return;
-          this.rotateAt = this.run.searches + randInt(...ROTATE);
+          this.rotateAt = this.run.searches + this.rotateSpan();
           sinceCheck = 0;
           win = { n: 0, start: Date.now() };
+        }
+        // Réglage modifié en cours de route : nouveau compte à rebours
+        if (cfg.rotateEvery !== rotateEvery) {
+          rotateEvery = cfg.rotateEvery;
+          this.rotateAt = this.run.searches + this.rotateSpan();
         }
         if (cfg.rotate && this.filters.length > 1 && this.run.searches >= this.rotateAt) {
           this.idx = (this.idx + 1) % this.filters.length;
           this.saveFilters();
           this.note(`Changement de cible : ${this.filter.label}`);
           if (!(await this.prepareFilter())) return;
-          this.rotateAt = this.run.searches + randInt(...ROTATE);
+          this.rotateAt = this.run.searches + this.rotateSpan();
           sinceCheck = 0;
           win = { n: 0, start: Date.now() };
         }
@@ -749,17 +759,22 @@
             this.snipes[id] = { defId, label: name, price: it.buyNow, at: Date.now() };
             save(K_SNIPES, this.snipes);
           }
+          this.searchNote(`→ snipé ${name} à ${fmt(it.buyNow)}`);
           this.note(`Snipé ${name} à ${fmt(it.buyNow)} ! (${ageText(it.expires)}, réponse en ${ms} ms)`, 'snipe');
           if (this.cfg.snipeSound) X.beep();
           if (defId && this.hooks.onSnipe(defId) && this.filter.album && this.filter.defId === defId) this.albumDone = true;
           won.push(it);
-        } else if (res.status === 401 || X.BAD_STATUS.has(res.status)) fatal ??= res.status;
-        else if (X.MISS_STATUS.has(res.status)) {
+        } else if (res.status === 401 || X.BAD_STATUS.has(res.status)) {
+          fatal ??= res.status;
+          this.searchNote(`→ achat ${name} refusé (statut ${res.status})`);
+        } else if (X.MISS_STATUS.has(res.status)) {
           this.run.misses++;
           this.session.misses++;
+          this.searchNote(`→ raté ${name} à ${fmt(it.buyNow)} (statut ${res.status})`);
           this.note(`Raté de peu : ${name} à ${fmt(it.buyNow)} (${ageText(it.expires)}, réponse en ${ms} ms)`, 'miss');
         } else {
           this.seen.delete(it.tradeId);
+          this.searchNote(`→ achat ${name} échoué (statut ${res.status})`);
           if (res.status === 470) this.note(`Crédits insuffisants pour ${name} à ${fmt(it.buyNow)}`, 'error');
           else if (res.status === -2) this.note(`Achat de ${name} sans réponse : vérifier les non-assignés`, 'error');
           else this.note(`Erreur ${res.status} à l'achat de ${name}`, 'error');
