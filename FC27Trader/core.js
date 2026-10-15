@@ -119,6 +119,7 @@
     activeFilter: 0,
     sellAfterSnipe: true,
     rotate: false,
+    rotateEvery: 1,
     breakPreset: 'safe',
     delayPreset: 'safe',
     mistakePrevention: true,
@@ -318,16 +319,83 @@
       defId,
       minPrice: lim && Number(lim.minimum) > 0 ? Number(lim.minimum) : null,
       collected: X.netItems.get(defId)?.collected === true,
+      card: X.cardOf(i),
     };
   };
+  // Club, ligue, nation, rareté et niveau d'une carte (regroupement des cibles du sniper)
+  const num = (v) => (v === undefined || v === null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+  X.cardOf = (i) => {
+    const r = num(i?.rating ?? i?._rating);
+    return {
+      club: num(i?.teamId ?? i?._teamId),
+      league: num(i?.leagueId ?? i?._leagueId),
+      nation: num(i?.nationId ?? i?._nationId),
+      rarity: num(i?.rareflag ?? i?._rareflag),
+      level: r === null || r <= 0 ? null : r >= 75 ? 'gold' : r >= 65 ? 'silver' : 'bronze',
+    };
+  };
+  // Groupe de cibles du sniper : joueurs aux prix scannés, critères communs (club, ligue, nation, rareté spéciale) et
+  // prix compatibles (achat le plus haut sous l'annonce la moins chère de chacun, sinon leurs annonces normales rempliraient la page)
+  X.GROUP_MAX = 6;
+  X.isGroup = (f) => f?.kind === 'group';
+  X.groupable = (f) => !!(f && !X.isGroup(f) && f.auto && f.defId && !f.criteria);
+  X.groupCheck = (members) => {
+    if (members.length < 2) return { ok: false, reason: 'Coche au moins 2 joueurs' };
+    if (members.length > X.GROUP_MAX) return { ok: false, reason: `${X.GROUP_MAX} joueurs max par groupe` };
+    const fixed = members.filter((m) => !X.groupable(m));
+    if (fixed.length) return { ok: false, reason: `${fixed.map((m) => m.label).join(', ')} : prix fixés ou filtre de la Web App, impossible à grouper` };
+    const todo = members.filter((m) => !m.buyPrice || !m.lowest || !m.card);
+    if (todo.length) return { ok: false, reason: `Prix à scanner : ${todo.map((m) => m.label).join(', ')}` };
+    const crit = {};
+    for (const k of ['club', 'league', 'nation', 'rarity', 'level']) {
+      const v = members[0].card[k];
+      crit[k] = v !== null && v !== undefined && (k === 'level' || v > 0) && members.every((m) => m.card[k] === v) ? v : null;
+    }
+    if (!crit.club && !crit.league && !crit.nation && !(crit.rarity >= 2)) {
+      const none = members.every((m) => !m.card.club && !m.card.league && !m.card.nation);
+      return { ok: false, reason: none ? 'Club, ligue et nation introuvables dans la Web App' : 'Aucun club, ligue, nation ou rareté spéciale en commun' };
+    }
+    const top = members.reduce((a, m) => (m.buyPrice > a.buyPrice ? m : a));
+    const low = members.reduce((a, m) => (m.lowest < a.lowest ? m : a));
+    if (top.buyPrice >= low.lowest)
+      return { ok: false, reason: `Prix incompatibles : achat jusqu'à ${fmt(top.buyPrice)} (${top.label}) au-dessus de l'annonce la moins chère de ${low.label} (${fmt(low.lowest)})` };
+    const same = [crit.club && 'club', crit.league && 'ligue', crit.nation && 'nation', crit.rarity && 'rareté'].filter(Boolean);
+    return { ok: true, crit, top: top.buyPrice, low: Math.min(...members.map((m) => m.buyPrice)), text: `même ${same.join(', ')}` };
+  };
+  // Joueurs retirés : enlevés de leurs groupes, groupes de moins de 2 joueurs supprimés ; renvoie les groupes supprimés
+  X.pruneGroups = (list) => {
+    const ids = new Set(list.filter((f) => !X.isGroup(f)).map((f) => f.id));
+    const gone = [];
+    for (let n = list.length - 1; n >= 0; n--) {
+      const g = list[n];
+      if (!X.isGroup(g)) continue;
+      g.members = g.members.filter((id) => ids.has(id));
+      if (g.members.length < 2) gone.push(...list.splice(n, 1));
+    }
+    return gone;
+  };
   // Recherche du sniper : filtre (joueur ou critères copiés de la Web App), bornes de prix variées pour éviter le cache EA
-  X.searchFilter = async (filter, range) => {
+  X.searchFilter = (filter, range) => {
     const c = new UTSearchCriteriaDTO();
     if (filter.criteria) Object.assign(c, filter.criteria);
     else {
       c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
       if (filter.defId) c.defId = [filter.defId];
     }
+    return runSearch(c, range);
+  };
+  // Recherche d'un groupe de cibles : critères communs (club, ligue, nation, rareté, niveau)
+  X.searchGroup = (g, range) => {
+    const c = new UTSearchCriteriaDTO();
+    c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
+    if (g.club) c.club = g.club;
+    if (g.league) c.league = g.league;
+    if (g.nation) c.nation = g.nation;
+    if (g.rarity) c.rarities = [g.rarity];
+    if (g.level) c.level = g.level;
+    return runSearch(c, range);
+  };
+  const runSearch = async (c, range) => {
     c.minBuy = range.minBuy ?? 0;
     c.maxBuy = range.maxBuy ?? 0;
     c.minBid = range.minBid ?? 0;

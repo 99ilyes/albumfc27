@@ -206,12 +206,18 @@
 #afc-root .setting > span { min-width: 0; }
 #afc-root .setting small { display: block; color: var(--dim); font-size: .7rem; }
 #afc-root .t-list { display: flex; flex-direction: column; gap: 4px; max-height: 330px; overflow-y: auto; scrollbar-width: thin; }
-#afc-root .t-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 2px 10px; padding: 7px 9px; border-radius: 7px; background: var(--panel2); border: 1px solid transparent; cursor: pointer; }
+#afc-root .t-row { display: grid; grid-template-columns: 15px auto minmax(0, 1fr) auto; align-items: center; gap: 2px 10px; padding: 7px 9px; border-radius: 7px; background: var(--panel2); border: 1px solid transparent; cursor: pointer; }
 #afc-root .t-row.active { border-color: var(--ac); background: rgba(0,202,246,.07); }
 #afc-root .t-row.lock { cursor: default; }
 #afc-root .t-row .t-n { color: #fff; font-weight: 600; font-size: .8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#afc-root .t-row .t-p { grid-column: 2; font-size: .7rem; color: var(--dim); }
-#afc-root .t-row .a-x { grid-row: 1 / span 2; grid-column: 3; }
+#afc-root .t-row .t-p { grid-column: 3; font-size: .7rem; color: var(--dim); }
+#afc-root .t-row .t-p.ko { color: var(--ko); }
+#afc-root .t-row .a-x { grid-row: 1 / span 2; grid-column: 4; }
+#afc-root .t-row .t-chk { grid-row: 1 / span 2; width: 15px; height: 15px; margin: 0; accent-color: var(--ac); cursor: pointer; }
+#afc-root .t-row.grp { background: rgba(0,202,246,.04); border-style: dashed; border-color: rgba(0,202,246,.35); }
+#afc-root .t-row.grp.active { border-style: solid; border-color: var(--ac); }
+#afc-root .t-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: .72rem; color: var(--dim); }
+#afc-root .t-bar.ok { color: var(--ok); } #afc-root .t-bar.ko { color: var(--ko); }
 #afc-root .t-row .a-radio { grid-row: 1 / span 2; width: 13px; height: 13px; border-radius: 50%; border: 2px solid rgba(255,255,255,.35); }
 #afc-root .t-row.active .a-radio { border-color: var(--ac); background: radial-gradient(var(--ac) 45%, transparent 50%); }
 #afc-root .results { display: flex; flex-direction: column; border-radius: 6px; overflow: hidden; }
@@ -361,7 +367,7 @@
     // Saisie en cours dans le panneau : pas de reconstruction
     typing(scope = this.root) {
       const a = document.activeElement;
-      return !!a && scope.contains(a) && (a.tagName === 'INPUT' || a.tagName === 'SELECT');
+      return !!a && scope.contains(a) && ((a.tagName === 'INPUT' && a.type !== 'checkbox') || a.tagName === 'SELECT');
     }
     toggle() {
       this.isOpen ? this.close() : this.show();
@@ -522,6 +528,7 @@
         const what = a.mode === 'buy' ? 'Achats Galerie' : 'Vérification des prix';
         return `${what} · ${left > 0 ? `${a.waitLabel || 'Prochaine action'} dans ${fmtWait(left)}` : a.activityText || 'en cours…'}`;
       }
+      if (s.running && s.task === 'scan') return `Scan des prix${s.scanProgress ? ` ${s.scanProgress.done} / ${s.scanProgress.total}` : ''} · ${s.activity || 'en cours…'}`;
       if (s.running && s.task === 'relist') return `Relister · ${s.relistProgress ? `${s.relistProgress.done} / ${s.relistProgress.total} · ` : ''}${s.activity}`;
       if (s.running) {
         if (s.breakUntil) return `Sniper en pause · reprise dans ${fmtClock(s.breakUntil - now)}`;
@@ -587,11 +594,14 @@
       this.tHint = h('div', { className: 'a-block-hint' });
       const live = btn('+ Filtre de la Web App', () => void this.addLiveFilter(), 'small', { title: 'Copie le filtre réglé dans la recherche du marché de la Web App' });
       this.tClear = h('button', { type: 'button', className: 'a-link', textContent: 'Retirer les cibles Galerie', onclick: () => this.app.clearAlbumTargets() });
+      this.tScan = btn('Scanner les prix', () => this.app.scanPrices(), 'small', { title: 'Prix de tous les joueurs (moins chère du marché, prix d’achat), sans lancer le sniper : nécessaire pour créer un groupe' });
+      this.checked = new Set();
       const targets = h(
         'div',
         { className: 'a-block' },
-        h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: 'Cibles' }), this.tClear),
+        h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: 'Cibles' }), this.tClear, this.tScan),
         this.tList,
+        (this.tBar = h('div', { className: 't-bar' })),
         h('div', { className: 'a-row', style: 'align-items:flex-start' }, this.searchBox(), live),
         this.tHint,
       );
@@ -664,36 +674,79 @@
       const snipe = s.running && s.task === 'snipe';
       const list = this.app.targets();
       const activeIdx = snipe ? s.idx : cfg.activeFilter;
-      // Cibles
+      // Cibles : joueurs (cochables pour créer un groupe) et groupes ; la sélection (rond) est ce que le sniper cherche
+      const byId = new Map(list.map((f) => [f.id, f]));
+      const curId = snipe && s.cur ? s.cur.fid : null;
+      for (const id of this.checked) if (!X.groupable(byId.get(id))) this.checked.delete(id);
+      const groupsOf = (f) => list.filter((g) => X.isGroup(g) && g.members.includes(f.id)).length;
       this.tList.replaceChildren(
         ...(list.length
-          ? list.map((f, i) => {
-              const on = i === activeIdx;
-              const price = f.buyPrice ? `achat ≤ ${fmt(f.buyPrice)}${f.sellPrice ? ` · vente ${fmt(f.sellPrice)}` : ''}` : f.auto ? 'prix calculés au lancement' : 'prix à renseigner';
+          ? [...list.keys()].sort((a, b) => Number(X.isGroup(list[b])) - Number(X.isGroup(list[a])) || a - b).map((i) => {
+              const f = list[i];
+              const on = curId ? f.id === curId : i === activeIdx;
+              const isG = X.isGroup(f);
+              let price;
+              let ko = false;
+              if (isG) {
+                const c = X.groupCheck(f.members.map((id) => byId.get(id)).filter(Boolean));
+                ko = !c.ok;
+                price = c.ok ? `${c.text} · achat de ${fmt(c.low)} à ${fmt(c.top)}` : c.reason;
+              } else price = f.buyPrice ? `achat ≤ ${fmt(f.buyPrice)}${f.sellPrice ? ` · vente ${fmt(f.sellPrice)}` : ''}${f.lowest ? ` · moins chère ${fmt(f.lowest)}` : ''}` : f.auto ? 'prix à scanner' : 'prix à renseigner';
+              const chk = X.groupable(f) ? h('input', { type: 'checkbox', className: 't-chk', checked: this.checked.has(f.id), title: 'Cocher pour grouper' }) : h('span');
+              if (chk.tagName === 'INPUT')
+                chk.onclick = (ev) => {
+                  ev.stopPropagation();
+                  chk.checked ? this.checked.add(f.id) : this.checked.delete(f.id);
+                  this.renderGroupBar(list);
+                };
+              const n = isG ? 0 : groupsOf(f);
               const row = h(
                 'div',
-                { className: `t-row${on ? ' active' : ''}${snipe ? ' lock' : ''}`, title: snipe ? 'Cible choisie par le sniper (alternance si activée)' : 'Cible de départ' },
+                { className: `t-row${isG ? ' grp' : ''}${on ? ' active' : ''}${snipe ? ' lock' : ''}`, title: snipe ? (on ? 'En cours de recherche' : '') : isG ? 'Sélectionner ce groupe' : 'Sélectionner ce joueur' },
+                chk,
                 h('span', { className: 'a-radio' }),
-                h('span', { className: 'a-row', style: 'gap:6px;min-width:0;flex-wrap:nowrap' }, h('span', { className: 't-n', textContent: f.label }), f.album ? h('span', { className: 'a-pill ac', textContent: 'Galerie' }) : null),
-                h('button', { type: 'button', className: 'a-x', textContent: '×', title: snipe && on ? 'Cible en cours' : 'Retirer', disabled: snipe && on, onclick: (ev) => (ev.stopPropagation(), this.app.removeTarget(f.id)) }),
-                h('span', { className: 't-p', textContent: price }),
+                h(
+                  'span',
+                  { className: 'a-row', style: 'gap:6px;min-width:0;flex-wrap:nowrap' },
+                  isG ? h('span', { className: 'a-pill ac', textContent: 'Groupe' }) : null,
+                  h('span', { className: 't-n', textContent: f.label }),
+                  f.album ? h('span', { className: 'a-pill ac', textContent: 'Galerie' }) : null,
+                  n ? h('span', { className: 'a-pill', textContent: n > 1 ? `${n} groupes` : 'dans un groupe' }) : null,
+                ),
+                h('button', { type: 'button', className: 'a-x', textContent: '×', title: snipe && on ? 'En cours de recherche' : isG ? 'Supprimer le groupe' : 'Retirer', disabled: snipe && on, onclick: (ev) => (ev.stopPropagation(), this.app.removeTarget(f.id)) }),
+                h('span', { className: `t-p${ko ? ' ko' : ''}`, textContent: price }),
               );
               if (!snipe) row.onclick = () => this.app.setActiveTarget(i);
               return row;
             })
           : [h('div', { className: 'a-empty', textContent: 'Aucune cible. Cherche un joueur, copie le filtre de la Web App, ou ajoute des cartes manquantes depuis l’onglet Galerie (🎯).' })]),
       );
+      this.renderGroupBar(list);
       this.tClear.style.display = list.some((f) => f.album) ? '' : 'none';
       this.tClear.disabled = snipe;
+      this.tScan.disabled = s.running || this.album.running || !list.some((f) => X.groupable(f) || (!X.isGroup(f) && f.auto));
+      this.tScan.textContent = s.task === 'scan' && s.scanProgress ? `Scan ${s.scanProgress.done} / ${s.scanProgress.total}…` : 'Scanner les prix';
       // Prix de la cible active
       const f = list[activeIdx];
-      const ptitle = h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: 'Prix de la cible' }));
+      const ptitle = h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: X.isGroup(f) ? 'Groupe sélectionné' : 'Prix de la cible' }));
       if (!f) this.pricesEl.replaceChildren(ptitle, hint('Choisis une cible.'));
-      else {
+      else if (X.isGroup(f)) {
+        const members = f.members.map((id) => byId.get(id)).filter(Boolean);
+        const c = X.groupCheck(members);
+        this.pricesEl.replaceChildren(
+          ptitle,
+          ...members.map((m) => h('div', { style: 'font-size:.78rem;color:#fff', textContent: `${m.label} : achat ≤ ${fmt(m.buyPrice)} · vente ${fmt(m.sellPrice)} · moins chère ${fmt(m.lowest)}` })),
+          hint(
+            c.ok
+              ? `Une recherche (${c.text}) jusqu’à ${fmt(c.top)}, prix min calibré au lancement pour que la page de résultats ne sature pas. Seules ces cartes sont achetées, chacune sous son propre prix d’achat. Prix revérifiés comme pour un joueur.`
+              : `${c.reason}. Rescanner les prix ou recréer le groupe.`,
+          ),
+        );
+      } else {
         ptitle.append(h('span', { className: 'a-block-hint', textContent: 'Automatique' }), toggle(!!f.auto, (v) => this.app.patchTarget(f.id, { auto: v }), snipe));
         const gain = f.buyPrice && f.sellPrice ? profitOf(f.buyPrice, f.sellPrice) : null;
-        const line = h('div', { style: 'font-size:.82rem;color:#fff', textContent: f.buyPrice ? `Achat ≤ ${fmt(f.buyPrice)} · Vente ${fmt(f.sellPrice)}${gain === null ? '' : ` · Profit ${fmt(gain)}`}` : 'Prix calculés au lancement' });
-        if (f.auto) this.pricesEl.replaceChildren(ptitle, line, hint(`Achat un palier sous la moins chère du marché, baissé jusqu’au profit visé (${cfg.minProfit > 0 ? `${fmt(cfg.minProfit)} min` : '2 % du prix, 150 min'}). Prix revérifiés ${cfg.recheckEvery > 0 ? `toutes les ${cfg.recheckEvery} recherches, ` : ''}toutes les 15 min et après chaque snipe.`));
+        const line = h('div', { style: 'font-size:.82rem;color:#fff', textContent: f.buyPrice ? `Achat ≤ ${fmt(f.buyPrice)} · Vente ${fmt(f.sellPrice)}${gain === null ? '' : ` · Profit ${fmt(gain)}`}` : 'Prix vérifiés au lancement ou avec « Scanner les prix »' });
+        if (f.auto) this.pricesEl.replaceChildren(ptitle, line, hint(`Achat un palier sous la moins chère du marché, baissé jusqu’au profit visé (${cfg.minProfit > 0 ? `${fmt(cfg.minProfit)} min` : '2 % du prix, 150 min'}). Prix revérifiés ${cfg.recheckEvery > 0 ? `toutes les ${cfg.recheckEvery} recherches de cette cible, ` : ''}toutes les 15 min et après chaque snipe.`));
         else {
           const num = (k) => {
             const i = h('input', { type: 'number', className: 'a-in', min: '0', step: '50', value: String(f[k] || ''), disabled: snipe });
@@ -703,10 +756,11 @@
           this.pricesEl.replaceChildren(ptitle, cfg.sellAfterSnipe ? h('div', { className: 'prices' }, 'Achat', num('buyPrice'), 'Vente', num('sellPrice')) : h('div', { className: 'prices' }, 'Achat', num('buyPrice')), line);
         }
       }
+      const every = Math.max(1, Math.floor(cfg.rotateEvery) || 1);
       this.sRotate.replaceChildren(
         setting(
-          'Alterner les cibles',
-          list.length > 1 ? 'Change de cible toutes les 450 à 900 recherches' : 'Ajoute au moins 2 cibles pour alterner',
+          'Alterner',
+          cfg.rotate ? `Entre toutes les cibles et groupes, ${every} recherche${every > 1 ? 's' : ''} chacun (Réglages)` : 'Non : seule la cible ou le groupe sélectionné est cherché',
           toggle(cfg.rotate, (v) => this.app.setConfig({ rotate: v })),
         ),
       );
@@ -726,17 +780,44 @@
       this.renderSnipeLive();
     }
 
+    // Joueurs cochés : compatibilité (critères communs, prix) et création du groupe
+    renderGroupBar(list) {
+      const ids = [...this.checked];
+      if (!ids.length) {
+        this.tBar.className = 't-bar';
+        this.tBar.textContent = 'Plusieurs joueurs en une recherche : « Scanner les prix », coche les joueurs, puis « Créer le groupe ».';
+        return;
+      }
+      const members = ids.map((id) => list.find((f) => f.id === id)).filter(Boolean);
+      const c = X.groupCheck(members);
+      const create = btn(`Créer le groupe (${members.length})`, () => this.app.createGroup(ids) && this.checked.clear(), 'small', { disabled: !c.ok || (this.sniper.running && this.sniper.task === 'scan') });
+      const clear = h('button', { type: 'button', className: 'a-link', textContent: 'Décocher', onclick: () => (this.checked.clear(), this.renderSnipe()) });
+      this.tBar.className = `t-bar ${c.ok ? 'ok' : members.length >= 2 ? 'ko' : ''}`;
+      this.tBar.replaceChildren(h('span', { className: 'a-grow', textContent: c.ok ? `Compatibles : ${c.text}, achat de ${fmt(c.low)} à ${fmt(c.top)}` : c.reason }), clear, create);
+    }
+
     renderSnipeLive() {
       const s = this.sniper;
       const cfg = this.cfg;
       const now = Date.now();
       const snipe = s.running && s.task === 'snipe';
       const locked = s.guard.lockedUntil() > 0;
-      const f = snipe ? s.filter : this.app.targets()[cfg.activeFilter];
-      this.sPhase.textContent = snipe ? (locked ? 'PAUSE ANTI-CAPTCHA' : PHASES[s.phase]) : s.running ? 'RELISTER' : this.album.running ? 'SUSPENDU (GALERIE)' : s.on ? 'REPRISE IMMINENTE' : 'À L’ARRÊT';
+      const f = snipe ? (s.cur ? s.cur.members[0] : s.filter) : this.app.targets()[cfg.activeFilter];
+      this.sPhase.textContent = snipe ? (locked ? 'PAUSE ANTI-CAPTCHA' : PHASES[s.phase]) : s.running ? (s.task === 'scan' ? 'SCAN DES PRIX' : 'RELISTER') : this.album.running ? 'SUSPENDU (GALERIE)' : s.on ? 'REPRISE IMMINENTE' : 'À L’ARRÊT';
       this.sSpin.className = `s-spin${!s.running ? ' off' : s.phase === 'break' || s.phase === 'wait' ? ' pause' : ''}`;
-      const rot = snipe && cfg.rotate && s.filters.length > 1 ? ` · changement de cible dans ${Math.max(0, s.rotateAt - s.run.searches)} recherches` : '';
-      this.sTarget.replaceChildren(f ? h('span', {}, h('b', { textContent: f.label }), f.buyPrice ? ` · achat ≤ ${fmt(f.buyPrice)} · vente ${fmt(f.sellPrice)}` : '', rot) : 'Aucune cible');
+      const all = this.app.targets();
+      const cur = snipe && s.cur ? s.cur : null;
+      const units = snipe ? s.units.length : 0;
+      const rot = snipe && cfg.rotate && units > 1 ? ` · alternance` : '';
+      const members = (g) => g.members.map((id) => all.find((x) => x.id === id)).filter(Boolean);
+      let line;
+      if (cur?.group) line = h('span', {}, h('b', { textContent: s.unitLabel(cur) }), cur.minBuy ? ` · ${fmt(cur.minBuy)} à ${fmt(s.maxBuyOf(cur))}` : ' · calibrage', rot);
+      else if (!snipe && cfg.rotate && all.length > 1) line = h('span', {}, h('b', { textContent: `Alternance entre ${all.length} cibles et groupes` }), ` · ${Math.max(1, Math.floor(cfg.rotateEvery) || 1)} recherche(s) chacun`);
+      else if (!snipe && X.isGroup(f)) {
+        const c = X.groupCheck(members(f));
+        line = h('span', {}, h('b', { textContent: `Groupe ${f.label}` }), c.ok ? ` · achat de ${fmt(c.low)} à ${fmt(c.top)}` : ` · ${c.reason}`);
+      } else line = f ? h('span', {}, h('b', { textContent: f.label }), f.buyPrice ? ` · achat ≤ ${fmt(f.buyPrice)} · vente ${fmt(f.sellPrice)}` : '', rot) : 'Aucune cible';
+      this.sTarget.replaceChildren(line);
       const r = s.run;
       const pause = s.breakUntil ? `pause encore ${fmtClock(s.breakUntil - now)}` : s.breakAt ? `pause dans ${fmtClock(s.breakAt - now)}` : X.BREAK_PRESETS[cfg.breakPreset]?.every ? '' : 'sans pause';
       this.sTiles.replaceChildren(
@@ -745,7 +826,7 @@
         tile('Snipes', fmt(r.snipes), `${r.misses} raté(s) de peu${rate(r.snipes, r.misses)}`),
         tile('Durée', snipe ? fmtClock(now - r.startedAt) : '—', pause),
       );
-      this.sAct.textContent = snipe ? s.activity : s.on && !s.running ? 'Le sniper reprend dès la fin de la tâche ou de la pause en cours.' : '';
+      this.sAct.textContent = snipe || s.task === 'scan' ? s.activity : s.on && !s.running ? 'Le sniper reprend dès la fin de la tâche ou de la pause en cours.' : '';
       this.sGo.textContent = snipe ? 'Arrêter le sniper' : 'Lancer le sniper';
       this.sGo.className = `a-btn big ${snipe ? 'danger' : 'go'}`;
       this.sGo.disabled = s.running && !snipe;
@@ -1396,6 +1477,10 @@
           row('Prévention des erreurs', 'Pas d’achat si la recherche renvoie plus de 15 résultats', toggle(c.mistakePrevention, (v) => set({ mistakePrevention: v }))),
           row('Son à chaque snipe', '', toggle(c.snipeSound, (v) => (set({ snipeSound: v }), v && X.beep()))),
         ),
+        block(
+          'Alternance',
+          row('Recherches par cible avant la suivante', 'Avec « Alterner » (onglet Sniper) : 1 = une cible ou un groupe différent à chaque recherche. Les joueurs d’un groupe sont cherchés via le groupe.', num('rotateEvery', 1, 1000)),
+        ),
         block('Galerie', row('Importer tous les sets fut.gg à l’ouverture', 'Au plus toutes les 6 h', toggle(c.autoCatalog, (v) => set({ autoCatalog: v }))), hint('Écart max et « Après achat » se règlent dans la fenêtre d’achat direct.')),
       );
     }
@@ -1418,7 +1503,7 @@
       this.renderStrip();
       const a = this.album;
       const s = this.sniper;
-      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${this.cfg.snipeFilters}|${this.cfg.rotate}`;
+      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${this.cfg.activeFilter}|${this.cfg.rotateEvery}|${s.cur?.id ?? ''}|${s.scanProgress?.done ?? ''}|${this.cfg.snipeFilters}|${this.cfg.rotate}`;
       if (sig !== this.lastSig && !this.typing()) {
         this.lastSig = sig;
         if (this.tab === 'gallery' || this.tab === 'snipe') this.renderBody();

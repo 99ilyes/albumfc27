@@ -1,5 +1,6 @@
 // Moteur de sniping (SnipeFC27 0.6.2, logique conservée) : sans mode nuit, toujours en fonctionnement continu
-// (attend au lieu de s'arrêter, reprend après rechargement), alternance des cibles en option, pause courte après captcha.
+// (attend au lieu de s'arrêter, reprend après rechargement), une cible par recherche en alternance avec groupes de cibles
+// cherchées ensemble en option, pause courte après captcha.
 (function () {
   const X = globalThis.__fc27;
   const { fmt, rand, randInt, clockIn, load, save, priceDown, profitOf, breakEven, net, errMsg } = X;
@@ -18,7 +19,15 @@
   const SEARCHLOG = 100;
   const SALES = 50;
   const PRUNE_MS = 6e5;
-  const ROTATE = [450, 900];
+  // Groupes : résultats triés par fin de vente, annonces fraîches en dernier ; elles restent visibles tant que la page
+  // (21 annonces) n'est pas pleine. Calibrage : 10 résultats max ; en recherche : saturée à 18, chargée au-delà de 14
+  const SKIP_MS = 6e5;
+  const PAGE_SAT = 18;
+  const PAGE_BUSY = 14;
+  const CAL_MAX = 10;
+  const MISTAKE_GROUP = 5;
+  // Prix min de recherche essayés au calibrage, en part du prix d'achat le plus bas du groupe
+  const CALIBRATION = [0.6, 0.75, 0.85, 0.9, 0.95];
   const BLOCKED_WAIT = [48e4, 72e4];
   const ERROR_WAIT = [24e4, 36e4];
   const MAX_RETRIES = 5;
@@ -58,7 +67,8 @@
 
   X.Sniper = class {
     running = false;
-    task = null; // 'snipe' | 'relist'
+    task = null; // 'snipe' | 'relist' | 'scan'
+    scanProgress = null;
     relistProgress = null;
     phase = 'idle';
     activity = '';
@@ -73,7 +83,11 @@
     breakUntil = null;
     brk = { ...BREAK0, ...load(K_BREAK, {}) };
     segStart = 0;
-    rotateAt = 0;
+    units = [];
+    cur = null;
+    cursor = -1;
+    unitNo = 0;
+    streak = 0;
     snipes = load(K_SNIPES, {});
     prices = {};
     seen = new Set();
@@ -83,9 +97,7 @@
     reloadTimer = null;
     lastTick = 0;
     tickPhase = 'idle';
-    pricedAt = 0;
-    tooManyNoted = false;
-    albumDone = false;
+    albumDone = new Set();
 
     // hooks : { onSnipe(defId), isCollected(defId), albumSold(item), albumPrice(id), onListed(id, price), otherBusy(), afterTask() }
     constructor(getConfig, onUpdate, patchConfig, hooks) {
@@ -117,7 +129,10 @@
     }
 
     snapshot() {
-      const f = this.running && this.task === 'snipe' ? this.filter : X.parseFilters(this.cfg.snipeFilters)[this.cfg.activeFilter];
+      const snipe = this.running && this.task === 'snipe';
+      const list = snipe ? this.filters : X.parseFilters(this.cfg.snipeFilters);
+      const f = snipe && this.cur ? this.filters.find((x) => x.id === this.cur.fid) : list[this.cfg.activeFilter];
+      const members = X.isGroup(f) ? f.members.map((id) => list.find((x) => x.id === id)).filter(Boolean) : null;
       return {
         running: this.running,
         task: this.running ? this.task : null,
@@ -127,10 +142,10 @@
         phase: this.phase,
         activity: this.activity,
         coins: X.coins(),
-        filter: f?.label ?? '',
+        filter: members ? `Groupe ${members.map((m) => m.label).join(' + ')}` : (f?.label ?? ''),
         filterAlbum: !!f?.album,
-        buyPrice: f?.buyPrice ?? 0,
-        sellPrice: f?.sellPrice ?? 0,
+        buyPrice: members ? Math.max(0, ...members.map((m) => m.buyPrice || 0)) : (f?.buyPrice ?? 0),
+        sellPrice: members ? 0 : (f?.sellPrice ?? 0),
         targets: X.parseFilters(this.cfg.snipeFilters).length,
         run: { ...this.run },
         session: { ...this.session },
@@ -138,7 +153,6 @@
         sales: this.sales.slice(0, 20),
         breakAt: this.breakAt,
         breakUntil: this.breakUntil,
-        rotationIn: this.running && this.task === 'snipe' && this.cfg.rotate && this.filters.length > 1 ? Math.max(0, this.rotateAt - this.run.searches) : null,
         lockedUntil: this.guard.lockedUntil(),
         limits: this.guard.limits(),
         searchLog: this.searchLog,
@@ -206,10 +220,12 @@
       this.run = { startedAt: Date.now(), searches: 0, snipes: 0, misses: 0, profit: 0 };
       this.lastTick = Date.now();
       this.tickPhase = 'idle';
-      this.pricedAt = 0;
-      this.tooManyNoted = false;
-      this.note(`Sniper : démarrage${this.cfg.rotate ? ', alternance des cibles' : ''}`);
-      if (this.cfg.rotate && this.filters.length < 2) this.note('Une seule cible : en ajouter une 2e pour alterner toutes les 450 à 900 recherches');
+      this.units = [];
+      this.cur = null;
+      this.streak = 0;
+      this.albumDone.clear();
+      const sel = this.filters[this.idx];
+      this.note(`Sniper : démarrage, ${this.cfg.rotate ? `alternance entre les cibles et groupes (${Math.max(1, Math.floor(this.cfg.rotateEvery) || 1)} recherche(s) chacun)` : X.isGroup(sel) ? `groupe ${sel.label}` : sel.label}`);
       let retries = 0;
       let lastErr = 0;
       try {
@@ -329,6 +345,44 @@
         this.phase = 'idle';
         this.activity = '';
         this.note(`Relister terminé : ${ok} carte(s) mise(s) en vente${left ? `, ${left} laissée(s) telle(s) quelle(s)` : ''}`, 'list');
+        this.hooks.afterTask();
+      }
+    }
+
+    // Scan des prix : moins chère du marché et prix d'achat de chaque joueur (pour créer des groupes), sans lancer le sniper
+    async scanPrices() {
+      if (this.running) return;
+      if (this.hooks.otherBusy()) return this.note('Scanner les prix : attendre la fin de la tâche Galerie en cours', 'error');
+      const lock = this.guard.lockRemainingMs();
+      if (lock > 0) return this.note(`Pause anti-captcha encore ${X.fmtMin(lock)} : réessayer plus tard`, 'error');
+      this.filters = X.parseFilters(this.cfg.snipeFilters);
+      this.idx = Math.min(Math.max(0, this.cfg.activeFilter), this.filters.length - 1);
+      const todo = this.filters.filter((f) => !X.isGroup(f) && f.auto && !(f.pricedAt && Date.now() - f.pricedAt < PRICE_FRESH));
+      if (!todo.length) return this.note(this.filters.some((f) => !X.isGroup(f) && f.auto) ? 'Prix déjà scannés il y a moins de 5 min' : 'Aucun joueur en prix automatiques à scanner', 'error');
+      this.running = true;
+      this.task = 'scan';
+      this.stopRequested = false;
+      this.scanProgress = { done: 0, total: todo.length };
+      this.note(`Scan des prix : ${todo.length} joueur(s)`);
+      let bad = 0;
+      try {
+        for (const f of todo) {
+          this.checkStop();
+          if (!(await this.priceFilter(f))) bad++;
+          this.scanProgress.done++;
+          this.emit();
+        }
+        const scanned = this.filters.filter((f) => f.card);
+        if (scanned.length && scanned.every((f) => !f.card.club && !f.card.league && !f.card.nation)) this.note('Club, ligue et nation des cartes introuvables dans la Web App : groupes impossibles', 'error');
+      } catch (err) {
+        if (!(err instanceof Stop)) this.note(`Erreur : ${errMsg(err)}`, 'error');
+      } finally {
+        this.running = false;
+        this.task = null;
+        this.scanProgress = null;
+        this.phase = 'idle';
+        this.activity = '';
+        this.note(`Scan des prix terminé${bad ? ` : ${bad} joueur(s) sans prix rentable` : ''}. Coche les joueurs à grouper.`);
         this.hooks.afterTask();
       }
     }
@@ -455,12 +509,8 @@
     }
 
     async loop() {
-      if (!(await this.prepareFilter())) return;
       let key = this.breakKey();
       await this.restoreBreakClock(key);
-      this.rotateAt = this.run.searches + randInt(...ROTATE);
-      let win = { n: 0, start: Date.now() };
-      let sinceCheck = 0;
       let errors = 0;
       for (;;) {
         this.checkStop();
@@ -491,34 +541,14 @@
           this.breakUntil = null;
           this.newBreakTarget(key, long);
           this.resumeClock();
-          win = { n: 0, start: Date.now() };
         }
-        // Cible Galerie achetée : retirée, cible suivante
-        if (this.albumDone) {
-          this.albumDone = false;
-          if (!this.dropFilter(this.idx, 'carte obtenue pour la Galerie')) return;
-          if (!(await this.prepareFilter())) return;
-          this.rotateAt = this.run.searches + randInt(...ROTATE);
-          sinceCheck = 0;
-          win = { n: 0, start: Date.now() };
-        }
-        if (cfg.rotate && this.filters.length > 1 && this.run.searches >= this.rotateAt) {
-          this.idx = (this.idx + 1) % this.filters.length;
-          this.saveFilters();
-          this.note(`Changement de cible : ${this.filter.label}`);
-          if (!(await this.prepareFilter())) return;
-          this.rotateAt = this.run.searches + randInt(...ROTATE);
-          sinceCheck = 0;
-          win = { n: 0, start: Date.now() };
-        }
-        const f = this.filter;
+        // Cibles Galerie achetées ou déjà collectées : retirées
+        for (const id of this.albumDone) if (!this.dropById(id, 'carte obtenue pour la Galerie')) return;
+        this.albumDone.clear();
+        for (const f of [...this.filters]) if (f.album && f.defId && this.hooks.isCollected(f.defId) && !this.dropById(f.id, 'déjà dans la Galerie')) return;
+        this.syncUnits();
         if (await this.transferListFull()) {
           await this.blocked('Liste de transferts pleine');
-          continue;
-        }
-        const c0 = X.coins();
-        if (c0 !== null && c0 < f.buyPrice) {
-          await this.blocked(`Crédits insuffisants (${fmt(c0)} < ${fmt(f.buyPrice)})`);
           continue;
         }
         const g = [this.guard.check(), this.guard.checkBid()].find((x) => !x.ok);
@@ -529,22 +559,45 @@
           await this.idle(g.waitMs);
           continue;
         }
-        if (Date.now() - win.start > FRESH_MS) win = { n: 0, start: Date.now() };
-        const range = rangeVariants(f.buyPrice)[win.n];
-        if (!range) {
-          const ms = win.start + FRESH_MS + 1e3 - Date.now();
-          this.setActivity(`Attente de résultats frais (${Math.ceil(ms / 1e3)} s)`, 'wait');
-          await this.wait(Math.max(0, ms));
-          win = { n: 0, start: Date.now() };
+        const p = this.pick();
+        if (!p.u) {
+          if (p.freshAt) {
+            const ms = Math.max(0, p.freshAt - Date.now());
+            this.setActivity(`Attente de résultats frais (${Math.ceil(ms / 1e3)} s)`, 'wait');
+            await this.wait(ms);
+          } else if (p.poor) await this.blocked(`Crédits insuffisants (${fmt(X.coins())} < ${fmt(this.minBuyOf(p.poor))})`);
+          else await this.blocked('Aucune cible utilisable');
           continue;
         }
+        const u = p.u;
+        if (!p.prep) this.useUnit(u);
+        if (u.group && !u.minBuy && !this.needsPricing(u)) {
+          if (!(await this.calibrate(u))) {
+            u.skipUntil = Date.now() + SKIP_MS;
+            this.note(`${this.unitLabel(u)} : groupe en attente 10 min${cfg.rotate ? '' : ', cible suivante'}`, 'error');
+          }
+          continue;
+        }
+        if (this.needsPricing(u)) {
+          if (!(await this.priceUnit(u))) {
+            u.skipUntil = Date.now() + SKIP_MS;
+            this.note(`${this.unitLabel(u)} : pas de prix rentable trouvé, ${cfg.rotate && this.units.length > 1 ? 'ignorée 10 min' : 'cible suivante'}`, 'error');
+          }
+          continue;
+        }
+        const f = u.members[0];
+        const range = this.variants(u)[u.win.n];
         const budget = this.buyBudget();
         let wallet = X.coins() ?? Infinity;
-        this.setActivity(`Recherche ${f.label} ≤ ${fmt(f.buyPrice)}`, 'search');
-        const res = await X.searchFilter(f, range);
+        const top = this.maxBuyOf(u);
+        const name = this.unitLabel(u);
+        this.setActivity(`Recherche ${name} ≤ ${fmt(top)}`, 'search');
+        const res = u.group ? await X.searchGroup(u.crit, range) : await X.searchFilter(f, range);
         const items = res.success ? [...res.data].sort((a, b) => a.buyNow - b.buyNow || b.rating - a.rating) : [];
-        const tooMany = cfg.mistakePrevention && items.length > MISTAKE;
-        const cheap = tooMany ? [] : items.filter((i) => i.buyNow > 0 && i.buyNow <= f.buyPrice && !this.seen.has(i.tradeId));
+        const memberOf = (i) => (u.group ? u.members.find((m) => Number(m.defId) === i.defId) : f);
+        const fits = items.filter((i) => i.buyNow > 0 && i.buyNow <= (memberOf(i)?.buyPrice ?? 0));
+        const tooMany = cfg.mistakePrevention && (u.group ? fits.length > MISTAKE_GROUP : items.length > MISTAKE);
+        const cheap = tooMany ? [] : fits.filter((i) => !this.seen.has(i.tradeId));
         const buys = [];
         for (const i of cheap) {
           if (buys.length >= budget) break;
@@ -558,29 +611,35 @@
         this.guard.recordSearch();
         this.run.searches++;
         this.session.searches++;
-        win.n++;
-        sinceCheck++;
+        u.win.n++;
+        u.sinceCheck++;
+        this.streak++;
+        const auto = this.isAuto(u);
         if (res.success) {
           errors = 0;
+          const noise = items.length - fits.length;
           this.searchNote(
-            `#${this.run.searches} ≤ ${fmt(f.buyPrice)} : ${items.length ? `${items.length} résultat(s), dès ${fmt(items[0].buyNow)}` : 'rien'}${tooMany ? ' (plus de 15 : pas d’achat)' : buys.length > 1 ? ` → ${buys.length} achats` : buys.length ? ' → achat' : ''}`,
+            `#${this.run.searches} ${name} ≤ ${fmt(top)} : ${items.length ? `${items.length} résultat(s), dès ${fmt(items[0].buyNow)}` : 'rien'}${u.group && noise ? ` (${noise} hors cibles)` : ''}${tooMany ? ` (plus de ${u.group ? MISTAKE_GROUP : MISTAKE} : pas d’achat)` : buys.length > 1 ? ` → ${buys.length} achats` : buys.length ? ' → achat' : ''}`,
           );
-          if (tooMany && !this.tooManyNoted) {
-            this.tooManyNoted = true;
-            this.note(`${items.length} résultats : pas d'achat (prévention des erreurs, prix d'achat trop haut ?)${f.auto ? ', revérification des prix' : ''}`);
+          if (tooMany && !u.tooManyNoted) {
+            u.tooManyNoted = true;
+            this.note(`${name} : ${u.group ? fits.length : items.length} résultats achetables : pas d'achat (prévention des erreurs, prix d'achat trop haut ?)${auto ? ', revérification des prix' : ''}`);
           }
-          if (tooMany && f.auto) sinceCheck = Infinity;
-          const got = buys.length ? await this.settleBids(buys, bids) : [];
+          if (tooMany && auto) u.sinceCheck = Infinity;
+          const got = buys.length ? await this.settleBids(buys, bids, memberOf) : [];
           const checked = new Set();
           let repriced = false;
-          for (const i of got) if (await this.afterSnipe(i, cheap.length === 1, checked)) repriced = true;
-          if (repriced) sinceCheck = 0;
-          else if (f.auto && cheap.length >= 3) sinceCheck = Infinity;
+          for (const i of got) if (await this.afterSnipe(i, memberOf(i), cheap.length === 1, checked)) repriced = true;
+          if (repriced && u.group) {
+            if (!this.groupCheck(u).ok || u.minBuy >= this.minBuyOf(u)) u.minBuy = u.lastMin = 0;
+          } else if (repriced) (u.sinceCheck = 0), (u.pricedAt = Date.now());
+          else if (auto && cheap.length >= 3) u.sinceCheck = Infinity;
+          if (u.group) this.checkNoise(u, items.length);
         } else {
           if (res.status === 401) this.sessionExpired();
           if (X.BAD_STATUS.has(res.status)) this.lockout(`Statut EA ${res.status} (captcha ou limite)`);
           errors++;
-          this.searchNote(`#${this.run.searches} erreur ${res.status}`);
+          this.searchNote(`#${this.run.searches} ${name} erreur ${res.status}`);
           this.note(`Erreur de recherche (statut ${res.status}), encore ${Math.max(0, MAX_ERRORS - errors)} essai(s)`, 'error');
           if (errors >= MAX_ERRORS) {
             errors = 0;
@@ -588,21 +647,188 @@
             continue;
           }
         }
-        const old = Date.now() - this.pricedAt > RECHECK_MS;
-        if (f.auto && (sinceCheck === Infinity || (cfg.recheckEvery > 0 && sinceCheck >= cfg.recheckEvery) || old)) {
-          this.note(sinceCheck === Infinity ? 'Revérification des prix' : old ? 'Revérification des prix (plus de 15 min)' : `Revérification des prix après ${cfg.recheckEvery} recherches`);
-          sinceCheck = 0;
-          if (await this.priceFilter(f)) this.tooManyNoted = false;
-          else {
-            this.pricedAt = Date.now();
-            this.note('Revérification échouée : prix actuels conservés', 'error');
-          }
-          win = { n: 0, start: Date.now() };
-        }
         const { ms, hesitation } = this.searchDelay();
         this.setActivity(`Prochaine recherche dans ${(ms / 1e3).toFixed(1).replace('.', ',')} s${hesitation ? ' (hésitation)' : ''}`, 'search');
         await this.wait(ms);
       }
+    }
+
+    // ---------- Unités de recherche : un joueur (ou filtre), ou un groupe créé dans la liste des cibles ----------
+
+    newUnit(f, extra = {}) {
+      return { id: ++this.unitNo, fid: f.id, members: [], group: X.isGroup(f), minBuy: 0, lastMin: 0, win: { n: 0, start: 0 }, sinceCheck: 0, pricedAt: 0, skipUntil: 0, noisy: 0, tooManyNoted: false, ...extra };
+    }
+    unitOf(f) {
+      return f ? this.units.find((u) => u.fid === f.id) : undefined;
+    }
+    unitLabel(u) {
+      return u.group ? `Groupe ${u.members.map((m) => m.label).join(' + ')}` : (u.members[0]?.label ?? '?');
+    }
+    minBuyOf(u) {
+      return Math.min(...u.members.map((m) => m.buyPrice || Infinity));
+    }
+    maxBuyOf(u) {
+      return Math.max(...u.members.map((m) => m.buyPrice || 0));
+    }
+    isAuto(u) {
+      return u.members.every((m) => m.auto);
+    }
+    useUnit(u) {
+      if (u !== this.cur) this.streak = 0;
+      this.cur = u;
+      const n = this.filters.findIndex((f) => f.id === u.fid);
+      if (n >= 0) this.idx = n;
+    }
+    // Une unité par entrée de la liste ; état gardé d'une recherche à l'autre, prix scannés de moins de 15 min repris
+    syncUnits() {
+      const byId = new Map(this.filters.map((f) => [f.id, f]));
+      const old = new Map(this.units.map((u) => [u.fid, u]));
+      const fresh = (m) => (m.auto && m.pricedAt && Date.now() - m.pricedAt < RECHECK_MS ? m.pricedAt : 0);
+      this.units = this.filters.map((f) => {
+        const u = old.get(f.id) ?? this.newUnit(f, { pricedAt: X.isGroup(f) ? 0 : fresh(f) });
+        u.members = X.isGroup(f) ? f.members.map((id) => byId.get(id)).filter((m) => m && !X.isGroup(m)) : [f];
+        if (u.group && !u.pricedAt && u.members.length && u.members.every(fresh)) u.pricedAt = Math.min(...u.members.map(fresh));
+        return u;
+      });
+      if (this.cur && !this.units.includes(this.cur)) this.cur = null;
+    }
+    variants(u) {
+      if (!u.group) return rangeVariants(u.members[0].buyPrice);
+      const top = this.maxBuyOf(u);
+      const mins = [u.minBuy];
+      while (mins.length < 5) mins.push(X.nextPrice(mins[mins.length - 1]));
+      mins.splice(0, mins.length, ...mins.filter((m) => m < top));
+      const out = [];
+      for (const minBuy of mins) for (const minBid of [null, 150]) for (const maxBid of [null, priceDown(top)]) out.push({ minBuy, maxBuy: top, minBid, maxBid });
+      return out;
+    }
+    needsPricing(u) {
+      if (!u.pricedAt) return true;
+      if (!this.isAuto(u)) return false;
+      const every = this.cfg.recheckEvery;
+      return u.sinceCheck === Infinity || (every > 0 && u.sinceCheck >= every) || Date.now() - u.pricedAt > RECHECK_MS;
+    }
+    // Prochaine unité : la cible ou le groupe sélectionné (puis le suivant s'il est inutilisable), ou en alternance
+    // toutes les entrées (joueurs d'un groupe cherchés via le groupe), N recherches chacune
+    pick() {
+      const now = Date.now();
+      const coins = X.coins();
+      const rotate = this.cfg.rotate;
+      let list;
+      if (rotate) {
+        const inGroup = new Set(this.units.filter((u) => u.group).flatMap((u) => u.members.map((m) => m.id)));
+        const order = this.units.filter((u) => u.group || !inGroup.has(u.fid));
+        const at = order.indexOf(this.cur);
+        const stay = at >= 0 && this.streak < Math.max(1, Math.floor(this.cfg.rotateEvery) || 1) ? 0 : 1;
+        list = order.map((_, k) => order[(at + stay + k + order.length) % order.length]);
+      } else list = this.filters.map((_, k) => this.unitOf(this.filters[(this.idx + k) % this.filters.length]));
+      let poor = null;
+      let freshAt = Infinity;
+      for (const u of list) {
+        if (!u || u.skipUntil > now) continue;
+        if (u.pricedAt && coins !== null && coins < this.minBuyOf(u)) {
+          poor ??= u;
+          if (rotate) continue;
+          return { poor };
+        }
+        if (this.needsPricing(u) || (u.group && !u.minBuy)) return { u };
+        if (now - u.win.start > FRESH_MS) u.win = { n: 0, start: now };
+        if (!this.variants(u)[u.win.n]) {
+          freshAt = Math.min(freshAt, u.win.start + FRESH_MS + 1e3);
+          if (rotate) continue;
+          return { freshAt };
+        }
+        return { u };
+      }
+      return freshAt < Infinity ? { freshAt } : { poor };
+    }
+    // Prix d'une unité : vérification du marché (cibles automatiques) ; false si la cible est inutilisable
+    async priceUnit(u) {
+      const first = !u.pricedAt;
+      const label = this.unitLabel(u);
+      if (!first) {
+        const every = this.cfg.recheckEvery;
+        this.note(u.sinceCheck === Infinity ? `${label} : revérification des prix` : every > 0 && u.sinceCheck >= every ? `${label} : revérification des prix après ${every} recherches` : `${label} : revérification des prix (plus de 15 min)`);
+      }
+      if (!u.group) {
+        const f = u.members[0];
+        const bad = this.checkFilter(f);
+        if (bad) return this.note(bad, 'error'), false;
+        if (f.auto && !(await this.priceFilter(f))) {
+          if (first) return false;
+          this.note(`${f.label} : revérification échouée, prix actuels conservés`, 'error');
+        }
+      } else {
+        if (u.members.length < 2) return false;
+        for (const m of u.members) if (!(await this.priceFilter(m)) && !m.buyPrice) return false;
+      }
+      u.pricedAt = Date.now();
+      u.sinceCheck = 0;
+      u.tooManyNoted = false;
+      if (u.group && u.minBuy && u.minBuy >= this.minBuyOf(u)) u.minBuy = u.lastMin = 0;
+      return true;
+    }
+
+    // ---------- Groupes : une recherche par critères communs, prix min calibré ----------
+
+    groupCheck(u) {
+      return X.groupCheck(u.members);
+    }
+    // Calibrage : prix min de recherche le plus bas qui laisse la page de résultats loin de la saturation (10 annonces max)
+    async calibrate(u) {
+      const c = this.groupCheck(u);
+      if (!c.ok) {
+        u.pricedAt = 0;
+        u.minBuy = u.lastMin = 0;
+        return this.note(`${this.unitLabel(u)} : ${c.reason}`, 'error'), false;
+      }
+      const steps = [...new Set(CALIBRATION.map((r) => X.roundPrice(c.low * r)))].filter((v) => v > u.lastMin && v >= 150 && v < c.low);
+      let last = null;
+      for (const minBuy of steps) {
+        await this.wait(this.priceDelay());
+        await this.guardOk();
+        this.setActivity(`Calibrage du ${this.unitLabel(u)} : ${fmt(minBuy)} à ${fmt(c.top)}`, 'price');
+        const r = await this.search(null, { minBuy, maxBuy: c.top, minBid: null, maxBid: null }, c.crit);
+        if (!r.success) return this.note(`Calibrage du ${this.unitLabel(u)} : erreur EA (statut ${r.status})${X.errText(r.error)}`, 'error'), false;
+        const noise = r.data.filter((i) => !(i.buyNow <= (u.members.find((m) => Number(m.defId) === i.defId)?.buyPrice ?? 0)));
+        this.searchNote(`calibrage ${this.unitLabel(u)} ${fmt(minBuy)} à ${fmt(c.top)} : ${r.data.length} résultat(s), ${noise.length} hors cibles`);
+        last = { minBuy, count: r.data.length, noise };
+        if (r.data.length <= CAL_MAX) {
+          u.crit = c.crit;
+          u.minBuy = u.lastMin = minBuy;
+          u.noisy = 0;
+          u.win = { n: 0, start: 0 };
+          this.note(`${this.unitLabel(u)} : une recherche pour ${u.members.length} joueurs (${c.text}, ${fmt(minBuy)} à ${fmt(c.top)}, ${r.data.length} résultat(s) au calibrage dont ${noise.length} hors cibles)`);
+          return true;
+        }
+      }
+      u.lastMin = 0;
+      this.note(`${this.unitLabel(u)} : calibrage impossible, ${last ? `${last.count} résultats même de ${fmt(last.minBuy)} à ${fmt(c.top)}. ${this.noiseText(last.noise)}` : 'fourchette de prix trop étroite'}`, 'error');
+      return false;
+    }
+    // Cartes hors cibles les plus présentes : nom, nombre d'annonces, prix
+    noiseText(items) {
+      if (!items.length) return 'Page pleine d’annonces des joueurs du groupe : prix d’achat trop proches du marché, rescanner les prix';
+      const by = new Map();
+      for (const i of items) {
+        const k = i.defId || i.name;
+        const e = by.get(k) ?? { name: label(i), n: 0, lo: Infinity, hi: 0 };
+        e.n++;
+        e.lo = Math.min(e.lo, i.buyNow);
+        e.hi = Math.max(e.hi, i.buyNow);
+        by.set(k, e);
+      }
+      const top = [...by.values()].sort((a, b) => b.n - a.n).slice(0, 4);
+      return `Cartes qui encombrent : ${top.map((e) => `${e.name} ×${e.n}${e.n === 21 ? '+' : ''} (${e.lo === e.hi ? fmt(e.lo) : `${fmt(e.lo)} à ${fmt(e.hi)}`})`).join(', ')}. Les ajouter au groupe si elles sont compatibles, ou grouper des joueurs aux prix plus proches`;
+    }
+    // Page saturée, ou chargée 3 recherches d'affilée : recalibrage avec un prix min plus haut
+    checkNoise(u, count) {
+      const full = count >= PAGE_SAT;
+      u.noisy = full || count > PAGE_BUSY ? u.noisy + 1 : 0;
+      if (!full && u.noisy < 3) return;
+      this.note(`${this.unitLabel(u)} : page de résultats ${full ? 'saturée' : 'chargée'} (${count} annonces), recalibrage`, 'error');
+      u.noisy = 0;
+      u.minBuy = 0;
     }
     buyBudget() {
       const l = this.guard.limits();
@@ -614,36 +840,20 @@
     saveFilters() {
       this.patchConfig({ snipeFilters: JSON.stringify(this.filters), activeFilter: this.idx });
     }
-    // Retire la cible n ; false s'il n'en reste aucune
-    dropFilter(n, why) {
+    // Retire la cible ; false s'il n'en reste aucune
+    dropById(id, why) {
+      const n = this.filters.findIndex((f) => f.id === id);
+      if (n < 0) return this.filters.length > 0;
       const [f] = this.filters.splice(n, 1);
-      if (f) this.note(`Cible retirée : ${f.label} (${why})`);
+      this.note(`Cible retirée : ${f.label} (${why})`);
+      for (const g of X.pruneGroups(this.filters)) this.note(`Groupe ${g.label} supprimé (moins de 2 joueurs)`);
+      if (n < this.idx) this.idx--;
       if (this.idx >= this.filters.length) this.idx = 0;
       this.saveFilters();
       if (this.filters.length) return true;
       this.setOn(false);
       this.note('Plus aucune cible : sniper arrêté');
       return false;
-    }
-    // Cible utilisable (prix calculés) ; sinon cible suivante, puis attente si aucune
-    async prepareFilter() {
-      for (;;) {
-        for (let n = 0; n < this.filters.length; n++) {
-          const f = this.filter;
-          if (f.album && f.defId && this.hooks.isCollected(f.defId)) {
-            if (!this.dropFilter(this.idx, 'déjà dans la Galerie')) return false;
-            n--;
-            continue;
-          }
-          this.emit();
-          const bad = this.checkFilter(f);
-          if (!bad && (!f.auto || (await this.priceFilter(f)))) return (this.tooManyNoted = false), true;
-          this.note(`${bad ?? `${f.label} : pas de prix rentable trouvé`}, cible suivante`, 'error');
-          this.idx = (this.idx + 1) % this.filters.length;
-        }
-        if (!this.filters.length) return false;
-        await this.blocked('Aucune cible utilisable');
-      }
     }
     checkFilter(f) {
       if (f.auto) return null;
@@ -657,6 +867,7 @@
       let maxBuy = null;
       let lowest = null;
       let minPrice = null;
+      let card = null;
       this.setActivity(`Vérification du prix de ${name}`, 'price');
       for (let n = 0; n < 15; n++) {
         await this.wait(this.priceDelay());
@@ -674,12 +885,13 @@
         }
         lowest = list[0].buyNow;
         minPrice = list[0].minPrice ?? minPrice;
+        card = list[0].card ?? card;
         if (lowest <= 200) break;
         maxBuy = priceDown(lowest);
       }
       if (lowest === null) return null;
       this.note(`${name} : vente immédiate ${fmt(priceDown(lowest))}, moins chère du marché ${fmt(lowest)}`);
-      return { lowest, minPrice };
+      return { lowest, minPrice, card };
     }
     priceDelay() {
       const p = this.delayPreset();
@@ -694,8 +906,8 @@
         await this.idle(g.waitMs);
       }
     }
-    async search(filter, range) {
-      const r = await X.searchFilter(filter, range);
+    async search(filter, range, group = null) {
+      const r = group ? await X.searchGroup(group, range) : await X.searchFilter(filter, range);
       this.guard.recordSearch();
       this.session.otherSearches++;
       if (!r.success) {
@@ -716,10 +928,14 @@
       const p = await this.priceCheck(f, f.label);
       if (!p) return false;
       if (f.defId) this.prices[f.defId] = { ...p, at: Date.now() };
-      return this.applyPrices(f, p.lowest, p.minPrice);
+      f.lowest = p.lowest;
+      if (p.card) f.card = p.card;
+      const ok = this.applyPrices(f, p.lowest, p.minPrice);
+      if (ok) f.pricedAt = Date.now();
+      this.saveFilters();
+      return ok;
     }
     applyPrices(f, lowest, minPrice) {
-      this.pricedAt = Date.now();
       const r = this.computePrices(lowest, minPrice);
       if (r.status !== 'ok') {
         this.note(r.status === 'belowListable' ? `${f.label} : prix sous le minimum EA` : `${f.label} : aucun prix d'achat rentable`, 'error');
@@ -729,10 +945,10 @@
       f.sellPrice = r.sellPrice;
       this.saveFilters();
       const how = this.cfg.minProfit > 0 ? 'profit min choisi' : '2 % du prix, 150 minimum';
-      this.note(`Achat jusqu'à ${fmt(r.buyPrice)}, vente ${fmt(r.sellPrice)} (${how} : ${fmt(r.targetProfit)}${r.profit < r.targetProfit ? `, profit réduit à ${fmt(r.profit)}` : ''})`);
+      this.note(`${f.label} : achat jusqu'à ${fmt(r.buyPrice)}, vente ${fmt(r.sellPrice)} (${how} : ${fmt(r.targetProfit)}${r.profit < r.targetProfit ? `, profit réduit à ${fmt(r.profit)}` : ''})`);
       return true;
     }
-    async settleBids(items, bids) {
+    async settleBids(items, bids, memberOf) {
       this.setActivity(items.length > 1 ? `Achat de ${items.length} cartes…` : `Achat de ${label(items[0])} à ${fmt(items[0].buyNow)}…`);
       const results = await Promise.all(bids);
       const won = [];
@@ -744,14 +960,15 @@
           this.run.snipes++;
           this.session.snipes++;
           const id = Number(it.raw?.id);
-          const defId = it.defId || this.filter.defId || 0;
+          const m = memberOf(it);
+          const defId = it.defId || Number(m?.defId) || 0;
           if (id) {
             this.snipes[id] = { defId, label: name, price: it.buyNow, at: Date.now() };
             save(K_SNIPES, this.snipes);
           }
           this.note(`Snipé ${name} à ${fmt(it.buyNow)} ! (${ageText(it.expires)}, réponse en ${ms} ms)`, 'snipe');
           if (this.cfg.snipeSound) X.beep();
-          if (defId && this.hooks.onSnipe(defId) && this.filter.album && this.filter.defId === defId) this.albumDone = true;
+          if (defId && this.hooks.onSnipe(defId) && m?.album && Number(m.defId) === defId) this.albumDone.add(m.id);
           won.push(it);
         } else if (res.status === 401 || X.BAD_STATUS.has(res.status)) fatal ??= res.status;
         else if (X.MISS_STATUS.has(res.status)) {
@@ -770,10 +987,9 @@
       return won;
     }
     // Après un snipe : revente au prix calculé (prix revérifié si la carte diffère de la cible ou si le prix date)
-    async afterSnipe(it, single, checked) {
-      const f = this.filter;
+    async afterSnipe(it, f, single, checked) {
       const name = label(it);
-      const defId = it.defId || f.defId || 0;
+      const defId = it.defId || Number(f.defId) || 0;
       if (!this.cfg.sellAfterSnipe) return await this.moveTransfer(it.raw, name), false;
       let sell = f.sellPrice;
       let repriced = false;
@@ -784,7 +1000,7 @@
           p = await this.priceCheck({ defId, criteria: null }, name);
           checked.add(defId);
           if (p) this.prices[defId] = { ...p, at: Date.now() };
-          if (p && f.defId === defId) repriced = this.applyPrices(f, p.lowest, p.minPrice);
+          if (p && Number(f.defId) === defId) repriced = this.applyPrices(f, p.lowest, p.minPrice);
         }
         const r = p ? this.computePrices(p.lowest, p.minPrice) : null;
         sell = r && r.status !== 'belowListable' ? r.sellPrice : 0;

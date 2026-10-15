@@ -38,12 +38,13 @@
         X.saveConfig(this.cfg);
         onUpdate();
       },
-      // Cibles : copie du sniper pendant qu'il tourne, sinon celles des réglages
+      // Cibles : copie du sniper pendant qu'il tourne (ou vérifie leurs prix), sinon celles des réglages
+      liveTargets: () => sniper.running && (sniper.task === 'snipe' || sniper.task === 'scan'),
       targets() {
-        return sniper.running && sniper.task === 'snipe' ? sniper.filters : X.parseFilters(this.cfg.snipeFilters);
+        return this.liveTargets() ? sniper.filters : X.parseFilters(this.cfg.snipeFilters);
       },
       editTargets(fn) {
-        const live = sniper.running && sniper.task === 'snipe';
+        const live = this.liveTargets();
         const list = live ? sniper.filters : X.parseFilters(this.cfg.snipeFilters);
         let active = live ? sniper.idx : this.cfg.activeFilter;
         active = fn(list, active) ?? active;
@@ -62,19 +63,37 @@
           return sniper.running ? active : list.length - 1;
         });
       },
+      // Joueur retiré : enlevé de ses groupes, groupe supprimé s'il lui reste moins de 2 joueurs
       removeTarget(id) {
         this.editTargets((list, active) => {
           const n = list.findIndex((f) => f.id === id);
           if (n < 0 || (sniper.running && sniper.task === 'snipe' && n === active)) return active;
+          const keep = list[active]?.id;
           list.splice(n, 1);
-          return n < active ? active - 1 : active;
+          X.pruneGroups(list);
+          return Math.max(0, list.findIndex((f) => f.id === keep));
         });
+      },
+      // Groupe des joueurs cochés (prix scannés et compatibles) : nouvelle entrée de la liste, sélectionnée
+      createGroup(ids) {
+        let made = null;
+        this.editTargets((list, active) => {
+          const members = ids.map((id) => list.find((f) => f.id === id)).filter(Boolean);
+          if (!X.groupCheck(members).ok) return active;
+          const dup = list.find((g) => X.isGroup(g) && g.members.length === members.length && members.every((m) => g.members.includes(m.id)));
+          if (dup) return sniper.running ? active : list.indexOf(dup);
+          made = { id: `g${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, kind: 'group', label: members.map((m) => m.label).join(' + '), members: members.map((m) => m.id), auto: true };
+          list.push(made);
+          return sniper.running ? active : list.length - 1;
+        });
+        if (made) sniper.note(`Groupe créé : ${made.label}`);
+        return made;
       },
       setActiveTarget(n) {
         if (!sniper.running) this.setConfig({ activeFilter: n });
       },
       patchTarget(id, patch) {
-        if (sniper.running && sniper.task === 'snipe') return;
+        if (this.liveTargets()) return;
         this.editTargets((list) => {
           const f = list.find((x) => x.id === id);
           if (f) Object.assign(f, patch);
@@ -105,6 +124,7 @@
         this.editTargets((list) => {
           const keep = list.filter((f) => !f.album);
           list.splice(0, list.length, ...keep);
+          X.pruneGroups(list);
           return 0;
         });
       },
@@ -130,6 +150,9 @@
       },
       relist() {
         void sniper.relistTransferList();
+      },
+      scanPrices() {
+        void sniper.scanPrices();
       },
       unlock() {
         sniper.unlock();
