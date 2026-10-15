@@ -1,0 +1,18 @@
+:root { color-scheme: dark; }
+body { color: #e8e8e8; background: #15171c; width: 290px; margin: 0; font: 13px/1.4 system-ui, sans-serif; }
+main { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+h1 { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 15px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #555; }
+.dot.on { background: #3ddc84; } .dot.lock { background: #ffb347; }
+.muted { color: #8a92a3; margin: 0; font-size: 12px; }
+.activity { color: #c9cfdb; margin: 0; font-size: 12px; min-height: 1.4em; }
+dl { display: grid; grid-template-columns: 1fr auto; gap: 3px 10px; margin: 0; }
+dt { color: #a9b1c2; } dd { margin: 0; text-align: right; font-weight: 600; }
+.market { margin: 0; padding: 6px 8px; border-radius: 6px; background: #1b1e25; border-left: 4px solid; font-size: 12px; }
+.market.inactive { border-color: #ff6b6b; } .market.semi { border-color: #e0c341; } .market.active { border-color: #3ddc84; }
+.row { display: flex; gap: 6px; }
+button { flex: 1; font: inherit; font-weight: 600; cursor: pointer; border: 0; border-radius: 6px; padding: 9px; color: #e8e8e8; background: #2a2e37; }
+button:hover:not(:disabled) { filter: brightness(1.15); }
+button:disabled { opacity: .4; cursor: default; }
+.go { background: #3ddc84; color: #0b1118; } .stop { background: #c92a2a; color: #fff; }
+.on-btn { background: #00caf6; color: #0b1118; } .ghost { background: #1b1e25; }

@@ -1,39 +1,46 @@
-# Extensions FC 27 Web App
+# FC27 Trader
 
-- `SnipeFC27/` : autobuyer existant (achat sous le prix, revente avec marge).
-- `AlbumFC27/` : complète les sets de la **Galerie** FC 27 importés depuis fut.gg, avec la méthode du « Gallery Solver » de FUT Simple Trader (statut Galerie lu chez EA, prix de référence du marché, achat avec tolérance en paliers, revente ou club). Interface : calque plein écran façon FST. Le catalogue de sets, les scores, grades, tags, planificateur et composition de FST viennent de son serveur payant : non repris, les sets restent importés depuis fut.gg.
+Extension Chrome unique pour la Web App FC 27 : fusion de SnipeFC27 (0.6.2) et AlbumFC27 (3.3). Elle remplace les deux anciennes extensions : désinstalle-les avant de charger celle-ci (les réglages, cibles, sets et statistiques sont repris automatiquement, même stockage).
 
-## AlbumFC27 : utilisation
+## Installation
 
-1. Chrome > `chrome://extensions` > Mode développeur > Charger l'extension non empaquetée > dossier `AlbumFC27` (« Recharger » après mise à jour).
-2. Ouvrir la Web App FC 27 : bouton « AlbumFC27 » en bas à gauche. Il ouvre le calque plein écran façon FUT Simple Trader (onglets Galerie, Ventes, Journal, Réglages ; bandeau d'activité avec bouton Arrêter pendant une tâche). Le popup de l'extension l'ouvre ou le ferme aussi.
-3. **Importer** : à l'ouverture de la Web App, tous les sets de la Galerie fut.gg sont importés automatiquement (catalogue relu au plus toutes les 6 h ; case « Importer tous les sets de la Galerie à l'ouverture » dans Réglages). Le service worker lit `https://www.fut.gg/fut-gallery/`, ses catégories, chaque set et ses pages suivantes (`?page=`), avec le même parseur que le bouton fut.gg ; le statut Galerie des nouveaux sets est ensuite lu chez EA. Tuile « ↻ Réimporter tous les sets fut.gg » pour forcer la relecture. Un set retiré (×) n'est plus réimporté par le catalogue ; un envoi manuel le rétablit. Import manuel toujours possible : tuile « + Importer un set fut.gg », ouvrir un set de la Galerie, cliquer « Envoyer à AlbumFC27 » (le calque s'ouvre sur le set ; renvoyer un set le met à jour). Chaque set est une tuile (joueurs, cartes requises, collectés x / y, reste à acheter au prix fut.gg).
-4. **Set** : onglets Tous / Collectés / Manquants, recherche, pages de 36 cartes. Les cartes sont rendues par la Web App (même méthode que FST). Le statut Galerie est lu chez EA à l'entrée du set (si la dernière lecture date de plus de 5 min) et via « ↻ Synchronisé il y a… » : requête `GET /ut/game/fc27/defid?type=player&defId=…` (champ `isCollected`, 250 joueurs par requête), aussi avant chaque lot d'achats. Un joueur acheté mais non collecté selon EA redevient manquant (signalé dans le journal).
-5. **Sélectionner** : clic sur une carte manquante (« Tout sélectionner » pour tout le set). Barre du bas : projection de coût selon « Après achat » (achat, revente nette, taxe EA 5 %, coût réel, pire cas avec l'écart max, cartes couvertes par le solde), « Effacer », « Acheter maintenant ». La même projection figure dans le Résumé de la fenêtre d'achat.
-6. **Fenêtre « Acheter des cartes Galerie »** (FST) : liste des cartes (clic = inclure / retirer, prix de départ modifiable, vide = vérifié sur le marché), « Vérifier sur la Web App » (prix de départ = 4e annonce la moins chère parmi celles publiées depuis plus d'une minute ; page pleine : recherche dichotomique, 10 recherches max), Résumé (cartes, coût, maximum avec la hausse, solde), **Écart max** (Auto = 3 paliers EA, ou Manuel 0–10), **Après achat** (Garder au club, Revendre au prix d'achat par défaut, Revendre avec marge +5 %) avec le retour estimé après taxe. Un seul bouton lance tout : « Vérifier, acheter & remettre en vente N cartes » (prix manquants vérifiés d'abord) ou « Acheter N cartes ».
-7. **Achat** (boucle de FST) : recherche de la carte exacte au prix de départ, achat de l'une des 2 annonces les moins chères. Aucune annonce : prix relevé d'un palier EA par recherche jusqu'à l'écart max ; au-delà, « Prix monté » avec le prix vu. 2 achats ratés : fenêtre de prix décalée d'un palier ; 6 ratés : « Surenchéri » ; 10 recherches max par joueur. Mise en vente 1 h bornée à la fourchette de prix EA ; liste de transferts pleine ou échec : au club. Achats un par un, du moins cher au plus cher. Solde insuffisant : le lot attend les ventes de la liste de transferts (encaissement toutes les 2 min) puis reprend ; sans carte en vente (ou en « Garder au club »), la carte est sautée (« Crédits insuffisants ») et reste sélectionnée. Statut de chaque carte en direct dans la fenêtre et sur la carte. Bilan : « Achetés · mis en vente · échecs · sautés », bouton « Racheter N cartes sautées au prix vu », « Reprendre » si arrêté avant la fin.
-8. **Quick snipe** (bouton sur chaque carte manquante, comme FST) : prix du marché (même sondage), puis recherches rapides (2–4 s, ralenties après une limite EA) pendant 4 min, achat sous prix × 0,95 − 300 (profit minimum 300), arrêt au premier achat, mise en vente au prix du marché. Prix min relevé d'un palier à chaque recherche (cache EA), remis à zéro après 10 paliers.
-9. **Récapitulatif des coûts** : coût réel = taxe EA 5 % en revente au prix d'achat, prix payé si gardé au club.
-10. **Vitesse** (onglet Réglages) : préréglages Prudent (7–12 s), Normal (4–8 s), Rapide (2–4 s), ou délais personnalisés entre recherches et avant achat. Ralentissement après limite EA réglable : multiplicateur à chaque limite (×1,5 par défaut, 1 = jamais), plafond (×4), retour au rythme normal après N min sans limite (30), bouton « Revenir au rythme normal ». Appliqué immédiatement, y compris pendant les achats et le relist.
-11. **Relister** (onglet Ventes ou popup) : encaisse les ventes, puis pour chaque joueur invendu de la liste de transferts (acheté par AlbumFC27 ou non), sonde le marché (même sondage que « Vérifier les prix ») et le remet en vente au prix de l'annonce la moins chère vue, bornée à la fourchette EA (aucune annonce : prix précédent). Une carte que la Web App n'a pas chargée est remise en vente par la même requête que la Web App (identifiant de carte, session EA déjà ouverte). Les échecs sont remis en vente en bloc à leur prix précédent. Les annonces en cours ne peuvent pas être modifiées (règle EA) : elles sont relistables à leur expiration.
+`chrome://extensions` > Mode développeur > Charger l'extension non empaquetée > dossier `FC27Trader` (« Recharger » après mise à jour).
 
-## Onglet Ventes
+## Interface
 
-- Coût réel = perte réalisée (prix d'achat − net encaissé) + perte en attente (sur les joueurs encore en vente, au prix affiché). Les joueurs gardés au club comptent pour leur prix payé (aussi détaillés dans la tuile « Dépensé »).
-- En vente (valeur, invendus), vendus / achetés, crédits récupérés, dépensé, taxe payée. Liste des joueurs en vente, invendus en tête.
+- **Bouton flottant** (bas à gauche) : état en direct, bouton ▶ / ■ pour lancer ou arrêter le sniper, clic pour ouvrir le panneau.
+- **Panneau** : onglets Sniper, Galerie, Ventes, Journal, Réglages. Un bandeau unique montre la tâche en cours avec un seul bouton **Arrêter** (et « Lever la pause » pendant une pause anti-captcha).
+- **Popup** de l'extension : état, crédits, profit, lancer / arrêter le sniper, alternance, relister, ouvrir le panneau.
 
-## Garde-fous
+## Sniper (moteur SnipeFC27)
 
-- Quotas réglables dans l'onglet Réglages (0 = illimité), cumulés avec SnipeFC27 : recherches par heure, recherches et achats par 24 h (tous désactivés par défaut) ; refus de démarrer si SnipeFC27 tourne.
-- Pauses après refus EA réglables dans l'onglet Réglages (0 = aucune, défaut) : après une limite de débit (426, 429, 512, 521, ou 8 achats ratés d'affilée) et après un captcha (458, 460, 494). À 0, le process reprend après le délai normal entre recherches ; une pause enregistrée par une version précédente est levée au démarrage. Valeur > 0 : doublée si ça se répète (max 30 min pour les limites, 2 h pour les captchas).
-- Captcha : notification (au plus une toutes les 10 min). Le captcha n'est pas résolu automatiquement : tant qu'il n'est pas résolu dans la Web App, les requêtes échouent et le process réessaie en boucle.
-- Session expirée : rechargement de la Web App, clic sur le bouton de connexion si la session EA est encore ouverte, reprise des achats.
-- Joueurs déjà dans la Galerie (`isCollected` de la requête `/defid` et des réponses EA) : ignorés.
+1. Onglet Sniper > **Cibles** : chercher un joueur, « + Filtre de la Web App », ou ajouter des cartes manquantes depuis la Galerie (🎯).
+2. **Lancer le sniper**. Prix automatiques : achat un palier sous la moins chère du marché, baissé jusqu'au profit visé (2 % du prix, 150 minimum, ou profit min réglé), revente 1 h jamais sous le prix d'achat taxe comprise.
+3. **Alterner les cibles** (remplace le mode nuit) : change de cible toutes les 450 à 900 recherches.
+
+Fonctionnement continu, toujours actif : le sniper attend au lieu de s'arrêter (crédits insuffisants, liste de transferts pleine, quota anti-ban, cible sans prix rentable), reprend après rechargement de la Web App (session expirée, connexion automatique si la session EA est ouverte), après une tâche Galerie et après une pause. Pendant ses pauses : ventes encaissées, non-assignés rangés, snipes invendus remis en vente.
+
+Hésitations : 8 % des recherches, +0,5 à 1,5 s (au lieu de +1 à 4 s).
+
+## Galerie (AlbumFC27)
+
+- Sets de la Galerie fut.gg importés à l'ouverture (au plus toutes les 6 h), ou un par un avec le bouton « Envoyer à FC27 Trader » sur fut.gg. Statut collecté lu chez EA.
+- Sélectionner les cartes manquantes, puis au choix :
+  - **🎯 Sniper** : les cartes deviennent des cibles du sniper (alternance activée, sniper lancé). Achat sous le prix du marché, revente avec profit : la Galerie se remplit en gagnant des crédits, plus lentement. Une carte obtenue est retirée des cibles.
+  - **Acheter maintenant** : achat direct au prix du marché (méthode FST : 4e annonce la moins chère, écart max en paliers), puis revente au prix d'achat, avec marge ou club. Rapide, coût = taxe EA 5 %. Le sniper est suspendu pendant les achats puis reprend seul. En fin de lot, les cartes non achetées peuvent être envoyées au sniper.
+
+## Ventes
+
+Un seul **Relister les invendus** (sniper arrêté) : remet chaque invendu un palier sous la moins chère du marché, jamais sous le prix d'achat (taxe comprise pour un snipe, prix payé pour une carte Galerie). Suivi du sniper (profit réel, par heure, en attente, snipes, recherches, temps), coût réel de la Galerie, dernières ventes.
+
+## Garde-fous (communs à toutes les tâches)
+
+- Une seule tâche EA à la fois.
+- Limites anti-ban (Prudent 600 recherches / h, 3 000 / 24 h, 120 achats / h, 600 / 24 h ; ou Stevie), délais et pauses réglables dans Réglages.
+- Captcha ou limite EA (426, 429, 458, 460, 494, 512, 521, marché vide sans filtre) : pause de 30 à 60 min puis reprise automatique, doublée si ça se répète dans les 24 h (4 h max), notification système. Un captcha affiché doit être résolu à la main dans la Web App.
 
 ## Limites connues
 
-- Import basé sur la page fut.gg affichée (liens `/players/…/27-<defId>`, prix à côté de l'icône crédit) : un changement de mise en page fut.gg peut le casser.
-- Catalogue automatique : lit le HTML renvoyé par le serveur fut.gg (sans exécuter la page). Si fut.gg charge les joueurs ou les prix uniquement côté navigateur, ou si une protection anti-bot bloque la requête, les sets concernés sont ignorés (« page(s) sans joueur » ou « Catalogue fut.gg indisponible » dans le journal) : l'import manuel reste utilisable. Testé sur des pages fut.gg simulées uniquement.
-- Sets stockés dans le `localStorage` de la Web App (~5 Mo) : un catalogue très volumineux peut le saturer (signalé dans le journal).
-- Que l'achat suffise à compter le joueur dans le set est contrôlé a posteriori par la lecture `/defid` (« Achetés mais absents de la Galerie selon EA » dans le journal) ; la requête `/defid` n'a été testée que sur une Web App simulée.
+- Testé sur une Web App simulée uniquement (moteurs, suspension et reprise, ventes, relist, pause captcha).
+- Import fut.gg dépendant de la mise en page de fut.gg.
 - L'automatisation de la Web App est contraire aux conditions d'EA : risque de restriction du marché ou du compte.

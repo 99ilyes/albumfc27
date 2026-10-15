@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "AlbumFC27",
-  "version": "3.3.0",
-  "description": "Complète les sets de la Galerie FC 27 (catalogue fut.gg importé à l'ouverture) avec la méthode de FUT Simple Trader : statut Galerie lu chez EA, prix de référence du marché, achat avec tolérance en paliers, revente ou club.",
+  "name": "FC27 Trader",
+  "version": "1.0.0",
+  "description": "Web App FC 27 : sniper qui tourne sans interruption pour gagner des crédits, et remplissage automatique des sets de la Galerie (catalogue fut.gg).",
   "action": {
     "default_popup": "popup.html",
-    "default_title": "AlbumFC27",
+    "default_title": "FC27 Trader",
     "default_icon": {
       "16": "icon-16.png",
       "48": "icon-48.png"
@@ -27,7 +27,11 @@
         "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*"
       ],
       "js": [
-        "main.js"
+        "core.js",
+        "sniper.js",
+        "album.js",
+        "ui.js",
+        "boot.js"
       ],
       "world": "MAIN",
       "run_at": "document_idle"

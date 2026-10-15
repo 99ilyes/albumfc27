@@ -3,7 +3,7 @@
   chrome.runtime.onMessage.addListener((cmd) => toPage(cmd));
   window.addEventListener('message', (e) => {
     if (e.source !== window || e.data?.ns !== 'albumfc27' || e.data.dir !== 'to-ext') return;
-    if (e.data.stats) chrome.storage.local.set({ albumStats: e.data.stats });
+    if (e.data.stats) chrome.storage.local.set({ fc27Stats: e.data.stats });
     if (e.data.notify) chrome.runtime.sendMessage({ type: 'notify', ...e.data.notify }).catch(() => {});
     if (e.data.catalog) void syncCatalog(!!e.data.catalog.force);
   });
