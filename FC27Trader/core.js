@@ -119,7 +119,6 @@
     activeFilter: 0,
     sellAfterSnipe: true,
     rotate: false,
-    groupSearch: true,
     rotateEvery: 1,
     breakPreset: 'safe',
     delayPreset: 'safe',
@@ -334,6 +333,46 @@
       rarity: num(i?.rareflag ?? i?._rareflag),
       level: r === null || r <= 0 ? null : r >= 75 ? 'gold' : r >= 65 ? 'silver' : 'bronze',
     };
+  };
+  // Groupe de cibles du sniper : joueurs aux prix scannés, critères communs (club, ligue, nation, rareté spéciale) et
+  // prix compatibles (achat le plus haut sous l'annonce la moins chère de chacun, sinon leurs annonces normales rempliraient la page)
+  X.GROUP_MAX = 6;
+  X.isGroup = (f) => f?.kind === 'group';
+  X.groupable = (f) => !!(f && !X.isGroup(f) && f.auto && f.defId && !f.criteria);
+  X.groupCheck = (members) => {
+    if (members.length < 2) return { ok: false, reason: 'Coche au moins 2 joueurs' };
+    if (members.length > X.GROUP_MAX) return { ok: false, reason: `${X.GROUP_MAX} joueurs max par groupe` };
+    const fixed = members.filter((m) => !X.groupable(m));
+    if (fixed.length) return { ok: false, reason: `${fixed.map((m) => m.label).join(', ')} : prix fixés ou filtre de la Web App, impossible à grouper` };
+    const todo = members.filter((m) => !m.buyPrice || !m.lowest || !m.card);
+    if (todo.length) return { ok: false, reason: `Prix à scanner : ${todo.map((m) => m.label).join(', ')}` };
+    const crit = {};
+    for (const k of ['club', 'league', 'nation', 'rarity', 'level']) {
+      const v = members[0].card[k];
+      crit[k] = v !== null && v !== undefined && (k === 'level' || v > 0) && members.every((m) => m.card[k] === v) ? v : null;
+    }
+    if (!crit.club && !crit.league && !crit.nation && !(crit.rarity >= 2)) {
+      const none = members.every((m) => !m.card.club && !m.card.league && !m.card.nation);
+      return { ok: false, reason: none ? 'Club, ligue et nation introuvables dans la Web App' : 'Aucun club, ligue, nation ou rareté spéciale en commun' };
+    }
+    const top = members.reduce((a, m) => (m.buyPrice > a.buyPrice ? m : a));
+    const low = members.reduce((a, m) => (m.lowest < a.lowest ? m : a));
+    if (top.buyPrice >= low.lowest)
+      return { ok: false, reason: `Prix incompatibles : achat jusqu'à ${fmt(top.buyPrice)} (${top.label}) au-dessus de l'annonce la moins chère de ${low.label} (${fmt(low.lowest)})` };
+    const same = [crit.club && 'club', crit.league && 'ligue', crit.nation && 'nation', crit.rarity && 'rareté'].filter(Boolean);
+    return { ok: true, crit, top: top.buyPrice, low: Math.min(...members.map((m) => m.buyPrice)), text: `même ${same.join(', ')}` };
+  };
+  // Joueurs retirés : enlevés de leurs groupes, groupes de moins de 2 joueurs supprimés ; renvoie les groupes supprimés
+  X.pruneGroups = (list) => {
+    const ids = new Set(list.filter((f) => !X.isGroup(f)).map((f) => f.id));
+    const gone = [];
+    for (let n = list.length - 1; n >= 0; n--) {
+      const g = list[n];
+      if (!X.isGroup(g)) continue;
+      g.members = g.members.filter((id) => ids.has(id));
+      if (g.members.length < 2) gone.push(...list.splice(n, 1));
+    }
+    return gone;
   };
   // Recherche du sniper : filtre (joueur ou critères copiés de la Web App), bornes de prix variées pour éviter le cache EA
   X.searchFilter = (filter, range) => {

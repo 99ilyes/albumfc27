@@ -10,24 +10,25 @@ Extension Chrome unique pour la Web App FC 27 : fusion de SnipeFC27 (0.6.2) et A
 
 - **Bouton flottant** (bas à gauche) : état en direct, bouton ▶ / ■ pour lancer ou arrêter le sniper, clic pour ouvrir le panneau.
 - **Panneau** : onglets Sniper, Galerie, Ventes, Journal, Réglages. Un bandeau unique montre la tâche en cours avec un seul bouton **Arrêter** (et « Lever la pause » pendant une pause anti-captcha).
-- **Popup** de l'extension : état, crédits, profit, lancer / arrêter le sniper, cibles cherchées (cochée ou toutes), relister, ouvrir le panneau.
+- **Popup** de l'extension : état, crédits, profit, lancer / arrêter le sniper, alternance, relister, ouvrir le panneau.
 
 ## Sniper (moteur SnipeFC27)
 
-1. Onglet Sniper > **Cibles** : chercher un joueur, « + Filtre de la Web App », ou ajouter des cartes manquantes depuis la Galerie (🎯). Cliquer une cible la coche : ses prix s'affichent dans « Prix de la cible ».
-2. **Cibles cherchées** (onglet Sniper) :
-   - **Cible cochée** : seule la cible cochée est cherchée, ou son groupe si elle en fait partie.
-   - **Toutes** : les cibles (et groupes) l'un après l'autre, N recherches chacun (Réglages > Plusieurs cibles, 1 par défaut). Chaque cible garde sa fenêtre de cache EA (31 s) : plus d'attente de résultats frais. Cible sans prix rentable ignorée 10 min, cible trop chère pour les crédits sautée.
-3. **Prix et groupes** (optionnel, bouton du bloc Cibles) : vérifie le prix de toutes les cibles et forme les groupes sans lancer le sniper. Résultat repris au lancement pendant 15 min (de même au redémarrage du sniper dans les 15 min). Sinon, fait automatiquement au lancement.
-4. **Lancer le sniper**. Prix automatiques : achat un palier sous la moins chère du marché, baissé jusqu'au profit visé (2 % du prix, 150 minimum, ou profit min réglé), revente 1 h jamais sous le prix d'achat taxe comprise. Prix revérifiés par cible (toutes les N recherches de cette cible, toutes les 15 min, après un snipe).
+1. Onglet Sniper > **Cibles** : chercher un joueur, « + Filtre de la Web App », ou ajouter des cartes manquantes depuis la Galerie (🎯).
+2. **Sélectionner** (rond) un joueur ou un groupe : c'est ce que le sniper cherche.
+3. **Lancer le sniper**. Prix automatiques : achat un palier sous la moins chère du marché, baissé jusqu'au profit visé (2 % du prix, 150 minimum, ou profit min réglé), revente 1 h jamais sous le prix d'achat taxe comprise. Prix revérifiés toutes les N recherches, toutes les 15 min et après un snipe.
 
-### Groupes (Réglages > Plusieurs cibles > Grouper les cibles, actif par défaut, valable dans les deux modes)
+### Groupes : plusieurs joueurs en une recherche
 
-Une seule recherche pour plusieurs cibles automatiques : même club, puis ligue, nation ou rareté spéciale, et prix compatibles (prix d'achat le plus haut du groupe sous l'annonce la moins chère de chaque membre). Recherche sur les critères communs et une fourchette de prix ; seules les cartes ciblées sont achetées, chacune sous son propre prix d'achat. 6 cibles max par groupe.
+1. **Scanner les prix** (bouton du bloc Cibles) : moins chère du marché, prix d'achat, club, ligue, nation et rareté de chaque joueur en prix automatiques, sans lancer le sniper. Prix de moins de 15 min repris au lancement.
+2. **Cocher** les joueurs à grouper. La barre sous la liste dit s'ils sont compatibles : critère commun (club, ligue, nation ou rareté spéciale) et prix compatibles (prix d'achat le plus haut sous l'annonce la moins chère de chacun, sinon leurs annonces normales rempliraient la page). 6 joueurs max.
+3. **Créer le groupe** : nouvelle entrée de la liste, sélectionnée. Lancer le sniper.
 
-- Calibrage : prix min essayé à 60, 75 puis 90 % du prix d'achat le plus bas, retenu si la page compte au plus 3 cartes hors cibles et moins de 18 résultats ; sinon recherches séparées, nouvel essai 1 h plus tard.
-- En cours de route : page saturée, ou plus de 6 cartes hors cibles 3 fois d'affilée, recalibrage plus haut, sinon groupe défait. Prix devenus incompatibles : groupe défait. Regroupement tenté toutes les 30 min.
-- Bilan sous la liste des cibles (groupes, cibles seules) ; raison de chaque cible ou paire non groupée dans le journal (prix fixés, filtre de la Web App, aucun attribut commun, prix incompatibles, calibrage refusé).
+Le groupe fait une seule recherche sur les critères communs et une fourchette de prix ; seules ses cartes sont achetées, chacune sous son propre prix d'achat. Au lancement, prix min calibré à 60, 75 puis 90 % du prix d'achat le plus bas, retenu si la page compte au plus 3 cartes hors cibles. En cours de route : page saturée ou trop de cartes hors cibles, recalibrage plus haut ; calibrage impossible ou prix devenus incompatibles, groupe mis en attente 10 min. Un joueur retiré est enlevé de ses groupes (groupe supprimé s'il lui reste moins de 2 joueurs).
+
+### Alterner (onglet Sniper)
+
+Désactivé : seule la sélection est cherchée. Activé : toutes les cibles et groupes l'un après l'autre (les joueurs d'un groupe sont cherchés via le groupe), N recherches chacun (Réglages > Alternance, 1 par défaut). Chaque cible garde sa fenêtre de cache EA (31 s) : plus d'attente de résultats frais. Cible sans prix rentable ignorée 10 min, cible trop chère pour les crédits sautée.
 
 Fonctionnement continu, toujours actif : le sniper attend au lieu de s'arrêter (crédits insuffisants, liste de transferts pleine, quota anti-ban, cible sans prix rentable), reprend après rechargement de la Web App (session expirée, connexion automatique si la session EA est ouverte), après une tâche Galerie et après une pause. Pendant ses pauses : ventes encaissées, non-assignés rangés, snipes invendus remis en vente.
 
