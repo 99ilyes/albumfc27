@@ -22,13 +22,13 @@ function render(s) {
   s ??= {};
   const q = s.queue ?? {};
   const t = s.total ?? {};
-  const real = (t.lost ?? 0) + (s.pendingLoss ?? 0);
+  const real = (t.lost ?? 0) + (s.pendingLoss ?? 0) + (t.keptSpent ?? 0);
   const locked = (s.lockedUntil ?? 0) > Date.now();
   const hm = (x) => new Date(x).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const rows = [
     ['Crédits', s.coins == null ? '?' : fmt(s.coins)],
     ['Sets', s.sets?.length ? s.sets.join(', ') : '-'],
-    ['Dernier lot', q.total ? `${fmt(q.done)} / ${fmt(q.total)}${q.failed ? ` (${q.failed} non trouvé)` : ''}` : '-'],
+    ['Dernier lot', q.total ? `${fmt(q.done)} / ${fmt(q.total)}${q.failed ? ` (${q.failed} non acheté)` : ''}` : '-'],
     ['En vente', `${fmt(s.onSale)}${s.unsold ? ` (${s.unsold} invendu)` : ''}`],
     ['Coût réel', real < 0 ? `gain ${fmt(-real)}` : fmt(real)],
   ];
@@ -45,7 +45,7 @@ function render(s) {
         ? el('button', { className: 'stop', textContent: 'Arrêter', onclick: () => send({ type: 'stop' }) })
         : el('button', { className: 'start', textContent: `Relister les invendus${s.unsold ? ` (${s.unsold})` : ''}`, onclick: () => send({ type: 'relist' }) }),
     ),
-    el('button', { className: 'ghost', textContent: 'Afficher / masquer le panneau', onclick: () => send({ type: 'toggle-panel' }) }),
+    el('button', { className: 'ghost', textContent: 'Ouvrir / fermer AlbumFC27', onclick: () => send({ type: 'toggle-panel' }) }),
   );
 }
 
