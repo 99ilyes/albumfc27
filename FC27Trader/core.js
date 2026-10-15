@@ -27,8 +27,8 @@
     return Math.max(Math.ceil(m / step(m)) * step(m), tickUp(p));
   };
 
-  // Prix du sniper : vente un palier sous la moins chère (ou X % au-dessus si réglé), achat un palier sous la moins chère baissé jusqu'au profit visé (2 % du prix, 150 min)
-  function computePrices({ lowestOnMarket, minPrice, sellMarkupPct }) {
+  // Prix du sniper : vente un palier sous la moins chère (ou X % au-dessus si réglé), achat un palier sous la moins chère baissé jusqu'au profit visé (2 % du prix, 150 min), plafonné à X % sous la moins chère si réglé
+  function computePrices({ lowestOnMarket, minPrice, sellMarkupPct, buyDiscountPct }) {
     const under = priceDown(lowestOnMarket);
     const sell = sellMarkupPct > 0 ? markupPrice(lowestOnMarket, sellMarkupPct) : under;
     const s = step(lowestOnMarket);
@@ -38,6 +38,12 @@
     if (minPrice && under < floor) return { ...base, status: 'belowListable' };
     let buy = under;
     for (let i = 0; i < 5e3 && buy > Math.max(floor, 150) && profitOf(buy, sell) < target; i++) buy = priceDown(buy);
+    if (buyDiscountPct > 0) {
+      const m = lowestOnMarket * (1 - buyDiscountPct / 100);
+      const cap = Math.floor(m / step(m)) * step(m);
+      if (cap < Math.max(floor, 150)) return { ...base, status: 'belowListable' };
+      buy = Math.min(buy, cap);
+    }
     const profit = profitOf(buy, sell);
     return { ...base, status: profit > 0 ? 'ok' : 'noProfit', buyPrice: buy, profit };
   }
@@ -129,6 +135,7 @@
     mistakePrevention: true,
     recheckEvery: 50,
     sellMarkupPct: 0,
+    buyDiscountPct: 0,
     snipeSound: true,
     limitsPreset: 'prudent',
     maxBuysPerSearch: 2,

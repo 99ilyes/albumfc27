@@ -710,7 +710,7 @@
       if (r.success && !r.data.length) this.lockout('Aucune annonce même sans filtre : marché restreint par EA (soft ban probable)');
     }
     computePrices(lowest, minPrice) {
-      return X.computePrices({ lowestOnMarket: lowest, minPrice, sellMarkupPct: this.cfg.sellMarkupPct });
+      return X.computePrices({ lowestOnMarket: lowest, minPrice, sellMarkupPct: this.cfg.sellMarkupPct, buyDiscountPct: this.cfg.buyDiscountPct });
     }
     async priceFilter(f) {
       const p = await this.priceCheck(f, f.label);
@@ -722,13 +722,14 @@
       this.pricedAt = Date.now();
       const r = this.computePrices(lowest, minPrice);
       if (r.status !== 'ok') {
-        this.note(r.status === 'belowListable' ? `${f.label} : prix sous le minimum EA` : `${f.label} : aucun prix d'achat rentable`, 'error');
+        this.note(r.status === 'belowListable' ? `${f.label} : prix d'achat sous le minimum EA` : `${f.label} : aucun prix d'achat rentable`, 'error');
         return false;
       }
       f.buyPrice = r.buyPrice;
       f.sellPrice = r.sellPrice;
       this.saveFilters();
-      const how = this.cfg.sellMarkupPct > 0 ? `marché +${this.cfg.sellMarkupPct} %, ` : '';
+      const { sellMarkupPct: up, buyDiscountPct: down } = this.cfg;
+      const how = [down > 0 && `achat marché −${down} %`, up > 0 && `vente marché +${up} %`].filter(Boolean).map((t) => `${t}, `).join('');
       this.note(`Achat jusqu'à ${fmt(r.buyPrice)}, vente ${fmt(r.sellPrice)} (${how}profit ${fmt(r.profit)}${r.profit < r.targetProfit ? `, sous le profit visé de ${fmt(r.targetProfit)}` : ''})`);
       return true;
     }

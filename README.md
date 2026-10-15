@@ -15,7 +15,7 @@ Extension Chrome unique pour la Web App FC 27 : fusion de SnipeFC27 (0.6.2) et A
 ## Sniper (moteur SnipeFC27)
 
 1. Onglet Sniper > **Cibles** : chercher un joueur, « + Filtre de la Web App », ou ajouter des cartes manquantes depuis la Galerie (🎯).
-2. **Lancer le sniper**. Prix automatiques : achat un palier sous la moins chère du marché, baissé jusqu'au profit visé (2 % du prix, 150 minimum), revente un palier sous la moins chère ou X % au-dessus (réglage « Vente au-dessus du marché »), 1 h, jamais sous le prix d'achat taxe comprise.
+2. **Lancer le sniper**. Prix automatiques : achat un palier sous la moins chère du marché, baissé jusqu'au profit visé (2 % du prix, 150 minimum) ou plafonné à X % sous la moins chère (réglage « Achat sous le marché »), revente un palier sous la moins chère ou X % au-dessus (réglage « Vente au-dessus du marché »), 1 h, jamais sous le prix d'achat taxe comprise.
 3. **Alterner les cibles** (remplace le mode nuit) : change de cible toutes les 450 à 900 recherches.
 
 Fonctionnement continu, toujours actif : le sniper attend au lieu de s'arrêter (crédits insuffisants, liste de transferts pleine, quota anti-ban, cible sans prix rentable), reprend après rechargement de la Web App (session expirée, connexion automatique si la session EA est ouverte), après une tâche Galerie et après une pause. Pendant ses pauses : ventes encaissées, non-assignés rangés, snipes invendus remis en vente.

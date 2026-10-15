@@ -698,7 +698,7 @@
         ptitle.append(h('span', { className: 'a-block-hint', textContent: 'Automatique' }), toggle(!!f.auto, (v) => this.app.patchTarget(f.id, { auto: v }), snipe));
         const gain = f.buyPrice && f.sellPrice ? profitOf(f.buyPrice, f.sellPrice) : null;
         const line = h('div', { style: 'font-size:.82rem;color:#fff', textContent: f.buyPrice ? `Achat ≤ ${fmt(f.buyPrice)} · Vente ${fmt(f.sellPrice)}${gain === null ? '' : ` · Profit ${fmt(gain)}`}` : 'Prix calculés au lancement' });
-        if (f.auto) this.pricesEl.replaceChildren(ptitle, line, hint(`Achat un palier sous la moins chère du marché, baissé jusqu’au profit visé (2 % du prix, 150 min). Vente ${cfg.sellMarkupPct > 0 ? `${cfg.sellMarkupPct} % au-dessus de la moins chère` : 'un palier sous la moins chère'}. Prix revérifiés ${cfg.recheckEvery > 0 ? `toutes les ${cfg.recheckEvery} recherches, ` : ''}toutes les 15 min et après chaque snipe.`));
+        if (f.auto) this.pricesEl.replaceChildren(ptitle, line, hint(`Achat un palier sous la moins chère du marché, baissé jusqu’au profit visé (2 % du prix, 150 min)${cfg.buyDiscountPct > 0 ? `, au plus ${cfg.buyDiscountPct} % sous la moins chère` : ''}. Vente ${cfg.sellMarkupPct > 0 ? `${cfg.sellMarkupPct} % au-dessus de la moins chère` : 'un palier sous la moins chère'}. Prix revérifiés ${cfg.recheckEvery > 0 ? `toutes les ${cfg.recheckEvery} recherches, ` : ''}toutes les 15 min et après chaque snipe.`));
         else {
           const num = (k) => {
             const i = h('input', { type: 'number', className: 'a-in', min: '0', step: '50', value: String(f[k] || ''), disabled: snipe });
@@ -1404,6 +1404,7 @@
         ),
         block(
           'Sniper',
+          row('Achat sous le marché (%)', '0 = automatique (profit visé : 2 % du prix, 150 minimum), sinon prix d’achat max = moins chère − X % (arrondi au palier EA), 0 à 50', num('buyDiscountPct', 0, 50)),
           row('Vente au-dessus du marché (%)', '0 = un palier sous la moins chère du marché, sinon moins chère + X % (arrondi au palier EA), 0 à 50', num('sellMarkupPct', 0, 50)),
           row('Achats max par recherche', '1 à 5', num('maxBuysPerSearch', 1, 5)),
           row('Revérifier les prix toutes les N recherches', '0 = jamais (toujours toutes les 15 min et après un snipe)', num('recheckEvery')),
