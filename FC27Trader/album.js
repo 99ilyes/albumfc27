@@ -2,7 +2,7 @@
 // Garde-fous, délais et pause anti-captcha : ceux du moteur de sniping (communs)
 (function () {
   const X = globalThis.__fc27;
-  const { fmt: fmtNum, rand, sleep, load, save, errText, errMsg, roundPrice, tickUp, net: netOf } = X;
+  const { fmt: fmtNum, rand, sleep, load, save, errText, errMsg, roundPrice, tickUp, markupPrice, net: netOf } = X;
   const NS = X.ALBUM_NS;
   const BUY_SEARCHES = 10;
   const MAX_COMPETITION = 6;
@@ -33,11 +33,6 @@
   };
   // Prix plancher du sondage (FST) : or/argent/bronze selon la note pour les cartes communes et rares, 1 000 sinon
   const minPriceFor = (rareflag, rating) => (![0, 1].includes(Number(rareflag ?? 0)) ? 1e3 : Number(rating) >= 75 ? 350 : 200);
-  const markupPrice = (p, pct) => {
-    if (pct <= 0) return roundPrice(p);
-    const m = p * (1 + pct / 100);
-    return Math.max(Math.ceil(m / X.step(m)) * X.step(m), tickUp(p));
-  };
   // Annonce publiée depuis plus d'une minute (FST écarte les annonces toutes fraîches du prix de référence)
   const DURATIONS = [3600, 10800, 21600, 43200, 86400, 259200];
   const settled = (sr) => !Number.isFinite(sr) || Math.floor(((DURATIONS.find((d) => sr < d) ?? DURATIONS[DURATIONS.length - 1]) - sr) / 60) > 1;

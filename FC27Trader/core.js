@@ -21,8 +21,13 @@
   const roundPrice = (p) => Math.max(0, Math.round(p / step(p)) * step(p));
   const tickUp = (p) => roundPrice(p + step(p));
   const tickDown = (p) => Math.max(0, roundPrice(p - step(p - 1)));
+  const markupPrice = (p, pct) => {
+    if (pct <= 0) return roundPrice(p);
+    const m = p * (1 + pct / 100);
+    return Math.max(Math.ceil(m / step(m)) * step(m), tickUp(p));
+  };
 
-  // Prix du sniper : achat un palier sous la moins chère, baissé jusqu'au profit visé (2 % du prix, 150 min, ou profit min choisi)
+  // Prix du sniper (logique Stevie's Sniper) : vente un palier sous la moins chère, achat baissé palier par palier jusqu'au profit visé (2 % de la moins chère arrondi au palier, 150 min, ou profit min choisi en crédits)
   function computePrices({ lowestOnMarket, minPrice, minProfit }) {
     const sell = priceDown(lowestOnMarket);
     const s = step(lowestOnMarket);
@@ -84,7 +89,7 @@
     }
   }
 
-  Object.assign(X, { step, nextPrice, priceDown, roundUp, net, profitOf, perHour, breakEven, roundPrice, tickUp, tickDown, computePrices });
+  Object.assign(X, { step, nextPrice, priceDown, roundUp, net, profitOf, perHour, breakEven, roundPrice, tickUp, tickDown, markupPrice, computePrices });
   Object.assign(X, { fmt, fmtSigned, rand, randInt, sleep, hm, clockIn, fmtMin, fmtClock, fmtWait, errText, errMsg, load, save });
 
   // ---------- Préréglages (moteur SnipeFC27) ----------

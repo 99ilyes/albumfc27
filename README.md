@@ -9,13 +9,13 @@ Extension Chrome unique pour la Web App FC 27 : fusion de SnipeFC27 (0.6.2) et A
 ## Interface
 
 - **Bouton flottant** (bas à gauche) : état en direct, bouton ▶ / ■ pour lancer ou arrêter le sniper, clic pour ouvrir le panneau.
-- **Panneau** : onglets Sniper, Galerie, Ventes, Journal, Réglages. Un bandeau unique montre la tâche en cours avec un seul bouton **Arrêter** (et « Lever la pause » pendant une pause anti-captcha).
+- **Panneau** : onglets Sniper, Galerie, Ventes, Journal, Réglages. Crédits affichés en haut, bouton ↻ pour les actualiser. Un bandeau unique montre la tâche en cours avec un seul bouton **Arrêter** (et « Lever la pause » pendant une pause anti-captcha).
 - **Popup** de l'extension : état, crédits, profit, lancer / arrêter le sniper, alternance, relister, ouvrir le panneau.
 
 ## Sniper (moteur SnipeFC27)
 
 1. Onglet Sniper > **Cibles** : chercher un joueur, « + Filtre de la Web App », ou ajouter des cartes manquantes depuis la Galerie (🎯).
-2. **Lancer le sniper**. Prix automatiques : achat un palier sous la moins chère du marché, baissé jusqu'au profit visé (2 % du prix, 150 minimum, ou profit min réglé), revente 1 h jamais sous le prix d'achat taxe comprise.
+2. **Lancer le sniper**. Prix automatiques (logique Stevie's Sniper) : vente un palier sous la moins chère du marché ; achat baissé palier par palier jusqu'au profit visé (2 % du prix de la moins chère arrondi au palier, 150 minimum, ou « Profit minimum par carte » en crédits), taxe EA déduite. Revente 1 h, snipes invendus remis en vente jamais sous le prix d'achat taxe comprise.
 3. **Alterner les cibles** (remplace le mode nuit) : change de cible toutes les 450 à 900 recherches.
 
 Fonctionnement continu, toujours actif : le sniper attend au lieu de s'arrêter (crédits insuffisants, liste de transferts pleine, quota anti-ban, cible sans prix rentable), reprend après rechargement de la Web App (session expirée, connexion automatique si la session EA est ouverte), après une tâche Galerie et après une pause. Pendant ses pauses : ventes encaissées, non-assignés rangés, snipes invendus remis en vente.
