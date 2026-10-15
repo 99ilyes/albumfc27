@@ -668,13 +668,14 @@
       this.tList.replaceChildren(
         ...(list.length
           ? list.map((f, i) => {
-              const on = i === activeIdx;
+              const on = snipe && s.cur ? s.cur.members.includes(f) : i === activeIdx;
+              const g = snipe ? s.groupOf(f.id) : null;
               const price = f.buyPrice ? `achat ≤ ${fmt(f.buyPrice)}${f.sellPrice ? ` · vente ${fmt(f.sellPrice)}` : ''}` : f.auto ? 'prix calculés au lancement' : 'prix à renseigner';
               const row = h(
                 'div',
-                { className: `t-row${on ? ' active' : ''}${snipe ? ' lock' : ''}`, title: snipe ? 'Cible choisie par le sniper (alternance si activée)' : 'Cible de départ' },
+                { className: `t-row${on ? ' active' : ''}${snipe ? ' lock' : ''}`, title: snipe ? 'Cible en cours de recherche' : 'Cible de départ' },
                 h('span', { className: 'a-radio' }),
-                h('span', { className: 'a-row', style: 'gap:6px;min-width:0;flex-wrap:nowrap' }, h('span', { className: 't-n', textContent: f.label }), f.album ? h('span', { className: 'a-pill ac', textContent: 'Galerie' }) : null),
+                h('span', { className: 'a-row', style: 'gap:6px;min-width:0;flex-wrap:nowrap' }, h('span', { className: 't-n', textContent: f.label }), f.album ? h('span', { className: 'a-pill ac', textContent: 'Galerie' }) : null, g ? h('span', { className: 'a-pill', textContent: `Groupe ${g.no}`, title: `Cherchée avec ${g.members.length - 1} autre(s) cible(s) : ${s.critText(g.crit)}, ${fmt(g.minBuy)} à ${fmt(s.maxBuyOf(g))}` }) : null),
                 h('button', { type: 'button', className: 'a-x', textContent: '×', title: snipe && on ? 'Cible en cours' : 'Retirer', disabled: snipe && on, onclick: (ev) => (ev.stopPropagation(), this.app.removeTarget(f.id)) }),
                 h('span', { className: 't-p', textContent: price }),
               );
@@ -706,9 +707,18 @@
       this.sRotate.replaceChildren(
         setting(
           'Alterner les cibles',
-          list.length > 1 ? 'Change de cible toutes les 450 à 900 recherches' : 'Ajoute au moins 2 cibles pour alterner',
+          list.length > 1 ? 'Une cible différente à chaque recherche : pas d’attente du cache EA, toutes les cibles surveillées' : 'Ajoute au moins 2 cibles pour alterner',
           toggle(cfg.rotate, (v) => this.app.setConfig({ rotate: v })),
         ),
+        ...(cfg.rotate
+          ? [
+              setting(
+                'Grouper les cibles',
+                'Cibles de même club, ligue, nation ou rareté spéciale et de prix voisins : une seule recherche pour toutes, après calibrage du prix min (3 cartes hors cibles max)',
+                toggle(cfg.groupSearch, (v) => this.app.setConfig({ groupSearch: v })),
+              ),
+            ]
+          : []),
       );
       // Après un snipe
       const seg = h(
@@ -735,8 +745,16 @@
       const f = snipe ? s.filter : this.app.targets()[cfg.activeFilter];
       this.sPhase.textContent = snipe ? (locked ? 'PAUSE ANTI-CAPTCHA' : PHASES[s.phase]) : s.running ? 'RELISTER' : this.album.running ? 'SUSPENDU (GALERIE)' : s.on ? 'REPRISE IMMINENTE' : 'À L’ARRÊT';
       this.sSpin.className = `s-spin${!s.running ? ' off' : s.phase === 'break' || s.phase === 'wait' ? ' pause' : ''}`;
-      const rot = snipe && cfg.rotate && s.filters.length > 1 ? ` · changement de cible dans ${Math.max(0, s.rotateAt - s.run.searches)} recherches` : '';
-      this.sTarget.replaceChildren(f ? h('span', {}, h('b', { textContent: f.label }), f.buyPrice ? ` · achat ≤ ${fmt(f.buyPrice)} · vente ${fmt(f.sellPrice)}` : '', rot) : 'Aucune cible');
+      const g = snipe && s.cur?.group ? s.cur : null;
+      const groups = snipe ? s.units.filter((u) => u.group).length : 0;
+      const rot = snipe && cfg.rotate && s.units.length > 1 ? ` · alternance entre ${s.units.length} recherches${groups ? ` (${groups} groupe${groups > 1 ? 's' : ''})` : ''}` : '';
+      this.sTarget.replaceChildren(
+        g
+          ? h('span', {}, h('b', { textContent: s.unitLabel(g) }), g.minBuy ? ` · ${fmt(g.minBuy)} à ${fmt(s.maxBuyOf(g))}` : ' · calibrage', rot)
+          : f
+            ? h('span', {}, h('b', { textContent: f.label }), f.buyPrice ? ` · achat ≤ ${fmt(f.buyPrice)} · vente ${fmt(f.sellPrice)}` : '', rot)
+            : 'Aucune cible',
+      );
       const r = s.run;
       const pause = s.breakUntil ? `pause encore ${fmtClock(s.breakUntil - now)}` : s.breakAt ? `pause dans ${fmtClock(s.breakAt - now)}` : X.BREAK_PRESETS[cfg.breakPreset]?.every ? '' : 'sans pause';
       this.sTiles.replaceChildren(
@@ -1418,7 +1436,7 @@
       this.renderStrip();
       const a = this.album;
       const s = this.sniper;
-      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${this.cfg.snipeFilters}|${this.cfg.rotate}`;
+      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${s.cur?.id ?? ''}|${s.units.map((u) => u.id).join(',')}|${this.cfg.snipeFilters}|${this.cfg.rotate}|${this.cfg.groupSearch}`;
       if (sig !== this.lastSig && !this.typing()) {
         this.lastSig = sig;
         if (this.tab === 'gallery' || this.tab === 'snipe') this.renderBody();

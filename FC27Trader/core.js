@@ -119,6 +119,7 @@
     activeFilter: 0,
     sellAfterSnipe: true,
     rotate: false,
+    groupSearch: true,
     breakPreset: 'safe',
     delayPreset: 'safe',
     mistakePrevention: true,
@@ -318,16 +319,43 @@
       defId,
       minPrice: lim && Number(lim.minimum) > 0 ? Number(lim.minimum) : null,
       collected: X.netItems.get(defId)?.collected === true,
+      card: X.cardOf(i),
+    };
+  };
+  // Club, ligue, nation, rareté et niveau d'une carte (regroupement des cibles du sniper)
+  const num = (v) => (v === undefined || v === null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+  X.cardOf = (i) => {
+    const r = num(i?.rating ?? i?._rating);
+    return {
+      club: num(i?.teamId ?? i?._teamId),
+      league: num(i?.leagueId ?? i?._leagueId),
+      nation: num(i?.nationId ?? i?._nationId),
+      rarity: num(i?.rareflag ?? i?._rareflag),
+      level: r === null || r <= 0 ? null : r >= 75 ? 'gold' : r >= 65 ? 'silver' : 'bronze',
     };
   };
   // Recherche du sniper : filtre (joueur ou critères copiés de la Web App), bornes de prix variées pour éviter le cache EA
-  X.searchFilter = async (filter, range) => {
+  X.searchFilter = (filter, range) => {
     const c = new UTSearchCriteriaDTO();
     if (filter.criteria) Object.assign(c, filter.criteria);
     else {
       c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
       if (filter.defId) c.defId = [filter.defId];
     }
+    return runSearch(c, range);
+  };
+  // Recherche d'un groupe de cibles : critères communs (club, ligue, nation, rareté, niveau)
+  X.searchGroup = (g, range) => {
+    const c = new UTSearchCriteriaDTO();
+    c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
+    if (g.club) c.club = g.club;
+    if (g.league) c.league = g.league;
+    if (g.nation) c.nation = g.nation;
+    if (g.rarity) c.rarities = [g.rarity];
+    if (g.level) c.level = g.level;
+    return runSearch(c, range);
+  };
+  const runSearch = async (c, range) => {
     c.minBuy = range.minBuy ?? 0;
     c.maxBuy = range.maxBuy ?? 0;
     c.minBid = range.minBid ?? 0;
