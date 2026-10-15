@@ -40,6 +40,9 @@
 #afc-root .a-close:hover { opacity: .7; }
 #afc-root .a-back { flex: none; width: 32px; height: 32px; border-radius: 8px; border: 1px solid rgba(255,255,255,.16); background: none; color: #fff; font-size: 16px; cursor: pointer; }
 #afc-root .a-coins { flex: none; font-weight: 700; color: #ffd76a; font-variant-numeric: tabular-nums; font-size: .85rem; }
+#afc-root .a-coins-btn { flex: none; width: 26px; height: 26px; border-radius: 7px; border: 1px solid rgba(255,215,106,.35); background: none; color: #ffd76a; font-size: 14px; line-height: 1; cursor: pointer; }
+#afc-root .a-coins-btn:hover:not(:disabled) { background: rgba(255,215,106,.1); }
+#afc-root .a-coins-btn:disabled { opacity: .5; cursor: default; }
 #afc-root .a-nav { display: flex; gap: .25rem; padding: .4rem 1.5rem 0; border-bottom: 1px solid var(--line); flex-shrink: 0; overflow-x: auto; }
 #afc-root .a-nav button { display: inline-flex; align-items: center; gap: 6px; padding: .5rem .95rem; border: 0; border-bottom: 2px solid transparent; background: none; color: var(--dim); font: 600 .82rem Roboto, Arial, sans-serif; cursor: pointer; white-space: nowrap; }
 #afc-root .a-nav button.active { color: #fff; border-bottom-color: var(--ac); }
@@ -395,6 +398,7 @@
       this.subEl = h('div', { className: 'a-sub' });
       this.syncBtn = btn('', () => void this.syncCurrent(), 'small');
       this.coinsEl = h('span', { className: 'a-coins', title: 'Crédits disponibles' });
+      this.coinsBtn = h('button', { type: 'button', className: 'a-coins-btn', textContent: '↻', title: 'Actualiser les crédits', onclick: () => void this.refreshCoins() });
       const head = h(
         'div',
         { className: 'a-head' },
@@ -403,6 +407,7 @@
         h('div', { className: 'a-text' }, this.eyebrowEl, this.titleEl, this.subEl),
         this.syncBtn,
         this.coinsEl,
+        this.coinsBtn,
         h('button', { type: 'button', className: 'a-close', textContent: '×', title: 'Fermer', onclick: () => this.close() }),
       );
       this.navBtns = {};
@@ -693,7 +698,7 @@
         ptitle.append(h('span', { className: 'a-block-hint', textContent: 'Automatique' }), toggle(!!f.auto, (v) => this.app.patchTarget(f.id, { auto: v }), snipe));
         const gain = f.buyPrice && f.sellPrice ? profitOf(f.buyPrice, f.sellPrice) : null;
         const line = h('div', { style: 'font-size:.82rem;color:#fff', textContent: f.buyPrice ? `Achat ≤ ${fmt(f.buyPrice)} · Vente ${fmt(f.sellPrice)}${gain === null ? '' : ` · Profit ${fmt(gain)}`}` : 'Prix calculés au lancement' });
-        if (f.auto) this.pricesEl.replaceChildren(ptitle, line, hint(`Achat un palier sous la moins chère du marché, baissé jusqu’au profit visé (${cfg.minProfit > 0 ? `${fmt(cfg.minProfit)} min` : '2 % du prix, 150 min'}). Prix revérifiés ${cfg.recheckEvery > 0 ? `toutes les ${cfg.recheckEvery} recherches, ` : ''}toutes les 15 min et après chaque snipe.`));
+        if (f.auto) this.pricesEl.replaceChildren(ptitle, line, hint(`Achat un palier sous la moins chère du marché, baissé jusqu’au profit visé (2 % du prix, 150 min). Vente ${cfg.sellMarkupPct > 0 ? `${cfg.sellMarkupPct} % au-dessus de la moins chère` : 'un palier sous la moins chère'}. Prix revérifiés ${cfg.recheckEvery > 0 ? `toutes les ${cfg.recheckEvery} recherches, ` : ''}toutes les 15 min et après chaque snipe.`));
         else {
           const num = (k) => {
             const i = h('input', { type: 'number', className: 'a-in', min: '0', step: '50', value: String(f[k] || ''), disabled: snipe });
@@ -829,6 +834,15 @@
         const stale = !s?.syncedAt || Date.now() - s.syncedAt > 5 * 6e4 || Object.values(s.players ?? {}).some((p) => !this.album.itemData.has(p.defId));
         if (stale && !this.album.running && !this.synced.get(key)) void this.syncCurrent();
       }
+    }
+    async refreshCoins() {
+      if (this.coinsBtn.disabled) return;
+      this.coinsBtn.disabled = true;
+      try {
+        await X.refreshCoins();
+      } catch {}
+      this.coinsBtn.disabled = false;
+      this.update();
     }
     async syncCurrent() {
       const key = this.setKey;
@@ -1390,7 +1404,7 @@
         ),
         block(
           'Sniper',
-          row('Profit minimum par carte', '0 = 2 % du prix, 150 minimum', num('minProfit')),
+          row('Vente au-dessus du marché (%)', '0 = un palier sous la moins chère du marché, sinon moins chère + X % (arrondi au palier EA), 0 à 50', num('sellMarkupPct', 0, 50)),
           row('Achats max par recherche', '1 à 5', num('maxBuysPerSearch', 1, 5)),
           row('Revérifier les prix toutes les N recherches', '0 = jamais (toujours toutes les 15 min et après un snipe)', num('recheckEvery')),
           row('Prévention des erreurs', 'Pas d’achat si la recherche renvoie plus de 15 résultats', toggle(c.mistakePrevention, (v) => set({ mistakePrevention: v }))),

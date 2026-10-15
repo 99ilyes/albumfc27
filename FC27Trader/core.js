@@ -21,16 +21,22 @@
   const roundPrice = (p) => Math.max(0, Math.round(p / step(p)) * step(p));
   const tickUp = (p) => roundPrice(p + step(p));
   const tickDown = (p) => Math.max(0, roundPrice(p - step(p - 1)));
+  const markupPrice = (p, pct) => {
+    if (pct <= 0) return roundPrice(p);
+    const m = p * (1 + pct / 100);
+    return Math.max(Math.ceil(m / step(m)) * step(m), tickUp(p));
+  };
 
-  // Prix du sniper : achat un palier sous la moins chère, baissé jusqu'au profit visé (2 % du prix, 150 min, ou profit min choisi)
-  function computePrices({ lowestOnMarket, minPrice, minProfit }) {
-    const sell = priceDown(lowestOnMarket);
+  // Prix du sniper : vente un palier sous la moins chère (ou X % au-dessus si réglé), achat un palier sous la moins chère baissé jusqu'au profit visé (2 % du prix, 150 min)
+  function computePrices({ lowestOnMarket, minPrice, sellMarkupPct }) {
+    const under = priceDown(lowestOnMarket);
+    const sell = sellMarkupPct > 0 ? markupPrice(lowestOnMarket, sellMarkupPct) : under;
     const s = step(lowestOnMarket);
-    const target = minProfit > 0 ? Math.round(minProfit) : Math.max(150, Math.round((lowestOnMarket * 0.02) / s) * s);
+    const target = Math.max(150, Math.round((lowestOnMarket * 0.02) / s) * s);
     const floor = minPrice ? nextPrice(minPrice) : 0;
-    const base = { status: 'ok', buyPrice: sell, sellPrice: sell, targetProfit: target, profit: 0 };
-    if (minPrice && sell < floor) return { ...base, status: 'belowListable' };
-    let buy = sell;
+    const base = { status: 'ok', buyPrice: under, sellPrice: sell, targetProfit: target, profit: 0 };
+    if (minPrice && under < floor) return { ...base, status: 'belowListable' };
+    let buy = under;
     for (let i = 0; i < 5e3 && buy > Math.max(floor, 150) && profitOf(buy, sell) < target; i++) buy = priceDown(buy);
     const profit = profitOf(buy, sell);
     return { ...base, status: profit > 0 ? 'ok' : 'noProfit', buyPrice: buy, profit };
@@ -84,7 +90,7 @@
     }
   }
 
-  Object.assign(X, { step, nextPrice, priceDown, roundUp, net, profitOf, perHour, breakEven, roundPrice, tickUp, tickDown, computePrices });
+  Object.assign(X, { step, nextPrice, priceDown, roundUp, net, profitOf, perHour, breakEven, roundPrice, tickUp, tickDown, markupPrice, computePrices });
   Object.assign(X, { fmt, fmtSigned, rand, randInt, sleep, hm, clockIn, fmtMin, fmtClock, fmtWait, errText, errMsg, load, save });
 
   // ---------- Préréglages (moteur SnipeFC27) ----------
@@ -122,7 +128,7 @@
     delayPreset: 'safe',
     mistakePrevention: true,
     recheckEvery: 50,
-    minProfit: 0,
+    sellMarkupPct: 0,
     snipeSound: true,
     limitsPreset: 'prudent',
     maxBuysPerSearch: 2,
