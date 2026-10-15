@@ -92,6 +92,7 @@
   X.LIMIT_PRESETS = {
     prudent: { label: 'Prudent', info: '600 / h, 3 000 / 24 h', searchesHour: 600, searchesDay: 3e3, bidsHour: 120, bidsDay: 600 },
     stevie: { label: 'Stevie', info: '900 / h, 4 500 / 24 h', searchesHour: 900, searchesDay: 4500, bidsHour: 180, bidsDay: 900 },
+    nolimit: { label: 'No limit', info: 'aucun plafond, risque de ban élevé', searchesHour: Infinity, searchesDay: Infinity, bidsHour: Infinity, bidsDay: Infinity },
   };
   X.limitsOf = (k) => {
     const { searchesHour, searchesDay, bidsHour, bidsDay } = X.LIMIT_PRESETS[k] ?? X.LIMIT_PRESETS.prudent;
