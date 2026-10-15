@@ -738,7 +738,7 @@
           ...members.map((m) => h('div', { style: 'font-size:.78rem;color:#fff', textContent: `${m.label} : achat ≤ ${fmt(m.buyPrice)} · vente ${fmt(m.sellPrice)} · moins chère ${fmt(m.lowest)}` })),
           hint(
             c.ok
-              ? `Une recherche (${c.text}) jusqu’à ${fmt(c.top)}, prix min calibré au lancement (au plus 3 cartes hors cibles). Seules ces cartes sont achetées, chacune sous son propre prix d’achat. Prix revérifiés comme pour un joueur.`
+              ? `Une recherche (${c.text}) jusqu’à ${fmt(c.top)}, prix min calibré au lancement pour que la page de résultats ne sature pas. Seules ces cartes sont achetées, chacune sous son propre prix d’achat. Prix revérifiés comme pour un joueur.`
               : `${c.reason}. Rescanner les prix ou recréer le groupe.`,
           ),
         );

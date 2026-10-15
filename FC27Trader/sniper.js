@@ -19,14 +19,15 @@
   const SEARCHLOG = 100;
   const SALES = 50;
   const PRUNE_MS = 6e5;
-  // Groupes : page saturée à 18 résultats, 3 cartes hors cibles admises au calibrage, 6 en recherche
+  // Groupes : résultats triés par fin de vente, annonces fraîches en dernier ; elles restent visibles tant que la page
+  // (21 annonces) n'est pas pleine. Calibrage : 10 résultats max ; en recherche : saturée à 18, chargée au-delà de 14
   const SKIP_MS = 6e5;
   const PAGE_SAT = 18;
-  const NOISE_OK = 3;
-  const NOISE_MAX = 6;
+  const PAGE_BUSY = 14;
+  const CAL_MAX = 10;
   const MISTAKE_GROUP = 5;
   // Prix min de recherche essayés au calibrage, en part du prix d'achat le plus bas du groupe
-  const CALIBRATION = [0.6, 0.75, 0.9];
+  const CALIBRATION = [0.6, 0.75, 0.85, 0.9, 0.95];
   const BLOCKED_WAIT = [48e4, 72e4];
   const ERROR_WAIT = [24e4, 36e4];
   const MAX_RETRIES = 5;
@@ -633,7 +634,7 @@
             if (!this.groupCheck(u).ok || u.minBuy >= this.minBuyOf(u)) u.minBuy = u.lastMin = 0;
           } else if (repriced) (u.sinceCheck = 0), (u.pricedAt = Date.now());
           else if (auto && cheap.length >= 3) u.sinceCheck = Infinity;
-          if (u.group) this.checkNoise(u, items.length, noise);
+          if (u.group) this.checkNoise(u, items.length);
         } else {
           if (res.status === 401) this.sessionExpired();
           if (X.BAD_STATUS.has(res.status)) this.lockout(`Statut EA ${res.status} (captcha ou limite)`);
@@ -773,7 +774,7 @@
     groupCheck(u) {
       return X.groupCheck(u.members);
     }
-    // Calibrage : prix min de recherche le plus bas qui laisse au plus 3 cartes hors cibles sur la page
+    // Calibrage : prix min de recherche le plus bas qui laisse la page de résultats loin de la saturation (10 annonces max)
     async calibrate(u) {
       const c = this.groupCheck(u);
       if (!c.ok) {
@@ -782,33 +783,50 @@
         return this.note(`${this.unitLabel(u)} : ${c.reason}`, 'error'), false;
       }
       const steps = [...new Set(CALIBRATION.map((r) => X.roundPrice(c.low * r)))].filter((v) => v > u.lastMin && v >= 150 && v < c.low);
+      let last = null;
       for (const minBuy of steps) {
         await this.wait(this.priceDelay());
         await this.guardOk();
         this.setActivity(`Calibrage du ${this.unitLabel(u)} : ${fmt(minBuy)} à ${fmt(c.top)}`, 'price');
         const r = await this.search(null, { minBuy, maxBuy: c.top, minBid: null, maxBid: null }, c.crit);
-        if (!r.success) return this.note(`Calibrage du ${this.unitLabel(u)} : erreur (statut ${r.status})`, 'error'), false;
-        const noise = r.data.filter((i) => !(i.buyNow <= (u.members.find((m) => Number(m.defId) === i.defId)?.buyPrice ?? 0))).length;
-        this.searchNote(`calibrage ${this.unitLabel(u)} ${fmt(minBuy)} à ${fmt(c.top)} : ${r.data.length} résultat(s), ${noise} hors cibles`);
-        if (r.data.length < PAGE_SAT && noise <= NOISE_OK) {
+        if (!r.success) return this.note(`Calibrage du ${this.unitLabel(u)} : erreur EA (statut ${r.status})${X.errText(r.error)}`, 'error'), false;
+        const noise = r.data.filter((i) => !(i.buyNow <= (u.members.find((m) => Number(m.defId) === i.defId)?.buyPrice ?? 0)));
+        this.searchNote(`calibrage ${this.unitLabel(u)} ${fmt(minBuy)} à ${fmt(c.top)} : ${r.data.length} résultat(s), ${noise.length} hors cibles`);
+        last = { minBuy, count: r.data.length, noise };
+        if (r.data.length <= CAL_MAX) {
           u.crit = c.crit;
           u.minBuy = u.lastMin = minBuy;
           u.noisy = 0;
           u.win = { n: 0, start: 0 };
-          this.note(`${this.unitLabel(u)} : une recherche pour ${u.members.length} joueurs (${c.text}, ${fmt(minBuy)} à ${fmt(c.top)}, ${noise} carte(s) hors cibles au calibrage)`);
+          this.note(`${this.unitLabel(u)} : une recherche pour ${u.members.length} joueurs (${c.text}, ${fmt(minBuy)} à ${fmt(c.top)}, ${r.data.length} résultat(s) au calibrage dont ${noise.length} hors cibles)`);
           return true;
         }
       }
       u.lastMin = 0;
-      this.note(`${this.unitLabel(u)} : trop de cartes hors cibles dans la fourchette de prix (même avec un prix min à 90 %)`, 'error');
+      this.note(`${this.unitLabel(u)} : calibrage impossible, ${last ? `${last.count} résultats même de ${fmt(last.minBuy)} à ${fmt(c.top)}. ${this.noiseText(last.noise)}` : 'fourchette de prix trop étroite'}`, 'error');
       return false;
     }
-    // Page saturée ou trop de cartes hors cibles 3 recherches d'affilée : recalibrage plus haut
-    checkNoise(u, count, noise) {
+    // Cartes hors cibles les plus présentes : nom, nombre d'annonces, prix
+    noiseText(items) {
+      if (!items.length) return 'Page pleine d’annonces des joueurs du groupe : prix d’achat trop proches du marché, rescanner les prix';
+      const by = new Map();
+      for (const i of items) {
+        const k = i.defId || i.name;
+        const e = by.get(k) ?? { name: label(i), n: 0, lo: Infinity, hi: 0 };
+        e.n++;
+        e.lo = Math.min(e.lo, i.buyNow);
+        e.hi = Math.max(e.hi, i.buyNow);
+        by.set(k, e);
+      }
+      const top = [...by.values()].sort((a, b) => b.n - a.n).slice(0, 4);
+      return `Cartes qui encombrent : ${top.map((e) => `${e.name} ×${e.n}${e.n === 21 ? '+' : ''} (${e.lo === e.hi ? fmt(e.lo) : `${fmt(e.lo)} à ${fmt(e.hi)}`})`).join(', ')}. Les ajouter au groupe si elles sont compatibles, ou grouper des joueurs aux prix plus proches`;
+    }
+    // Page saturée, ou chargée 3 recherches d'affilée : recalibrage avec un prix min plus haut
+    checkNoise(u, count) {
       const full = count >= PAGE_SAT;
-      u.noisy = full || noise > NOISE_MAX ? u.noisy + 1 : 0;
+      u.noisy = full || count > PAGE_BUSY ? u.noisy + 1 : 0;
       if (!full && u.noisy < 3) return;
-      this.note(`${this.unitLabel(u)} : ${full ? 'page de résultats saturée' : `${noise} cartes hors cibles`}, recalibrage`, 'error');
+      this.note(`${this.unitLabel(u)} : page de résultats ${full ? 'saturée' : 'chargée'} (${count} annonces), recalibrage`, 'error');
       u.noisy = 0;
       u.minBuy = 0;
     }
