@@ -69,7 +69,7 @@
 
   X.Sniper = class {
     running = false;
-    task = null; // 'snipe' | 'relist'
+    task = null; // 'snipe' | 'relist' | 'prepare'
     relistProgress = null;
     phase = 'idle';
     activity = '';
@@ -94,7 +94,10 @@
     regroupAt = 0;
     attrsWarned = false;
     groupInfo = '';
+    groupDetail = '';
     lastGroupNote = '';
+    prepared = 0;
+    streak = 0;
     snipes = load(K_SNIPES, {});
     prices = {};
     seen = new Set();
@@ -227,11 +230,7 @@
       this.run = { startedAt: Date.now(), searches: 0, snipes: 0, misses: 0, profit: 0 };
       this.lastTick = Date.now();
       this.tickPhase = 'idle';
-      this.units = [];
-      this.cur = null;
-      this.cursor = -1;
-      this.regroupAt = 0;
-      this.groupInfo = '';
+      this.reuseUnits();
       this.albumDone.clear();
       this.note(`Sniper : démarrage${this.cfg.rotate ? ', une cible différente à chaque recherche' : ''}${this.cfg.groupSearch ? ', cibles de prix voisins groupées' : ''}`);
       if (this.cfg.rotate && this.filters.length < 2) this.note('Une seule cible : en ajouter une 2e pour alterner');
@@ -267,6 +266,7 @@
         this.phase = 'idle';
         this.activity = '';
         this.breakAt = this.breakUntil = null;
+        this.prepared = Date.now();
         this.note('Sniper arrêté');
         this.hooks.afterTask();
       }
@@ -356,6 +356,76 @@
         this.note(`Relister terminé : ${ok} carte(s) mise(s) en vente${left ? `, ${left} laissée(s) telle(s) quelle(s)` : ''}`, 'list');
         this.hooks.afterTask();
       }
+    }
+
+    // Avant le lancement : prix de toutes les cibles vérifiés et groupes formés, repris par le sniper pendant 15 min
+    async prepareTargets() {
+      if (this.running) return;
+      if (this.hooks.otherBusy()) return this.note('Prix des cibles : attendre la fin de la tâche Galerie en cours', 'error');
+      const lock = this.guard.lockRemainingMs();
+      if (lock > 0) return this.note(`Pause anti-captcha encore ${X.fmtMin(lock)} : réessayer plus tard`, 'error');
+      this.filters = X.parseFilters(this.cfg.snipeFilters);
+      if (!this.filters.length) return this.note('Aucune cible : ajouter un joueur, le filtre de la Web App ou des cartes de la Galerie', 'error');
+      this.idx = Math.min(Math.max(0, this.cfg.activeFilter), this.filters.length - 1);
+      this.running = true;
+      this.task = 'prepare';
+      this.stopRequested = false;
+      this.note(`Prix des cibles${this.cfg.groupSearch ? ' et groupes' : ''} : démarrage`);
+      let ok = 0;
+      let bad = 0;
+      try {
+        this.reuseUnits();
+        this.syncUnits();
+        for (const u of [...this.units]) {
+          this.checkStop();
+          if (!this.units.includes(u)) continue;
+          if (this.needsPricing(u)) {
+            this.cur = u;
+            if (!(await this.priceUnit(u))) {
+              bad += u.members.length;
+              u.skipUntil = Date.now() + SKIP_MS;
+              this.note(`${this.unitLabel(u)} : pas de prix rentable trouvé`, 'error');
+              continue;
+            }
+          }
+          if (u.group && this.units.includes(u) && !u.minBuy && !(await this.calibrate(u))) this.dissolve(u, 'calibrage impossible', true);
+          ok += u.members.length;
+        }
+        if (this.cfg.groupSearch) {
+          this.regroupAt = 0;
+          await this.regroup();
+        }
+        this.prepared = Date.now();
+      } catch (err) {
+        if (!(err instanceof Stop)) this.note(`Erreur : ${errMsg(err)}`, 'error');
+      } finally {
+        this.running = false;
+        this.task = null;
+        this.cur = null;
+        this.phase = 'idle';
+        this.activity = '';
+        const groups = this.units.filter((u) => u.group).length;
+        this.note(`Prix des cibles terminé : ${ok} cible(s) au prix vérifié${bad ? `, ${bad} sans prix rentable` : ''}${this.cfg.groupSearch ? `, ${groups} groupe(s)` : ''}`);
+        this.hooks.afterTask();
+      }
+    }
+    // Prix et groupes de moins de 15 min (vérification des prix ou sniper arrêté) : repris tels quels
+    reuseUnits() {
+      this.cur = null;
+      this.cursor = -1;
+      this.streak = 0;
+      if (!this.prepared || Date.now() - this.prepared > RECHECK_MS) {
+        this.units = [];
+        this.regroupAt = 0;
+        this.groupInfo = '';
+        return;
+      }
+      const byId = new Map(this.filters.map((f) => [f.id, f]));
+      for (const u of this.units) u.members = u.members.map((m) => byId.get(m.id)).filter(Boolean);
+    }
+    // Groupes affichés : sniper ou vérification des prix en cours, ou résultat de moins de 15 min
+    showGroups() {
+      return (this.running && this.task !== 'relist') || (!!this.prepared && Date.now() - this.prepared < RECHECK_MS);
     }
 
     // byUser : le sniper ne reprend plus seul ; sinon (tâche Galerie) il reprend ensuite
@@ -585,6 +655,7 @@
         this.session.searches++;
         u.win.n++;
         u.sinceCheck++;
+        this.streak++;
         const auto = this.isAuto(u);
         if (res.success) {
           errors = 0;
@@ -650,6 +721,7 @@
       return u.members.every((m) => m.auto);
     }
     useUnit(u) {
+      if (u !== this.cur) this.streak = 0;
       this.cur = u;
       this.cursor = this.units.indexOf(u);
       const n = this.filters.indexOf(u.members[0]);
@@ -699,8 +771,10 @@
         const todo = this.units.find((u) => !u.group && !u.pricedAt && u.skipUntil <= now);
         if (todo) return { u: todo, prep: true };
       }
+      // Alternance : N recherches d'affilée sur la même cible (réglage), puis la suivante
+      const stay = rotate && this.cur && this.units[this.cursor] === this.cur && this.streak < Math.max(1, Math.floor(this.cfg.rotateEvery) || 1) ? 0 : 1;
       for (let k = 0; k < n; k++) {
-        const u = rotate ? this.units[(this.cursor + 1 + k) % n] : this.unitOf(this.filters[(this.idx + k) % n]);
+        const u = rotate ? this.units[(this.cursor + stay + k) % n] : this.unitOf(this.filters[(this.idx + k) % n]);
         if (!u || u.skipUntil > now) continue;
         if (u.pricedAt && coins !== null && coins < this.minBuyOf(u)) {
           poor ??= u;
@@ -832,9 +906,11 @@
         }
       const alone = ok.filter((f) => !paired.has(f));
       if (alone.length) why.push(`${alone.map((f) => f.label).join(', ')} : aucun club, ligue, nation ou rareté spéciale en commun avec une autre cible`);
-      const n = this.units.filter((u) => u.group).length;
-      const text = `Groupes : ${n ? `${n} formé(s)` : 'aucun'}${why.length ? `. Non groupées : ${why.slice(0, 6).join(' ; ')}${why.length > 6 ? ' ; …' : ''}` : ''}`;
-      this.groupInfo = text;
+      const groups = this.units.filter((u) => u.group);
+      const solo = this.units.filter((u) => !u.group).map((u) => u.members[0].label);
+      this.groupInfo = `${groups.length ? groups.map((g) => `Groupe ${g.no} : ${g.members.map((m) => m.label).join(' + ')}`).join(' · ') : 'Aucun groupe'}${solo.length ? ` · seules : ${solo.join(', ')}` : ''}`;
+      const text = `Groupes : ${groups.length ? `${groups.length} formé(s)` : 'aucun'}${why.length ? `. Non groupées : ${why.slice(0, 6).join(' ; ')}${why.length > 6 ? ' ; …' : ''}` : ''}`;
+      this.groupDetail = text;
       if (text !== this.lastGroupNote) {
         this.lastGroupNote = text;
         this.note(text);

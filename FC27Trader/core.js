@@ -120,6 +120,7 @@
     sellAfterSnipe: true,
     rotate: false,
     groupSearch: true,
+    rotateEvery: 1,
     breakPreset: 'safe',
     delayPreset: 'safe',
     mistakePrevention: true,

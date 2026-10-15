@@ -48,7 +48,7 @@ function render(st) {
       'div',
       { className: 'row' },
       el('button', { className: snipe ? 'stop' : 'go', textContent: snipe ? 'Arrêter le sniper' : 'Lancer le sniper', disabled: s.running && !snipe, onclick: () => send({ type: snipe ? 'sniper-stop' : 'start' }) }),
-      el('button', { className: s.rotate ? 'on-btn' : '', textContent: `Alterner : ${s.rotate ? 'oui' : 'non'}`, title: 'Une cible différente à chaque recherche', onclick: () => send({ type: 'rotate', on: !s.rotate }) }),
+      el('button', { className: s.rotate ? 'on-btn' : '', textContent: `Cibles : ${s.rotate ? 'toutes' : 'cochée'}`, title: 'Toutes les cibles l’une après l’autre, ou seulement la cible cochée', onclick: () => send({ type: 'rotate', on: !s.rotate }) }),
     ),
     el(
       'div',

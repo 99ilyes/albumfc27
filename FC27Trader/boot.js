@@ -38,12 +38,13 @@
         X.saveConfig(this.cfg);
         onUpdate();
       },
-      // Cibles : copie du sniper pendant qu'il tourne, sinon celles des réglages
+      // Cibles : copie du sniper pendant qu'il tourne (ou vérifie leurs prix), sinon celles des réglages
+      liveTargets: () => sniper.running && (sniper.task === 'snipe' || sniper.task === 'prepare'),
       targets() {
-        return sniper.running && sniper.task === 'snipe' ? sniper.filters : X.parseFilters(this.cfg.snipeFilters);
+        return this.liveTargets() ? sniper.filters : X.parseFilters(this.cfg.snipeFilters);
       },
       editTargets(fn) {
-        const live = sniper.running && sniper.task === 'snipe';
+        const live = this.liveTargets();
         const list = live ? sniper.filters : X.parseFilters(this.cfg.snipeFilters);
         let active = live ? sniper.idx : this.cfg.activeFilter;
         active = fn(list, active) ?? active;
@@ -74,7 +75,7 @@
         if (!sniper.running) this.setConfig({ activeFilter: n });
       },
       patchTarget(id, patch) {
-        if (sniper.running && sniper.task === 'snipe') return;
+        if (this.liveTargets()) return;
         this.editTargets((list) => {
           const f = list.find((x) => x.id === id);
           if (f) Object.assign(f, patch);
@@ -130,6 +131,9 @@
       },
       relist() {
         void sniper.relistTransferList();
+      },
+      prepareTargets() {
+        void sniper.prepareTargets();
       },
       unlock() {
         sniper.unlock();

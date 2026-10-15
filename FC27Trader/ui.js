@@ -522,6 +522,7 @@
         const what = a.mode === 'buy' ? 'Achats Galerie' : 'Vérification des prix';
         return `${what} · ${left > 0 ? `${a.waitLabel || 'Prochaine action'} dans ${fmtWait(left)}` : a.activityText || 'en cours…'}`;
       }
+      if (s.running && s.task === 'prepare') return `Prix des cibles · ${s.activity || 'en cours…'}`;
       if (s.running && s.task === 'relist') return `Relister · ${s.relistProgress ? `${s.relistProgress.done} / ${s.relistProgress.total} · ` : ''}${s.activity}`;
       if (s.running) {
         if (s.breakUntil) return `Sniper en pause · reprise dans ${fmtClock(s.breakUntil - now)}`;
@@ -587,11 +588,13 @@
       this.tHint = h('div', { className: 'a-block-hint' });
       const live = btn('+ Filtre de la Web App', () => void this.addLiveFilter(), 'small', { title: 'Copie le filtre réglé dans la recherche du marché de la Web App' });
       this.tClear = h('button', { type: 'button', className: 'a-link', textContent: 'Retirer les cibles Galerie', onclick: () => this.app.clearAlbumTargets() });
+      this.tPrep = btn('Prix et groupes', () => this.app.prepareTargets(), 'small', { title: 'Vérifie le prix de toutes les cibles et forme les groupes sans lancer le sniper (repris au lancement pendant 15 min)' });
       const targets = h(
         'div',
         { className: 'a-block' },
-        h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: 'Cibles' }), this.tClear),
+        h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: 'Cibles' }), this.tClear, this.tPrep),
         this.tList,
+        (this.tGroups = h('div', { className: 'a-block-hint' })),
         h('div', { className: 'a-row', style: 'align-items:flex-start' }, this.searchBox(), live),
         this.tHint,
       );
@@ -668,12 +671,12 @@
       this.tList.replaceChildren(
         ...(list.length
           ? list.map((f, i) => {
-              const on = snipe && s.cur ? s.cur.members.includes(f) : i === activeIdx;
-              const g = snipe ? s.groupOf(f.id) : null;
-              const price = f.buyPrice ? `achat ≤ ${fmt(f.buyPrice)}${f.sellPrice ? ` · vente ${fmt(f.sellPrice)}` : ''}` : f.auto ? 'prix calculés au lancement' : 'prix à renseigner';
+              const on = (snipe || s.task === 'prepare') && s.cur ? s.cur.members.includes(f) : i === activeIdx;
+              const g = s.showGroups() ? s.groupOf(f.id) : null;
+              const price = f.buyPrice ? `achat ≤ ${fmt(f.buyPrice)}${f.sellPrice ? ` · vente ${fmt(f.sellPrice)}` : ''}` : f.auto ? 'prix à vérifier' : 'prix à renseigner';
               const row = h(
                 'div',
-                { className: `t-row${on ? ' active' : ''}${snipe ? ' lock' : ''}`, title: snipe ? 'Cible en cours de recherche' : 'Cible de départ' },
+                { className: `t-row${on ? ' active' : ''}${snipe ? ' lock' : ''}`, title: snipe ? 'Cible en cours de recherche' : cfg.rotate ? 'Afficher et régler ses prix' : 'Cible cherchée' },
                 h('span', { className: 'a-radio' }),
                 h('span', { className: 'a-row', style: 'gap:6px;min-width:0;flex-wrap:nowrap' }, h('span', { className: 't-n', textContent: f.label }), f.album ? h('span', { className: 'a-pill ac', textContent: 'Galerie' }) : null, g ? h('span', { className: 'a-pill', textContent: `Groupe ${g.no}`, title: `Cherchée avec ${g.members.length - 1} autre(s) cible(s) : ${s.critText(g.crit)}, ${fmt(g.minBuy)} à ${fmt(s.maxBuyOf(g))}` }) : null),
                 h('button', { type: 'button', className: 'a-x', textContent: '×', title: snipe && on ? 'Cible en cours' : 'Retirer', disabled: snipe && on, onclick: (ev) => (ev.stopPropagation(), this.app.removeTarget(f.id)) }),
@@ -686,15 +689,23 @@
       );
       this.tClear.style.display = list.some((f) => f.album) ? '' : 'none';
       this.tClear.disabled = snipe;
+      const showG = cfg.groupSearch && s.showGroups() && !!s.groupInfo;
+      this.tGroups.textContent = showG ? s.groupInfo : '';
+      this.tGroups.title = showG ? s.groupDetail : '';
+      this.tGroups.style.display = showG ? '' : 'none';
+      this.tPrep.disabled = s.running || this.album.running || !list.length;
+      this.tPrep.textContent = s.running && s.task === 'prepare' ? 'Vérification…' : cfg.groupSearch ? 'Prix et groupes' : 'Prix des cibles';
       // Prix de la cible active
       const f = list[activeIdx];
+      const fg = f && s.showGroups() ? s.groupOf(f.id) : null;
+      const inGroup = fg ? [hint(`Cherchée dans le groupe ${fg.no} avec ${fg.members.filter((m) => m.id !== f.id).map((m) => m.label).join(', ')}, ${fg.minBuy ? `${fmt(fg.minBuy)} à ${fmt(s.maxBuyOf(fg))}` : 'calibrage au lancement'}. Seules les cartes ciblées sont achetées, chacune sous son prix d’achat.`)] : [];
       const ptitle = h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: 'Prix de la cible' }));
       if (!f) this.pricesEl.replaceChildren(ptitle, hint('Choisis une cible.'));
       else {
         ptitle.append(h('span', { className: 'a-block-hint', textContent: 'Automatique' }), toggle(!!f.auto, (v) => this.app.patchTarget(f.id, { auto: v }), snipe));
         const gain = f.buyPrice && f.sellPrice ? profitOf(f.buyPrice, f.sellPrice) : null;
-        const line = h('div', { style: 'font-size:.82rem;color:#fff', textContent: f.buyPrice ? `Achat ≤ ${fmt(f.buyPrice)} · Vente ${fmt(f.sellPrice)}${gain === null ? '' : ` · Profit ${fmt(gain)}`}` : 'Prix calculés au lancement' });
-        if (f.auto) this.pricesEl.replaceChildren(ptitle, line, hint(`Achat un palier sous la moins chère du marché, baissé jusqu’au profit visé (${cfg.minProfit > 0 ? `${fmt(cfg.minProfit)} min` : '2 % du prix, 150 min'}). Prix revérifiés ${cfg.recheckEvery > 0 ? `toutes les ${cfg.recheckEvery} recherches, ` : ''}toutes les 15 min et après chaque snipe.`));
+        const line = h('div', { style: 'font-size:.82rem;color:#fff', textContent: f.buyPrice ? `Achat ≤ ${fmt(f.buyPrice)} · Vente ${fmt(f.sellPrice)}${gain === null ? '' : ` · Profit ${fmt(gain)}`}` : 'Prix vérifiés au lancement ou avec « Prix et groupes »' });
+        if (f.auto) this.pricesEl.replaceChildren(ptitle, line, ...inGroup, hint(`Achat un palier sous la moins chère du marché, baissé jusqu’au profit visé (${cfg.minProfit > 0 ? `${fmt(cfg.minProfit)} min` : '2 % du prix, 150 min'}). Prix revérifiés ${cfg.recheckEvery > 0 ? `toutes les ${cfg.recheckEvery} recherches de cette cible, ` : ''}toutes les 15 min et après chaque snipe.`));
         else {
           const num = (k) => {
             const i = h('input', { type: 'number', className: 'a-in', min: '0', step: '50', value: String(f[k] || ''), disabled: snipe });
@@ -704,18 +715,22 @@
           this.pricesEl.replaceChildren(ptitle, cfg.sellAfterSnipe ? h('div', { className: 'prices' }, 'Achat', num('buyPrice'), 'Vente', num('sellPrice')) : h('div', { className: 'prices' }, 'Achat', num('buyPrice')), line);
         }
       }
+      // Cibles cherchées : la cible cochée (ou son groupe), ou toutes en alternance ; détails dans Réglages
+      const every = Math.max(1, Math.floor(cfg.rotateEvery) || 1);
+      const mode = h(
+        'div',
+        { className: 'a-seg' },
+        ...[
+          [false, 'Cible cochée'],
+          [true, 'Toutes'],
+        ].map(([v, l]) => h('button', { type: 'button', className: cfg.rotate === v ? 'active' : '', textContent: l, onclick: () => this.app.setConfig({ rotate: v }) })),
+      );
       this.sRotate.replaceChildren(
         setting(
-          'Alterner les cibles',
-          list.length > 1 ? 'Une cible différente à chaque recherche : pas d’attente du cache EA, toutes les cibles surveillées' : 'Ajoute au moins 2 cibles pour alterner',
-          toggle(cfg.rotate, (v) => this.app.setConfig({ rotate: v })),
+          'Cibles cherchées',
+          `${cfg.rotate ? `Toutes, l’une après l’autre, ${every} recherche${every > 1 ? 's' : ''} chacune` : `Seulement la cible cochée${cfg.groupSearch ? ', ou son groupe' : ''}`}. Groupes ${cfg.groupSearch ? 'actifs' : 'désactivés'} (Réglages).`,
+          mode,
         ),
-        setting(
-          'Grouper les cibles',
-          `Automatique : cibles de même club, ligue, nation ou rareté spéciale et de prix voisins, une seule recherche pour toutes après calibrage du prix min (3 cartes hors cibles max). Groupes formés une fois toutes les cibles au prix vérifié.${cfg.rotate ? '' : ' Sans alternance, seul le groupe (ou la cible) choisi est cherché.'}`,
-          toggle(cfg.groupSearch, (v) => this.app.setConfig({ groupSearch: v })),
-        ),
-        ...(snipe && cfg.groupSearch ? [hint(s.groupInfo || 'Groupes : vérification des prix des cibles en cours')] : []),
       );
       // Après un snipe
       const seg = h(
@@ -740,17 +755,23 @@
       const snipe = s.running && s.task === 'snipe';
       const locked = s.guard.lockedUntil() > 0;
       const f = snipe ? s.filter : this.app.targets()[cfg.activeFilter];
-      this.sPhase.textContent = snipe ? (locked ? 'PAUSE ANTI-CAPTCHA' : PHASES[s.phase]) : s.running ? 'RELISTER' : this.album.running ? 'SUSPENDU (GALERIE)' : s.on ? 'REPRISE IMMINENTE' : 'À L’ARRÊT';
+      this.sPhase.textContent = snipe ? (locked ? 'PAUSE ANTI-CAPTCHA' : PHASES[s.phase]) : s.running ? (s.task === 'prepare' ? 'PRIX DES CIBLES' : 'RELISTER') : this.album.running ? 'SUSPENDU (GALERIE)' : s.on ? 'REPRISE IMMINENTE' : 'À L’ARRÊT';
       this.sSpin.className = `s-spin${!s.running ? ' off' : s.phase === 'break' || s.phase === 'wait' ? ' pause' : ''}`;
       const g = snipe && s.cur?.group ? s.cur : null;
       const groups = snipe ? s.units.filter((u) => u.group).length : 0;
       const rot = snipe && cfg.rotate && s.units.length > 1 ? ` · alternance entre ${s.units.length} recherches${groups ? ` (${groups} groupe${groups > 1 ? 's' : ''})` : ''}` : '';
+      // À l'arrêt : ce que le sniper cherchera (toutes les cibles, la cible cochée ou son groupe)
+      const all = this.app.targets();
+      const fg = !snipe && !cfg.rotate && f && cfg.groupSearch && s.showGroups() ? s.groupOf(f.id) : null;
+      const shown = g ?? fg;
       this.sTarget.replaceChildren(
-        g
-          ? h('span', {}, h('b', { textContent: s.unitLabel(g) }), g.minBuy ? ` · ${fmt(g.minBuy)} à ${fmt(s.maxBuyOf(g))}` : ' · calibrage', rot)
-          : f
-            ? h('span', {}, h('b', { textContent: f.label }), f.buyPrice ? ` · achat ≤ ${fmt(f.buyPrice)} · vente ${fmt(f.sellPrice)}` : '', rot)
-            : 'Aucune cible',
+        shown
+          ? h('span', {}, h('b', { textContent: s.unitLabel(shown) }), shown.minBuy ? ` · ${fmt(shown.minBuy)} à ${fmt(s.maxBuyOf(shown))}` : ' · calibrage', rot)
+          : !snipe && cfg.rotate && all.length > 1
+            ? h('span', {}, h('b', { textContent: `Toutes les cibles (${all.length})` }), ` · ${Math.max(1, Math.floor(cfg.rotateEvery) || 1)} recherche(s) chacune${cfg.groupSearch ? ', groupées si possible' : ''}`)
+            : f
+              ? h('span', {}, h('b', { textContent: f.label }), f.buyPrice ? ` · achat ≤ ${fmt(f.buyPrice)} · vente ${fmt(f.sellPrice)}` : '', rot)
+              : 'Aucune cible',
       );
       const r = s.run;
       const pause = s.breakUntil ? `pause encore ${fmtClock(s.breakUntil - now)}` : s.breakAt ? `pause dans ${fmtClock(s.breakAt - now)}` : X.BREAK_PRESETS[cfg.breakPreset]?.every ? '' : 'sans pause';
@@ -760,7 +781,7 @@
         tile('Snipes', fmt(r.snipes), `${r.misses} raté(s) de peu${rate(r.snipes, r.misses)}`),
         tile('Durée', snipe ? fmtClock(now - r.startedAt) : '—', pause),
       );
-      this.sAct.textContent = snipe ? s.activity : s.on && !s.running ? 'Le sniper reprend dès la fin de la tâche ou de la pause en cours.' : '';
+      this.sAct.textContent = snipe || s.task === 'prepare' ? s.activity : s.on && !s.running ? 'Le sniper reprend dès la fin de la tâche ou de la pause en cours.' : '';
       this.sGo.textContent = snipe ? 'Arrêter le sniper' : 'Lancer le sniper';
       this.sGo.className = `a-btn big ${snipe ? 'danger' : 'go'}`;
       this.sGo.disabled = s.running && !snipe;
@@ -1411,6 +1432,16 @@
           row('Prévention des erreurs', 'Pas d’achat si la recherche renvoie plus de 15 résultats', toggle(c.mistakePrevention, (v) => set({ mistakePrevention: v }))),
           row('Son à chaque snipe', '', toggle(c.snipeSound, (v) => (set({ snipeSound: v }), v && X.beep()))),
         ),
+        block(
+          'Plusieurs cibles',
+          row('Recherches par cible avant la suivante', 'Mode « Toutes » : 1 = une cible différente à chaque recherche', num('rotateEvery', 1, 1000)),
+          row(
+            'Grouper les cibles',
+            'Cibles de même club, ligue, nation ou rareté spéciale et de prix compatibles : une seule recherche pour plusieurs, après calibrage (3 cartes hors cibles max). Fonctionne dans les deux modes.',
+            toggle(c.groupSearch, (v) => set({ groupSearch: v })),
+          ),
+          hint('Le bouton « Prix et groupes » de l’onglet Sniper vérifie les prix et forme les groupes avant le lancement (repris pendant 15 min). Bilan des groupes sous la liste des cibles, détail dans le journal.'),
+        ),
         block('Galerie', row('Importer tous les sets fut.gg à l’ouverture', 'Au plus toutes les 6 h', toggle(c.autoCatalog, (v) => set({ autoCatalog: v }))), hint('Écart max et « Après achat » se règlent dans la fenêtre d’achat direct.')),
       );
     }
@@ -1433,7 +1464,7 @@
       this.renderStrip();
       const a = this.album;
       const s = this.sniper;
-      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${s.cur?.id ?? ''}|${s.units.map((u) => u.id).join(',')}|${s.groupInfo}|${this.cfg.snipeFilters}|${this.cfg.rotate}|${this.cfg.groupSearch}`;
+      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${this.cfg.activeFilter}|${this.cfg.rotateEvery}|${s.prepared}|${s.cur?.id ?? ''}|${s.units.map((u) => u.id).join(',')}|${s.groupInfo}|${this.cfg.snipeFilters}|${this.cfg.rotate}|${this.cfg.groupSearch}`;
       if (sig !== this.lastSig && !this.typing()) {
         this.lastSig = sig;
         if (this.tab === 'gallery' || this.tab === 'snipe') this.renderBody();
