@@ -209,7 +209,7 @@
       this.pricedAt = 0;
       this.tooManyNoted = false;
       this.note(`Sniper : démarrage${this.cfg.rotate ? ', alternance des cibles' : ''}`);
-      if (this.cfg.rotate && this.filters.length < 2) this.note('Une seule cible : en ajouter une 2e pour alterner toutes les 450 à 900 recherches');
+      if (this.cfg.rotate && this.filters.length < 2) this.note(`Une seule cible : en ajouter une 2e pour alterner toutes les ${X.rotateText(this.cfg)} recherches`);
       let retries = 0;
       let lastErr = 0;
       try {
@@ -454,11 +454,16 @@
       this.resumeClock();
     }
 
+    rotateSpan() {
+      const n = Math.floor(this.cfg.rotateEvery);
+      return n > 0 ? n : randInt(...ROTATE);
+    }
     async loop() {
       if (!(await this.prepareFilter())) return;
       let key = this.breakKey();
       await this.restoreBreakClock(key);
-      this.rotateAt = this.run.searches + randInt(...ROTATE);
+      this.rotateAt = this.run.searches + this.rotateSpan();
+      let rotateEvery = this.cfg.rotateEvery;
       let win = { n: 0, start: Date.now() };
       let sinceCheck = 0;
       let errors = 0;
@@ -498,16 +503,21 @@
           this.albumDone = false;
           if (!this.dropFilter(this.idx, 'carte obtenue pour la Galerie')) return;
           if (!(await this.prepareFilter())) return;
-          this.rotateAt = this.run.searches + randInt(...ROTATE);
+          this.rotateAt = this.run.searches + this.rotateSpan();
           sinceCheck = 0;
           win = { n: 0, start: Date.now() };
+        }
+        // Réglage modifié en cours de route : nouveau compte à rebours
+        if (cfg.rotateEvery !== rotateEvery) {
+          rotateEvery = cfg.rotateEvery;
+          this.rotateAt = this.run.searches + this.rotateSpan();
         }
         if (cfg.rotate && this.filters.length > 1 && this.run.searches >= this.rotateAt) {
           this.idx = (this.idx + 1) % this.filters.length;
           this.saveFilters();
           this.note(`Changement de cible : ${this.filter.label}`);
           if (!(await this.prepareFilter())) return;
-          this.rotateAt = this.run.searches + randInt(...ROTATE);
+          this.rotateAt = this.run.searches + this.rotateSpan();
           sinceCheck = 0;
           win = { n: 0, start: Date.now() };
         }
