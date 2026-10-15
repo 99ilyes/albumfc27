@@ -1323,7 +1323,7 @@
       const f = this.jfilter;
       if (f === 'all') return true;
       if (f === 'main') return ev.type !== 'step';
-      if (f === 'trade') return ev.type === 'buy' || ev.type === 'sell' || ev.type === 'list';
+      if (f === 'trade') return ev.type === 'buy' || ev.type === 'sell' || ev.type === 'list' || ev.type === 'miss';
       return ev.type === 'miss' || ev.type === 'error' || ev.type === 'warn' || ev.type === 'lock';
     }
     renderEvents(full = false) {
@@ -1418,7 +1418,7 @@
       this.renderStrip();
       const a = this.album;
       const s = this.sniper;
-      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${this.cfg.snipeFilters}|${this.cfg.rotate}`;
+      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${this.cfg.activeFilter}|${this.cfg.snipeFilters}|${this.cfg.rotate}`;
       if (sig !== this.lastSig && !this.typing()) {
         this.lastSig = sig;
         if (this.tab === 'gallery' || this.tab === 'snipe') this.renderBody();

@@ -749,17 +749,22 @@
             this.snipes[id] = { defId, label: name, price: it.buyNow, at: Date.now() };
             save(K_SNIPES, this.snipes);
           }
+          this.searchNote(`→ snipé ${name} à ${fmt(it.buyNow)}`);
           this.note(`Snipé ${name} à ${fmt(it.buyNow)} ! (${ageText(it.expires)}, réponse en ${ms} ms)`, 'snipe');
           if (this.cfg.snipeSound) X.beep();
           if (defId && this.hooks.onSnipe(defId) && this.filter.album && this.filter.defId === defId) this.albumDone = true;
           won.push(it);
-        } else if (res.status === 401 || X.BAD_STATUS.has(res.status)) fatal ??= res.status;
-        else if (X.MISS_STATUS.has(res.status)) {
+        } else if (res.status === 401 || X.BAD_STATUS.has(res.status)) {
+          fatal ??= res.status;
+          this.searchNote(`→ achat ${name} refusé (statut ${res.status})`);
+        } else if (X.MISS_STATUS.has(res.status)) {
           this.run.misses++;
           this.session.misses++;
+          this.searchNote(`→ raté ${name} à ${fmt(it.buyNow)} (statut ${res.status})`);
           this.note(`Raté de peu : ${name} à ${fmt(it.buyNow)} (${ageText(it.expires)}, réponse en ${ms} ms)`, 'miss');
         } else {
           this.seen.delete(it.tradeId);
+          this.searchNote(`→ achat ${name} échoué (statut ${res.status})`);
           if (res.status === 470) this.note(`Crédits insuffisants pour ${name} à ${fmt(it.buyNow)}`, 'error');
           else if (res.status === -2) this.note(`Achat de ${name} sans réponse : vérifier les non-assignés`, 'error');
           else this.note(`Erreur ${res.status} à l'achat de ${name}`, 'error');
