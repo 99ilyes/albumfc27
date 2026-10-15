@@ -13,7 +13,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   chrome.notifications.create({
     type: 'basic',
     iconUrl: 'icon-128.png',
-    title: String(msg.title || 'AlbumFC27').slice(0, 80),
+    title: String(msg.title || 'FC27 Trader').slice(0, 80),
     message: String(msg.message || '').slice(0, 300),
     priority: 1,
   });

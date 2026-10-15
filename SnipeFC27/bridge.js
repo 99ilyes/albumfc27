@@ -1,1 +1,0 @@
-(function(){chrome.runtime.onMessage.addListener(e=>{window.postMessage({ns:`snipefc27`,dir:`to-page`,cmd:e},window.location.origin)}),window.addEventListener(`message`,e=>{e.source===window&&e.data?.ns===`snipefc27`&&e.data.dir===`to-ext`&&chrome.storage.local.set({stats:e.data.stats})})})();

@@ -1,4 +1,4 @@
-// Page d'un set Galerie sur fut.gg : bouton « Envoyer à AlbumFC27 » (lecture de la page affichée uniquement)
+// Page d'un set Galerie sur fut.gg : bouton « Envoyer à FC27 Trader » (lecture de la page affichée uniquement)
 (function () {
   const F = globalThis.AlbumFutgg;
 
@@ -31,12 +31,12 @@
           return toast('Extension mise à jour : recharge cette page');
         }
         const noPrice = list.filter((p) => !p.price).length;
-        toast(`Envoyé à AlbumFC27 : ${list.length} joueur(s)${noPrice ? `, ${noPrice} sans prix` : ''}. Va dans l'onglet de la Web App.`);
+        toast(`Envoyé à FC27 Trader : ${list.length} joueur(s)${noPrice ? `, ${noPrice} sans prix` : ''}. Va dans l'onglet de la Web App.`);
       };
       document.body.appendChild(btn);
     }
     const n = F.players(document).length;
-    const label = `Envoyer à AlbumFC27 (${n})`;
+    const label = `Envoyer à FC27 Trader (${n})`;
     if (btn.textContent !== label) btn.textContent = label;
     btn.disabled = n === 0;
   }
