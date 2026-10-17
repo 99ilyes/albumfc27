@@ -68,6 +68,7 @@
     session = { ...EMPTY_SESSION, since: Date.now(), ...load(K_SESSION, {}) };
     sales = load(K_SALES, []);
     counted = load(K_COUNTED, []);
+    stats = new X.SnipeStats();
     searchLog = [];
     breakAt = null;
     breakUntil = null;
@@ -134,6 +135,7 @@
         targets: X.parseFilters(this.cfg.snipeFilters).length,
         run: { ...this.run },
         session: { ...this.session },
+        current: this.stats.current ? { ...this.stats.current, targets: undefined } : null,
         pending: this.pending(),
         sales: this.sales.slice(0, 20),
         breakAt: this.breakAt,
@@ -150,11 +152,27 @@
       const listed = all.filter((s) => s.listPrice);
       return { count: all.length, listed: listed.length, invested: all.reduce((t, s) => t + s.price, 0), expected: listed.reduce((t, s) => t + profitOf(s.price, s.listPrice ?? 0), 0) };
     }
+    // Snipes en attente de vente regroupés par session d'achat ou par joueur
+    pendingBy(keyOf) {
+      const out = new Map();
+      for (const s of Object.values(this.snipes)) {
+        const k = keyOf(s);
+        const o = out.get(k) ?? { count: 0, invested: 0, expected: 0 };
+        o.count++;
+        o.invested += s.price;
+        if (s.listPrice) o.expected += profitOf(s.price, s.listPrice);
+        out.set(k, o);
+      }
+      return out;
+    }
     emit() {
       if (this.running && this.task === 'snipe') {
         const now = Date.now();
-        this.session.activeMs += now - this.lastTick;
-        if (this.tickPhase !== 'break' && this.tickPhase !== 'wait') this.session.timeMs += now - this.lastTick;
+        const d = now - this.lastTick;
+        const working = this.tickPhase !== 'break' && this.tickPhase !== 'wait';
+        this.session.activeMs += d;
+        if (working) this.session.timeMs += d;
+        this.stats.tick(d, working);
         this.lastTick = now;
         this.tickPhase = this.phase;
         save(K_SESSION, this.session);
@@ -178,6 +196,8 @@
     resetSession() {
       this.session = { ...EMPTY_SESSION, since: Date.now() };
       this.sales = [];
+      this.stats.reset();
+      if (this.running && this.task === 'snipe') this.stats.begin();
       save(K_SESSION, this.session);
       save(K_SALES, this.sales);
       this.emit();
@@ -208,6 +228,9 @@
       this.tickPhase = 'idle';
       this.pricedAt = 0;
       this.tooManyNoted = false;
+      const resumed = this.stats.current;
+      const cur = this.stats.begin();
+      if (resumed && resumed !== cur) this.note('Plus de 30 min d’interruption : nouvelle session de suivi');
       this.note(`Sniper : démarrage${this.cfg.rotate ? ', alternance des cibles' : ''}`);
       if (this.cfg.rotate && this.filters.length < 2) this.note('Une seule cible : en ajouter une 2e pour alterner toutes les 450 à 900 recherches');
       let retries = 0;
@@ -235,6 +258,9 @@
       } finally {
         this.emit();
         this.pauseClock();
+        // Arrêt voulu (ou plus de cible) : session close ; suspension Galerie ou rechargement : session continuée
+        if (!this.on) this.stats.end();
+        this.stats.flush();
         this.brk.stoppedAt = Date.now();
         save(K_BREAK, this.brk);
         this.running = false;
@@ -344,7 +370,10 @@
           this.note('Rechargement et reprise annulés');
         }
       }
-      if (!this.running) return this.emit();
+      if (!this.running) {
+        if (byUser) this.stats.end();
+        return this.emit();
+      }
       this.stopRequested = true;
       this.wake?.();
       this.note(msg);
@@ -558,6 +587,7 @@
         this.guard.recordSearch();
         this.run.searches++;
         this.session.searches++;
+        this.stats.search(f);
         win.n++;
         sinceCheck++;
         if (res.success) {
@@ -745,8 +775,9 @@
           this.session.snipes++;
           const id = Number(it.raw?.id);
           const defId = it.defId || this.filter.defId || 0;
+          const sid = this.stats.snipe(defId, name, it.buyNow);
           if (id) {
-            this.snipes[id] = { defId, label: name, price: it.buyNow, at: Date.now() };
+            this.snipes[id] = { defId, label: name, price: it.buyNow, at: Date.now(), sid };
             save(K_SNIPES, this.snipes);
           }
           this.note(`Snipé ${name} à ${fmt(it.buyNow)} ! (${ageText(it.expires)}, réponse en ${ms} ms)`, 'snipe');
@@ -757,6 +788,7 @@
         else if (X.MISS_STATUS.has(res.status)) {
           this.run.misses++;
           this.session.misses++;
+          this.stats.miss(it.defId || this.filter.defId || 0, name);
           this.note(`Raté de peu : ${name} à ${fmt(it.buyNow)} (${ageText(it.expires)}, réponse en ${ms} ms)`, 'miss');
         } else {
           this.seen.delete(it.tradeId);
@@ -842,7 +874,9 @@
         let profit = sn ? net(i.soldPrice) - sn.price : null;
         let buy = sn?.price ?? null;
         let name = sn?.label ?? i.name;
+        const held = sn?.at ? Date.now() - sn.at : null;
         if (sn) {
+          this.stats.sale(sn, i.soldPrice);
           this.session.realized += profit;
           this.session.sales++;
           delete this.snipes[i.id];
@@ -851,7 +885,7 @@
           if (a) ({ name, buy, profit } = a);
         }
         this.counted.push(i.tradeId || -i.id);
-        this.sales = [{ at: Date.now(), label: name, price: i.soldPrice, buy, profit, album: !sn && buy !== null }, ...this.sales].slice(0, SALES);
+        this.sales = [{ at: Date.now(), label: name, price: i.soldPrice, buy, profit, album: !sn && buy !== null, held }, ...this.sales].slice(0, SALES);
         this.note(`Vendu ${name} à ${fmt(i.soldPrice)}${profit === null ? '' : ` (${profit >= 0 ? 'profit' : 'perte'} ${fmt(Math.abs(profit))})`}`, 'sale');
       }
       this.counted = this.counted.slice(-500);

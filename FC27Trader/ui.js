@@ -176,6 +176,15 @@
 #afc-root .sale .n { color: #fff; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #afc-root .sale .m { font-size: 11px; color: var(--dim); }
 #afc-root .sale.unsold { box-shadow: inset 3px 0 #fd7e14; }
+#afc-root .stbl { display: flex; flex-direction: column; gap: 3px; max-height: 300px; overflow-y: auto; scrollbar-width: thin; font-size: 12px; font-variant-numeric: tabular-nums; }
+#afc-root .stbl .r { display: grid; grid-template-columns: var(--cols); align-items: center; gap: 8px; padding: 5px 9px; border-radius: 6px; background: var(--panel2); }
+#afc-root .stbl .r > :not(:first-child) { text-align: right; white-space: nowrap; }
+#afc-root .stbl .r.hd { position: sticky; top: 0; z-index: 1; background: var(--panel); padding-top: 0; font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; }
+#afc-root .stbl .r.cur { box-shadow: inset 3px 0 var(--ok); }
+#afc-root .stbl .n { color: #fff; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#afc-root .stbl .m { font-size: 11px; color: var(--dim); }
+#afc-root .stbl .bar { height: 6px; border-radius: 3px; background: rgba(255,255,255,.06); overflow: hidden; display: flex; }
+#afc-root .stbl .bar > span { height: 100%; background: var(--ok); } #afc-root .stbl .bar > span.neg { background: var(--ko); }
 #afc-root .pos { color: var(--ok); } #afc-root .neg { color: var(--ko); }
 #afc-root .ev { display: grid; grid-template-columns: 58px 14px 1fr; gap: 4px; padding: 2px 6px; border-radius: 4px; font-size: 12px; line-height: 1.45; color: #c9ccd4; }
 #afc-root .ev .tm { color: #6c7180; font-variant-numeric: tabular-nums; }
@@ -262,6 +271,16 @@
   const setting = (label, sub, control) => h('div', { className: 'setting' }, h('span', {}, label, sub ? h('small', { textContent: sub }) : null), control);
   const perH = (v) => (v === null ? '—' : `${fmtSigned(v)} / h`);
   const rate = (a, b) => (a + b ? ` · réussite ${Math.round((100 * a) / (a + b))} %` : '');
+  const sign = (v) => (v > 0 ? 'pos' : v < 0 ? 'neg' : '');
+  const dur = (ms) => (ms >= 36e5 ? `${Math.floor(ms / 36e5)} h ${String(Math.floor((ms % 36e5) / 6e4)).padStart(2, '0')}` : `${Math.max(0, Math.round(ms / 6e4))} min`);
+  const when = (t) => new Date(t).toLocaleString('fr-FR', { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  // Tableau : cols = grid-template-columns, head = intitulés, rows = [cellules, classe, title]
+  function table(cols, head, rows) {
+    const r = (cells, cls = '', title = '') => h('div', { className: `r ${cls}`.trim(), title }, ...cells.map((c) => (c instanceof Node ? c : h('span', { textContent: String(c) }))));
+    const el = h('div', { className: 'stbl', style: `--cols:${cols}` }, r(head, 'hd'), ...rows.map(([cells, cls, title]) => r(cells, cls, title)));
+    return el;
+  }
+  const cell = (text, cls) => h('span', { className: cls, textContent: text });
   const ago = (t) => {
     const m = Math.floor((Date.now() - t) / 6e4);
     return m < 1 ? "à l'instant" : m < 60 ? `il y a ${m} min` : m < 1440 ? `il y a ${Math.floor(m / 60)} h` : `il y a ${Math.floor(m / 1440)} j`;
@@ -742,13 +761,16 @@
       this.sSpin.className = `s-spin${!s.running ? ' off' : s.phase === 'break' || s.phase === 'wait' ? ' pause' : ''}`;
       const rot = snipe && cfg.rotate && s.filters.length > 1 ? ` · changement de cible dans ${Math.max(0, s.rotateAt - s.run.searches)} recherches` : '';
       this.sTarget.replaceChildren(f ? h('span', {}, h('b', { textContent: f.label }), f.buyPrice ? ` · achat ≤ ${fmt(f.buyPrice)} · vente ${fmt(f.sellPrice)}` : '', rot) : 'Aucune cible');
-      const r = s.run;
+      const c = s.stats.current;
       const pause = s.breakUntil ? `pause encore ${fmtClock(s.breakUntil - now)}` : s.breakAt ? `pause dans ${fmtClock(s.breakAt - now)}` : X.BREAK_PRESETS[cfg.breakPreset]?.every ? '' : 'sans pause';
+      const cp = c ? (s.pendingBy((x) => x.sid).get(c.id) ?? { count: 0, expected: 0 }) : null;
+      const cms = c ? c.ms + (snipe ? now - s.lastTick : 0) : 0;
+      const cTotal = c ? c.realized + cp.expected : 0;
       this.sTiles.replaceChildren(
-        tile('Profit attendu', fmtSigned(r.profit), snipe ? perH(perHour(r.profit, now - r.startedAt)) : 'session en cours', r.profit > 0 ? 'pos' : ''),
-        tile('Recherches', fmt(r.searches), snipe ? `${fmt(s.guard.limits().searchesHour)} sur 1 h` : ''),
-        tile('Snipes', fmt(r.snipes), `${r.misses} raté(s) de peu${rate(r.snipes, r.misses)}`),
-        tile('Durée', snipe ? fmtClock(now - r.startedAt) : '—', pause),
+        tile('Profit de la session', c ? fmtSigned(cTotal) : '—', c ? `réel ${fmtSigned(c.realized)} · ${cp.count} en attente · ${perH(perHour(cTotal, cms))}` : 'aucune session en cours', sign(cTotal)),
+        tile('Recherches', fmt(c?.searches ?? 0), snipe ? `${fmt(s.guard.limits().searchesHour)} sur 1 h${c?.snipes ? ` · 1 snipe / ${fmt(Math.round(c.searches / c.snipes))}` : ''}` : ''),
+        tile('Snipes', fmt(c?.snipes ?? 0), `${c?.misses ?? 0} raté(s) de peu${rate(c?.snipes ?? 0, c?.misses ?? 0)}`),
+        tile('Durée de la session', c ? fmtClock(cms) : '—', pause || (c ? `depuis ${when(c.start)}` : '')),
       );
       this.sAct.textContent = snipe ? s.activity : s.on && !s.running ? 'Le sniper reprend dès la fin de la tâche ou de la pause en cours.' : '';
       this.sGo.textContent = snipe ? 'Arrêter le sniper' : 'Lancer le sniper';
@@ -1236,7 +1258,26 @@
       this.salesEl = h('div', { className: 'salelist' });
       this.onSaleEl = h('div', { className: 'salelist' });
       this.refreshBtn = h('button', { type: 'button', className: 'a-link', textContent: '↻ Actualiser', title: 'Relit la liste de transferts chez EA', onclick: () => this.app.refreshPile() });
-      const resetS = h('button', { type: 'button', className: 'a-link', textContent: 'Réinitialiser', onclick: () => confirm('Remettre à zéro le suivi du sniper ?') && this.sniper.resetSession() });
+      const resetS = h('button', { type: 'button', className: 'a-link', textContent: 'Réinitialiser', onclick: () => confirm('Remettre à zéro le suivi du sniper (totaux, sessions, joueurs, jours) ?') && this.sniper.resetSession() });
+      this.sessionsEl = h('div');
+      this.playersEl = h('div');
+      this.daysEl = h('div');
+      this.psort = 'profit';
+      this.psortSeg = h(
+        'div',
+        { className: 'a-seg' },
+        ...[
+          ['profit', 'Profit'],
+          ['snipes', 'Snipes'],
+          ['last', 'Récents'],
+        ].map(([k, l]) => h('button', { type: 'button', value: k, textContent: l, onclick: () => ((this.psort = k), this.renderSales()) })),
+      );
+      const copyP = h('button', { type: 'button', className: 'a-link', textContent: 'Copier (CSV)' });
+      copyP.onclick = async () => {
+        const ok = await copyText(this.playersCsv());
+        copyP.textContent = ok ? 'Copié' : 'Échec';
+        setTimeout(() => (copyP.textContent = 'Copier (CSV)'), 1500);
+      };
       const resetA = h('button', { type: 'button', className: 'a-link', textContent: 'Réinitialiser', onclick: () => confirm('Remettre à zéro dépensé, vendus, perte réalisée et taxe de la Galerie ?') && this.album.resetTotals() });
       const title = (t, extra) => h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: t }), extra);
       return h(
@@ -1244,6 +1285,9 @@
         { className: 'a-sec' },
         block('Liste de transferts', this.relistBtn, hint('Encaisse les ventes, puis remet en vente chaque invendu un palier sous la moins chère du marché (prix vérifié par joueur). Jamais sous le prix d’achat : taxe comprise pour un snipe, prix payé pour une carte Galerie.'), this.pileEl),
         h('div', { className: 'a-block' }, title('Sniper', resetS), this.snipeTiles),
+        h('div', { className: 'a-block' }, title('Sessions du sniper'), hint('Une session couvre le fonctionnement continu du sniper, rechargements et tâches Galerie compris ; plus de 30 min d’interruption en ouvre une nouvelle. Profit rattaché à la session d’achat.'), this.sessionsEl),
+        h('div', { className: 'a-block' }, title('Par joueur', h('span', { className: 'a-row' }, copyP, this.psortSeg)), this.playersEl),
+        h('div', { className: 'a-block' }, title('Par jour'), this.daysEl),
         h('div', { className: 'a-block' }, title('Galerie (achat direct)', resetA), this.albumHero, this.albumTiles),
         block('Dernières ventes', this.salesEl),
         h('div', { className: 'a-block' }, title('Cartes Galerie en vente', this.refreshBtn), hint('Cartes achetées en direct pour la Galerie, recalées sur la liste de transferts à chaque lecture.'), this.onSaleEl),
@@ -1275,7 +1319,11 @@
         tile('Snipes', String(ses.snipes), `${ses.misses} raté(s) de peu${rate(ses.snipes, ses.misses)}`),
         tile('Recherches', fmt(ses.searches), `+ ${fmt(ses.otherSearches)} vérif. de prix${ses.snipes ? ` · 1 snipe / ${fmt(Math.round(ses.searches / ses.snipes))}` : ''}`),
         tile('Temps de fonctionnement', fmtClock(active), ses.since ? `depuis le ${new Date(ses.since).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}` : ''),
+        ...this.statTiles(),
       );
+      this.renderSessions(now);
+      this.renderPlayers();
+      this.renderDays();
       // Galerie
       const t = a.total;
       const pl = a.pendingLoss();
@@ -1298,7 +1346,7 @@
           ? s.sales.slice(0, 30).map((x) =>
               h(
                 'div',
-                { className: 'sale', title: x.buy === null ? 'Carte non achetée par l’extension' : `Acheté ${fmt(x.buy)}, vendu ${fmt(x.price)}` },
+                { className: 'sale', title: x.buy === null ? 'Carte non achetée par l’extension' : `Acheté ${fmt(x.buy)}, vendu ${fmt(x.price)}${x.held ? ` en ${dur(x.held)}` : ''}` },
                 h('span', { className: 'm', textContent: hm(x.at) }),
                 h('span', { className: 'n', textContent: `${x.label}${x.album ? ' · Galerie' : ''}` }),
                 h('span', { className: 'm', textContent: x.buy === null ? fmt(x.price) : `${fmt(x.buy)} → ${fmt(x.price)}` }),
@@ -1324,6 +1372,121 @@
             })
           : [h('div', { className: 'a-empty', textContent: 'Aucune carte Galerie en vente.' })]),
       );
+    }
+
+    statTiles() {
+      const st = this.sniper.stats;
+      const t = Object.values(st.players).reduce((o, p) => ((o.realized += p.realized), (o.gross += p.gross), (o.revenue += p.revenue), (o.holdMs += p.holdMs), (o.sales += p.sales), o), { realized: 0, gross: 0, revenue: 0, holdMs: 0, sales: 0 });
+      const cost = t.revenue - t.realized;
+      const d = st.days[X.dayOf(Date.now())];
+      return [
+        tile('Rendement', cost > 0 ? `${((100 * t.realized) / cost).toFixed(1).replace('.', ',')} %` : '—', t.sales ? `sur ${fmt(cost)} de cartes vendues · taxe EA ${fmt(t.gross - t.revenue)}` : 'aucune vente suivie', sign(t.realized)),
+        tile('Délai de vente moyen', t.sales ? dur(t.holdMs / t.sales) : '—', t.sales ? `entre le snipe et la vente · ${t.sales} vente(s)` : ''),
+        tile('Aujourd’hui', fmtSigned(d?.realized ?? 0), d ? `${d.snipes} snipe(s) · ${d.sales} vente(s) · ${dur(d.ms)}` : 'aucune activité', sign(d?.realized ?? 0)),
+      ];
+    }
+    renderSessions(now) {
+      const s = this.sniper;
+      const st = s.stats;
+      const pend = s.pendingBy((x) => x.sid);
+      const live = s.running && s.task === 'snipe';
+      const list = [...(st.current ? [st.current] : []), ...st.sessions];
+      if (!list.length) return this.sessionsEl.replaceChildren(h('div', { className: 'a-empty', textContent: 'Aucune session enregistrée. Le suivi commence au prochain lancement du sniper.' }));
+      const rows = list.map((x) => {
+        const cur = x === st.current;
+        const ms = x.ms + (cur && live ? now - s.lastTick : 0);
+        const p = pend.get(x.id);
+        const total = x.realized + (p?.expected ?? 0);
+        const top = Object.entries(x.targets ?? {})
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5)
+          .map(([k, v]) => `${k} (${fmt(v)})`)
+          .join(', ');
+        const title = `${when(x.start)} → ${cur ? 'en cours' : when(x.last)} · hors pauses ${dur(x.workMs)} · investi ${fmt(x.spent)}${top ? ` · recherches : ${top}` : ''}`;
+        return [
+          [
+            h('span', {}, cell(when(x.start), 'n'), cur ? cell(' · en cours', 'm') : null),
+            dur(ms),
+            fmt(x.searches),
+            h('span', {}, `${x.snipes}`, cell(` / ${x.misses}`, 'm')),
+            cell(fmtSigned(x.realized), sign(x.realized)),
+            p ? h('span', {}, `${p.count}`, cell(` · ${fmtSigned(p.expected)}`, 'm')) : cell('—', 'm'),
+            cell(perH(perHour(total, ms)), 'm'),
+          ],
+          cur ? 'cur' : '',
+          title,
+        ];
+      });
+      const keep = this.sessionsEl.firstChild?.scrollTop ?? 0;
+      this.sessionsEl.replaceChildren(table('minmax(0,1.6fr) repeat(6, minmax(0,1fr))', ['Début', 'Durée', 'Recherches', 'Snipes / ratés', 'Profit réel', 'En attente', 'Profit / h'], rows));
+      this.sessionsEl.firstChild.scrollTop = keep;
+    }
+    renderPlayers() {
+      const s = this.sniper;
+      const pend = s.pendingBy((x) => X.playerKey(x.defId, x.label));
+      const all = Object.entries(s.stats.players).map(([k, p]) => ({ ...p, pend: pend.get(k) }));
+      for (const b of this.psortSeg.children) b.classList.toggle('active', b.value === this.psort);
+      if (!all.length) return this.playersEl.replaceChildren(h('div', { className: 'a-empty', textContent: 'Aucun joueur suivi pour l’instant.' }));
+      const by = { profit: (p) => p.realized + (p.pend?.expected ?? 0), snipes: (p) => p.snipes, last: (p) => p.last }[this.psort];
+      const rows = all
+        .sort((a, b) => by(b) - by(a))
+        .slice(0, 100)
+        .map((p) => {
+          const title = [
+            p.searches ? `${fmt(p.searches)} recherche(s) ciblée(s)${p.snipes ? ` · 1 snipe / ${fmt(Math.round(p.searches / p.snipes))}` : ''}` : '',
+            `investi ${fmt(p.spent)}`,
+            p.best !== null ? `meilleure vente ${fmtSigned(p.best)}` : '',
+            p.pend ? `${p.pend.count} en attente (${fmt(p.pend.invested)} investis, ${fmtSigned(p.pend.expected)} attendus)` : '',
+          ]
+            .filter(Boolean)
+            .join(' · ');
+          return [
+            [
+              cell(p.label || `#${p.defId}`, 'n'),
+              h('span', {}, `${p.snipes}`, cell(` / ${p.misses}`, 'm')),
+              fmt(p.sales),
+              cell(fmtSigned(p.realized), sign(p.realized)),
+              cell(p.sales ? fmtSigned(Math.round(p.realized / p.sales)) : '—', 'm'),
+              cell(p.sales ? dur(p.holdMs / p.sales) : '—', 'm'),
+              p.pend ? `${p.pend.count}` : cell('—', 'm'),
+            ],
+            '',
+            title,
+          ];
+        });
+      const keep = this.playersEl.firstChild?.scrollTop ?? 0;
+      this.playersEl.replaceChildren(table('minmax(0,1.8fr) repeat(6, minmax(0,1fr))', ['Joueur', 'Snipes / ratés', 'Ventes', 'Profit réel', 'Moy. / vente', 'Délai moyen', 'En attente'], rows));
+      this.playersEl.firstChild.scrollTop = keep;
+    }
+    renderDays() {
+      const days = Object.entries(this.sniper.stats.days)
+        .sort((a, b) => (a[0] < b[0] ? 1 : -1))
+        .slice(0, 14);
+      if (!days.length) return this.daysEl.replaceChildren(h('div', { className: 'a-empty', textContent: 'Aucune journée enregistrée.' }));
+      const max = Math.max(1, ...days.map(([, d]) => Math.abs(d.realized)));
+      const rows = days.map(([k, d]) => [
+        [
+          cell(new Date(`${k}T12:00:00`).toLocaleDateString('fr-FR', { weekday: 'short', day: '2-digit', month: '2-digit' }), 'n'),
+          dur(d.ms),
+          fmt(d.searches),
+          h('span', {}, `${d.snipes}`, cell(` / ${d.misses}`, 'm')),
+          fmt(d.sales),
+          cell(fmtSigned(d.realized), sign(d.realized)),
+          h('div', { className: 'bar' }, h('span', { className: d.realized < 0 ? 'neg' : '', style: `width:${(100 * Math.abs(d.realized)) / max}%` })),
+        ],
+        '',
+        `investi ${fmt(d.spent)} · ${perH(perHour(d.realized, d.ms))}`,
+      ]);
+      this.daysEl.replaceChildren(table('minmax(0,1.2fr) repeat(5, minmax(0,1fr)) minmax(0,1.4fr)', ['Jour', 'Durée', 'Recherches', 'Snipes / ratés', 'Ventes', 'Profit réel', ''], rows));
+    }
+    playersCsv() {
+      const q = (v) => `"${String(v).replace(/"/g, '""')}"`;
+      const pend = this.sniper.pendingBy((x) => X.playerKey(x.defId, x.label));
+      const head = ['joueur', 'defId', 'recherches', 'snipes', 'rates', 'investi', 'ventes', 'profit_reel', 'ventes_brutes', 'delai_moyen_min', 'en_attente'];
+      const lines = Object.entries(this.sniper.stats.players).map(([k, p]) =>
+        [q(p.label), p.defId, p.searches, p.snipes, p.misses, p.spent, p.sales, p.realized, p.gross, p.sales ? Math.round(p.holdMs / p.sales / 6e4) : '', pend.get(k)?.count ?? 0].join(';'),
+      );
+      return [head.join(';'), ...lines].join('\n');
     }
 
     // ================= Journal =================
