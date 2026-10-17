@@ -89,6 +89,15 @@
 #afc-root .a-tile-top { display: flex; align-items: center; gap: .5rem; }
 #afc-root .a-tile-name { flex: 1; min-width: 0; font-size: .95rem; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #afc-root .a-tile-stats { display: flex; flex-wrap: wrap; gap: .4rem .9rem; font-size: .74rem; color: var(--dim); }
+#afc-root .a-tile.picked { border-color: var(--ac); box-shadow: inset 0 0 0 1px var(--ac); }
+#afc-root .a-tile .a-check { flex: none; cursor: pointer; }
+#afc-root .a-hits { display: flex; flex-direction: column; gap: 3px; max-height: 320px; overflow-y: auto; scrollbar-width: thin; }
+#afc-root .a-hit { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 4px 10px; padding: 6px 9px; border-radius: 6px; background: var(--panel2); font-size: 12px; }
+#afc-root .a-hit.pick { cursor: pointer; } #afc-root .a-hit.pick:hover { background: #222c3a; }
+#afc-root .a-hit .n { color: #fff; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#afc-root .a-hit .n i { font-style: normal; color: #ffd76a; margin-right: .35rem; }
+#afc-root .a-hit .m { font-size: 11px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#afc-root .a-hit .ok { color: var(--ok); } #afc-root .a-hit .ac { color: var(--ac); }
 #afc-root .a-tile-foot { margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: .5rem; font-size: .75rem; color: var(--ac); font-weight: 600; }
 #afc-root .a-x { background: none; border: 0; color: var(--dim); font-size: 15px; cursor: pointer; padding: 0 2px; }
 #afc-root .a-x:hover:not(:disabled) { color: #fff; } #afc-root .a-x:disabled { opacity: .3; cursor: default; }
@@ -271,6 +280,8 @@
   const setting = (label, sub, control) => h('div', { className: 'setting' }, h('span', {}, label, sub ? h('small', { textContent: sub }) : null), control);
   const perH = (v) => (v === null ? '—' : `${fmtSigned(v)} / h`);
   const rate = (a, b) => (a + b ? ` · réussite ${Math.round((100 * a) / (a + b))} %` : '');
+  // Recherche insensible à la casse et aux accents
+  const norm = (t) => String(t ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
   const sign = (v) => (v > 0 ? 'pos' : v < 0 ? 'neg' : '');
   const dur = (ms) => (ms >= 36e5 ? `${Math.floor(ms / 36e5)} h ${String(Math.floor((ms % 36e5) / 6e4)).padStart(2, '0')}` : `${Math.max(0, Math.round(ms / 6e4))} min`);
   const when = (t) => new Date(t).toLocaleString('fr-FR', { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
@@ -355,6 +366,10 @@
     text = '';
     page = 0;
     buyKey = null;
+    buyKeys = [];
+    homeText = '';
+    homeFilter = 'all';
+    homeSel = new Set();
     buyRows = [];
     jfilter = 'all';
     shownEventId = 0;
@@ -581,7 +596,7 @@
         this.renderSettings();
         if (this.body.firstChild !== this.settingsSec) this.body.replaceChildren(this.settingsSec);
       }
-      if (tab !== 'gallery' || !this.setKey) this.actionbar.classList.add('hidden');
+      if (tab !== 'gallery' || (!this.setKey && !this.homeSel.size)) this.actionbar.classList.add('hidden');
       this.body.scrollTop = top;
     }
 
@@ -878,35 +893,73 @@
       this.renderAll();
     }
     renderHome() {
+      if (!this.homeWrap) {
+        this.homeSearch = h('input', { type: 'search', className: 'a-in', placeholder: 'Rechercher un set ou un joueur', style: 'flex:1;min-width:200px' });
+        this.homeSearch.oninput = () => {
+          this.homeText = norm(this.homeSearch.value.trim());
+          this.renderHomeContent();
+        };
+        this.homeSeg = h('div', { className: 'a-tabs' });
+        this.homePickAll = h('button', { type: 'button', className: 'a-link' });
+        this.homeContent = h('div', { className: 'a-sec', style: 'max-width:none' });
+        this.homeWrap = h('div', {}, h('div', { className: 'a-ctl' }, this.homeSeg, this.homeSearch, this.homePickAll), this.homeContent);
+      }
+      if (this.body.firstChild !== this.homeWrap) this.body.replaceChildren(this.homeWrap);
+      this.renderHomeContent();
+    }
+    renderHomeContent() {
       const a = this.album;
-      const sets = a.setList();
-      const add = h(
-        'div',
-        { className: 'a-tile add', onclick: () => window.open(FUTGG_GALLERY, '_blank', 'noopener') },
-        h('b', { textContent: '+ Importer un set fut.gg' }),
-        hint(`Ouvre un set de la Galerie sur fut.gg, puis clique « Envoyer à ${X.APP} ».`),
-      );
-      const c = a.catalog;
-      const catalog = h(
-        'div',
-        { className: 'a-tile add', title: 'Lit tous les sets de la Galerie sur fut.gg (sets retirés à la main exclus)', onclick: () => a.requestCatalog(true) },
-        h('b', { textContent: c.busy ? 'Catalogue fut.gg…' : '↻ Réimporter tous les sets fut.gg' }),
-        hint(c.busy ? c.text : `${c.at ? `Catalogue lu ${ago(c.at)}` : 'Catalogue jamais lu'}${this.cfg.autoCatalog ? ' · relu à l’ouverture (toutes les 6 h)' : ''}`),
-      );
+      const t = this.homeText;
       const targets = new Set(this.app.targets().filter((f) => f.album).map((f) => f.defId));
-      const tiles = sets.map((s) => {
+      const info = a.setList().map((s) => {
         const all = a.setPlayers(s);
-        const got = all.filter((p) => p.collected).length;
         const missing = all.filter((p) => !p.collected);
-        const left = missing.reduce((t, p) => t + (p.minPrice || 0), 0);
+        return { s, all, missing, hits: t ? all.filter((p) => norm(p.name).includes(t)) : [], nameHit: !t || norm(s.name).includes(t) };
+      });
+      // Sets complétés ou retirés : plus cochables
+      const byKey = new Map(info.map((x) => [x.s.key, x]));
+      for (const k of [...this.homeSel]) if (!byKey.get(k)?.missing.length) this.homeSel.delete(k);
+      const counts = { all: info.length, todo: info.filter((x) => x.missing.length).length, done: info.filter((x) => !x.missing.length).length };
+      this.homeSeg.replaceChildren(
+        ...[
+          ['all', 'Tous'],
+          ['todo', 'Incomplets'],
+          ['done', 'Complets'],
+        ].map(([id, label]) => h('button', { type: 'button', className: this.homeFilter === id ? 'active' : '', textContent: `${label} ${counts[id]}`, onclick: () => ((this.homeFilter = id), this.renderHomeContent()) })),
+      );
+      const shown = info.filter((x) => (this.homeFilter === 'all' || (this.homeFilter === 'todo') === x.missing.length > 0) && (x.nameHit || x.hits.length));
+      const pickable = shown.filter((x) => x.missing.length);
+      const allPicked = pickable.length > 0 && pickable.every((x) => this.homeSel.has(x.s.key));
+      this.homePickAll.textContent = allPicked ? 'Décocher les sets affichés' : `Cocher les ${pickable.length} set(s) incomplet(s) affiché(s)`;
+      this.homePickAll.disabled = !pickable.length;
+      this.homePickAll.onclick = () => {
+        for (const x of pickable) allPicked ? this.homeSel.delete(x.s.key) : this.homeSel.add(x.s.key);
+        this.renderHomeContent();
+      };
+      const tiles = shown.map(({ s, all, missing, hits }) => {
+        const got = all.length - missing.length;
+        const left = missing.reduce((n, p) => n + (p.minPrice || 0), 0);
         const sel = missing.filter((p) => a.isSelected(p.defId)).length;
         const tg = missing.filter((p) => targets.has(p.defId)).length;
+        const picked = this.homeSel.has(s.key);
         return h(
           'div',
-          { className: 'a-tile', onclick: () => this.openSet(s.key) },
+          { className: `a-tile${picked ? ' picked' : ''}`, onclick: () => this.openSet(s.key) },
           h(
             'div',
             { className: 'a-tile-top' },
+            missing.length
+              ? h('span', {
+                  className: `a-check${picked ? ' on' : ''}`,
+                  textContent: '✓',
+                  title: picked ? 'Retirer de la sélection de sets' : 'Cocher pour sniper ou acheter plusieurs sets d’un coup',
+                  onclick: (ev) => {
+                    ev.stopPropagation();
+                    picked ? this.homeSel.delete(s.key) : this.homeSel.add(s.key);
+                    this.renderHomeContent();
+                  },
+                })
+              : null,
             h('span', { className: 'a-tile-name', textContent: s.name, title: s.name }),
             s.url ? h('button', { type: 'button', className: 'a-x', textContent: '↗', title: 'Ouvrir sur fut.gg (renvoyer pour mettre à jour)', onclick: (ev) => (ev.stopPropagation(), window.open(s.url, '_blank', 'noopener')) }) : null,
             h('button', { type: 'button', className: 'a-x', textContent: '×', title: 'Retirer le set', disabled: a.running, onclick: (ev) => (ev.stopPropagation(), confirm(`Retirer le set « ${s.name} » ?`) && a.removeSet(s.key)) }),
@@ -917,6 +970,7 @@
             h('span', { textContent: `${all.length} joueurs` }),
             s.needed ? h('span', { textContent: `${s.needed} cartes requises` }) : null,
             left ? h('span', { textContent: `manquants ~${fmt(left)} crédits` }) : null,
+            hits.length ? h('span', { className: 'a-pill ac', textContent: `${hits.length} joueur(s) trouvé(s)` }) : null,
             sel ? h('span', { className: 'a-pill ac', textContent: `${sel} sélectionné(s)` }) : null,
             tg ? h('span', { className: 'a-pill', style: 'color:var(--warn);border-color:rgba(255,179,71,.4)', textContent: `🎯 ${tg} ciblé(s)` }) : null,
           ),
@@ -924,7 +978,24 @@
           h('div', { className: 'a-tile-foot' }, h('span', { style: 'color:#dfe4ec;font-weight:400', textContent: `Collectés ${got} / ${all.length}` }), h('span', { textContent: 'Voir les joueurs →' })),
         );
       });
-      const intro = sets.length
+      const c = a.catalog;
+      const extra = t
+        ? []
+        : [
+            h(
+              'div',
+              { className: 'a-tile add', onclick: () => window.open(FUTGG_GALLERY, '_blank', 'noopener') },
+              h('b', { textContent: '+ Importer un set fut.gg' }),
+              hint(`Ouvre un set de la Galerie sur fut.gg, puis clique « Envoyer à ${X.APP} ».`),
+            ),
+            h(
+              'div',
+              { className: 'a-tile add', title: 'Lit tous les sets de la Galerie sur fut.gg (sets retirés à la main exclus)', onclick: () => a.requestCatalog(true) },
+              h('b', { textContent: c.busy ? 'Catalogue fut.gg…' : '↻ Réimporter tous les sets fut.gg' }),
+              hint(c.busy ? c.text : `${c.at ? `Catalogue lu ${ago(c.at)}` : 'Catalogue jamais lu'}${this.cfg.autoCatalog ? ' · relu à l’ouverture (toutes les 6 h)' : ''}`),
+            ),
+          ];
+      const intro = info.length
         ? null
         : h(
             'div',
@@ -935,10 +1006,80 @@
               {},
               h('li', { textContent: 'Les sets de la Galerie fut.gg sont importés à l’ouverture (ou « ↻ Réimporter »), ou un par un avec « + Importer un set fut.gg ».' }),
               h('li', { textContent: 'Ouvre un set : les joueurs déjà collectés sont lus chez EA.' }),
-              h('li', { textContent: 'Sélectionne les cartes manquantes : « Sniper » (sous le prix du marché, revente avec profit) ou « Acheter maintenant » (au prix du marché, coût = taxe EA).' }),
+              h('li', { textContent: 'Sélectionne les cartes manquantes, ou coche plusieurs sets : « Sniper » (sous le prix du marché, revente avec profit) ou « Acheter maintenant » (au prix du marché, coût = taxe EA).' }),
             ),
           );
-      this.body.replaceChildren(...[h('div', { className: 'a-grid' }, ...tiles, add, catalog), intro].filter(Boolean));
+      const top = this.body.scrollTop;
+      this.homeContent.replaceChildren(
+        ...[
+          t.length >= 2 ? this.playerHits(info) : null,
+          tiles.length || extra.length ? h('div', { className: 'a-grid' }, ...tiles, ...extra) : h('div', { className: 'a-empty', textContent: 'Aucun set ne correspond.' }),
+          intro,
+        ].filter(Boolean),
+      );
+      this.body.scrollTop = top;
+      this.renderHomeActionbar(byKey);
+    }
+    // Joueurs trouvés dans tous les sets : un clic sélectionne une carte manquante, ↗ ouvre son set
+    playerHits(info) {
+      const a = this.album;
+      const seen = new Map();
+      for (const { s, hits } of info) for (const p of hits) if (!seen.has(p.defId)) seen.set(p.defId, { p, sets: [s] });
+      else seen.get(p.defId).sets.push(s);
+      const list = [...seen.values()].sort((x, y) => Number(x.p.collected) - Number(y.p.collected) || (y.p.rating || 0) - (x.p.rating || 0));
+      if (!list.length) return block('Joueurs', h('div', { className: 'a-empty', textContent: 'Aucun joueur ne correspond.' }));
+      const rows = list.slice(0, 60).map(({ p, sets }) => {
+        const sel = !p.collected && a.isSelected(p.defId);
+        const price = Number(a.selection[p.defId]) || p.minPrice || 0;
+        const row = h(
+          'div',
+          { className: `a-hit${p.collected || a.running ? '' : ' pick'}`, title: sets.map((x) => x.name).join(', ') },
+          p.collected ? h('span', { className: 'ok', textContent: '✓' }) : h('span', { className: `a-check${sel ? ' on' : ''}`, textContent: '✓' }),
+          h('span', { className: 'n' }, p.rating ? h('i', { textContent: String(p.rating) }) : null, p.name, h('span', { className: 'm', textContent: ` · ${sets[0].name}${sets.length > 1 ? ` +${sets.length - 1}` : ''}` })),
+          h('span', { className: `m${p.collected ? ' ok' : sel ? ' ac' : ''}`, textContent: p.collected ? 'Collecté' : price ? `${fmt(price)} crédits` : 'sans prix' }),
+          h('button', { type: 'button', className: 'a-x', textContent: '↗', title: 'Ouvrir le set', onclick: (ev) => (ev.stopPropagation(), this.openSet(sets[0].key)) }),
+        );
+        if (!p.collected && !a.running)
+          row.onclick = () => {
+            a.setSelected(p.defId, !sel);
+            a.touch();
+            this.renderHomeContent();
+          };
+        return row;
+      });
+      return block(`Joueurs (${list.length}${list.length > 60 ? ', 60 premiers' : ''})`, hint('Touche un joueur manquant pour le sélectionner ; il est acheté ou snipé avec les sets cochés ou depuis son set.'), h('div', { className: 'a-hits' }, ...rows));
+    }
+    // Plusieurs sets cochés : toutes leurs cartes manquantes, sniper ou achat direct d'un coup
+    renderHomeActionbar(byKey) {
+      const a = this.album;
+      const keys = [...this.homeSel];
+      if (!keys.length) return this.actionbar.classList.add('hidden');
+      const missing = [...new Map(keys.flatMap((k) => byKey.get(k)?.missing ?? []).map((p) => [p.defId, p])).values()];
+      const spend = missing.reduce((n, p) => n + (Number(a.selection[p.defId]) || p.minPrice || 0), 0);
+      const unpriced = missing.filter((p) => !(Number(a.selection[p.defId]) || p.minPrice)).length;
+      const ids = missing.map((p) => p.defId);
+      this.actionbar.classList.remove('hidden');
+      this.actionbar.replaceChildren(
+        h(
+          'div',
+          { className: 'a-row a-grow' },
+          h('span', { className: 'a-count', textContent: `${keys.length} set(s) coché(s)` }),
+          h('span', { className: 'a-proj' }, `${missing.length} carte(s) manquante(s) · achat direct `, h('b', { textContent: `~${fmt(spend)}` }), unpriced ? h('span', { className: 'dim', textContent: ` + ${unpriced} sans prix` }) : null),
+        ),
+        h(
+          'div',
+          { className: 'a-row' },
+          btn('Décocher', () => (this.homeSel.clear(), this.renderHomeContent(), this.actionbar.classList.add('hidden')), 'ghost'),
+          btn(`🎯 Sniper (${ids.length})`, () => (this.homeSel.clear(), this.app.snipeSelection(ids)), '', {
+            disabled: !ids.length,
+            title: 'Toutes les cartes manquantes des sets cochés deviennent des cibles du sniper (alternance) : achat sous le prix du marché, revente avec profit.',
+          }),
+          btn(a.mode === 'buy' ? 'Achats en cours…' : `Acheter maintenant (${ids.length})`, () => {
+            if (a.mode !== 'buy') for (const id of ids) a.setSelected(id, true);
+            this.openBuy(keys);
+          }, 'primary', { disabled: (!ids.length || a.running) && a.mode !== 'buy', title: 'Achat direct au prix du marché de toutes les cartes manquantes des sets cochés, set par set (décochables dans la fenêtre)' }),
+        ),
+      );
     }
     renderSet() {
       const a = this.album;
@@ -957,7 +1098,7 @@
       );
       const search = h('input', { type: 'search', className: 'a-in', placeholder: 'Rechercher un joueur', value: this.text });
       search.oninput = () => {
-        this.text = search.value.trim().toLowerCase();
+        this.text = norm(search.value.trim());
         this.page = 0;
         this.renderGrid(lists, queue);
       };
@@ -973,7 +1114,7 @@
     renderGrid(lists, queue) {
       const a = this.album;
       const t = this.text;
-      const list = lists[this.filter].filter((p) => !t || p.name.toLowerCase().includes(t));
+      const list = lists[this.filter].filter((p) => !t || norm(p.name).includes(t));
       const pages = Math.max(1, Math.ceil(list.length / PAGE_CARDS));
       this.page = Math.min(this.page, pages - 1);
       const shown = list.slice(this.page * PAGE_CARDS, (this.page + 1) * PAGE_CARDS);
@@ -1073,18 +1214,22 @@
 
     // --- Fenêtre « Acheter des cartes Galerie » ---
 
-    openBuy(key) {
-      const set = this.album.sets[key];
-      if (!set) return;
+    // keys : un set ou plusieurs (sets cochés de l'accueil Galerie)
+    openBuy(keys) {
+      const sets = [].concat(keys).map((k) => this.album.sets[k]).filter(Boolean);
+      if (!sets.length) return;
+      this.buyKeys = sets.map((x) => x.key);
+      const key = this.buyKeys.join('|');
       this.buyKey = key;
       const running = this.album.running;
-      this.buyRows = running || (this.buyRan && this.buyRanKey === key) ? this.album.queue.map((q) => q.defId) : this.selectedOf(set).map((p) => p.defId);
+      this.buyRows = running || (this.buyRan && this.buyRanKey === key) ? this.album.queue.map((q) => q.defId) : [...new Set(sets.flatMap((x) => this.selectedOf(x).map((p) => p.defId)))];
       if (!running && !(this.buyRan && this.buyRanKey === key)) this.buyRan = false;
       this.buyLayer.classList.add('open');
       this.renderBuy();
     }
     closeBuy() {
       this.buyKey = null;
+      this.buyKeys = [];
       this.buyRan = false;
       this.buyLayer.classList.remove('open');
       if (this.isOpen) this.renderBody();
@@ -1099,8 +1244,11 @@
     }
     renderBuy() {
       const a = this.album;
-      const set = a.sets[this.buyKey];
-      if (!set) return this.closeBuy();
+      const sets = this.buyKeys.map((k) => a.sets[k]).filter(Boolean);
+      if (!sets.length) return this.closeBuy();
+      const multi = sets.length > 1;
+      const setOf = new Map();
+      for (const x of [...sets].reverse()) for (const id of Object.keys(x.players ?? {})) setOf.set(Number(id), x.name);
       const cfg = this.cfg;
       const running = a.running;
       const queue = new Map(a.queue.map((q) => [q.defId, q]));
@@ -1113,7 +1261,7 @@
       const head = h(
         'div',
         { className: 'a-head' },
-        h('div', { className: 'a-text' }, h('div', { className: 'a-eyebrow', textContent: 'Galerie · Achat direct' }), h('div', { className: 'a-title', textContent: `Acheter des cartes · ${set.name}` }), h('div', { className: 'a-sub', textContent: running ? 'Achat des cartes au prix du marché, patiente…' : 'Achat au prix du marché, un bouton lance tout. Le sniper est suspendu pendant les achats puis reprend.' })),
+        h('div', { className: 'a-text' }, h('div', { className: 'a-eyebrow', textContent: 'Galerie · Achat direct' }), h('div', { className: 'a-title', textContent: `Acheter des cartes · ${multi ? `${sets.length} sets` : sets[0].name}`, title: sets.map((x) => x.name).join(', ') }), h('div', { className: 'a-sub', textContent: running ? 'Achat des cartes au prix du marché, patiente…' : 'Achat au prix du marché, un bouton lance tout. Le sniper est suspendu pendant les achats puis reprend.' })),
         h('button', { type: 'button', className: 'a-close', textContent: '×', title: 'Fermer', onclick: () => this.closeBuy(), disabled: running }),
       );
       const listRows = rows.map(({ id, p, q }) => {
@@ -1132,7 +1280,7 @@
           'div',
           { className: `a-brow${inc || q ? '' : ' off'}` },
           h('span', { className: `a-check${inc || (q && showRun) ? ' on' : ''}`, textContent: '✓' }),
-          h('span', { className: 'a-bn' }, p.rating ? h('i', { textContent: String(p.rating) }) : null, p.name),
+          h('span', { className: 'a-bn' }, p.rating ? h('i', { textContent: String(p.rating) }) : null, p.name, multi ? h('span', { style: 'color:var(--dim);font-weight:400', textContent: ` · ${q?.set ?? setOf.get(Number(id)) ?? ''}` }) : null),
           showRun ? h('span') : price,
           h('span', { className: `a-bs ${st[1]}`, textContent: st[0] + (q?.note && isFailed(q) && q.status !== 'moved' ? ` · ${q.note}` : '') }),
         );

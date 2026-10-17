@@ -158,6 +158,7 @@
         isCollected: (defId) => album.isCollected(defId),
         albumSold: (i) => album.recordSold(i),
         albumPrice: (id) => album.bought[id]?.price ?? 0,
+        albumOnSale: () => Object.values(album.bought).filter((b) => b.state === 'active').length,
         onListed: (id, price) => album.onListed(id, price),
         otherBusy: () => album.running,
         afterTask: () => app.resume(),
