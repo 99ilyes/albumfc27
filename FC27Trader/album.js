@@ -43,6 +43,16 @@
   // Annonce publiée depuis plus d'une minute (FST écarte les annonces toutes fraîches du prix de référence)
   const DURATIONS = [3600, 10800, 21600, 43200, 86400, 259200];
   const settled = (sr) => !Number.isFinite(sr) || Math.floor(((DURATIONS.find((d) => sr < d) ?? DURATIONS[DURATIONS.length - 1]) - sr) / 60) > 1;
+  // Score Galerie d'une carte : barème communautaire FC 27 (non publié par EA, ajustable en cours de saison).
+  // Or 75-99 selon la note, argent 35, bronze 20 ; rareté spéciale x1,25 (estimation). Bonus de tags non comptés.
+  const GOLD_SCORE = { 75: 90, 76: 100, 77: 120, 78: 140, 79: 160, 80: 180, 81: 280, 82: 340, 83: 410, 84: 830, 85: 2100, 86: 4100, 87: 5500, 88: 8300, 89: 11e3, 90: 14e3, 91: 19e3, 92: 2e4, 93: 25e3, 94: 3e4, 95: 4e4, 96: 55e3, 97: 85e3, 98: 9e4, 99: 1e5 };
+  const itemScore = (rating, rareflag) => {
+    const r = Math.floor(Number(rating) || 0);
+    if (r < 40) return 0;
+    const base = r >= 99 ? 1e5 : r >= 75 ? GOLD_SCORE[r] : r >= 65 ? 35 : 20;
+    return Math.round(base * (Number(rareflag) > 1 ? 1.25 : 1));
+  };
+  X.itemScore = itemScore;
   const validId = (v) => (Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : null);
 
   function loadBought() {
@@ -300,6 +310,98 @@
     proposedSets() {
       const c = X.coins();
       return c === null ? [] : this.planSets(this.setList().map((s) => s.key), c);
+    }
+
+    // --- Objectif niveau Galerie : points estimés gagnés par carte achetée ---
+
+    scoreOf(p) {
+      return itemScore(p.rating, p.rareflag);
+    }
+    // Emplacements d'un set : cartes requises, sinon tous ses joueurs
+    slotsOf(set) {
+      const n = Object.keys(set.players ?? {}).length;
+      return set.needed > 0 && set.needed < n ? set.needed : n;
+    }
+    // Meilleurs scores collectés de chaque set, dans la limite de ses emplacements
+    levelState() {
+      const state = new Map();
+      for (const s of this.setList()) {
+        const slots = this.slotsOf(s);
+        const top = this.setPlayers(s)
+          .filter((p) => p.collected)
+          .map((p) => this.scoreOf(p))
+          .sort((x, y) => y - x)
+          .slice(0, slots);
+        state.set(s.key, { slots, top });
+      }
+      return state;
+    }
+    estimatedScore() {
+      let t = 0;
+      for (const { top } of this.levelState().values()) for (const v of top) t += v;
+      return t;
+    }
+    // Glouton paresseux sur points / crédit : une carte compte dans chaque set où elle entre (ou remplace une carte plus faible).
+    // need : points à gagner ; budget : crédits engagés au plus (achats successifs, sans compter les reventes)
+    planLevel(need, budget) {
+      const state = this.levelState();
+      const where = new Map();
+      for (const s of this.setList())
+        for (const p of Object.values(s.players ?? {})) {
+          if (this.refreshCollected(p).collected || !this.priceOf(p) || !this.scoreOf(p)) continue;
+          const w = where.get(p.defId) ?? { p, keys: [], price: this.priceOf(p), score: this.scoreOf(p) };
+          w.keys.push(s.key);
+          where.set(p.defId, w);
+        }
+      const gainOf = (w) =>
+        w.keys.reduce((t, k) => {
+          const st = state.get(k);
+          return t + (st.top.length < st.slots ? w.score : Math.max(0, w.score - st.top[st.top.length - 1]));
+        }, 0);
+      const ratio = (x) => x.gain / x.w.price;
+      const heap = [...where.values()].map((w) => ({ w, gain: gainOf(w) })).filter((x) => x.gain > 0);
+      heap.sort((a, b) => ratio(b) - ratio(a));
+      const picks = [];
+      let spend = 0;
+      let gain = 0;
+      while (heap.length && gain < need && budget - spend >= 150) {
+        const x = heap.shift();
+        const g = gainOf(x.w);
+        if (g < x.gain) {
+          x.gain = g;
+          if (g > 0) {
+            let i = heap.findIndex((y) => ratio(y) < ratio(x));
+            heap.splice(i < 0 ? heap.length : i, 0, x);
+          }
+          continue;
+        }
+        if (spend + x.w.price > budget) continue;
+        picks.push({ p: x.w.p, price: x.w.price, gain: g, keys: x.w.keys });
+        spend += x.w.price;
+        gain += g;
+        for (const k of x.w.keys) {
+          const st = state.get(k);
+          st.top.push(x.w.score);
+          st.top.sort((a, b) => b - a);
+          if (st.top.length > st.slots) st.top.pop();
+        }
+      }
+      return { picks, spend, gain, cost: picks.reduce((t, x) => t + this.costFor(x.price), 0), candidates: where.size };
+    }
+    async buyLevel(picks) {
+      if (this.running) return;
+      const tol = tolOf(this.getConfig());
+      const queue = picks.map(({ p }) => {
+        this.setSelected(p.defId, true);
+        return this.entryOf(p, 'Objectif niveau', tol);
+      });
+      if (!queue.length) return this.log('Objectif niveau : aucune carte à acheter');
+      const gain = picks.reduce((t, x) => t + x.gain, 0);
+      this.log(`Objectif niveau : ${queue.length} carte(s) pour ~${fmtNum(gain)} points estimés, de la plus rentable (points / crédit) à la moins rentable`);
+      this.queue = queue;
+      save(K_QUEUE, this.queue);
+      this.touch();
+      await this.runQueue();
     }
 
     // Joueurs présents au club (scan page par page) puis Galerie EA (joueurs passés) ; true si mené à terme

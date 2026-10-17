@@ -132,6 +132,9 @@
     afterBuy: 'relist',
     markupPct: 5,
     autoCatalog: true,
+    levelTarget: 3e6,
+    levelScore: 0,
+    levelBudget: 0,
     tab: 'snipe',
   };
   const K_CONFIG = `${X.SNIPE_NS}:config`;
@@ -185,10 +188,32 @@
       X.netItems.set(defId, { collected: it.isCollected === true || !!X.netItems.get(defId)?.collected });
     }
   }
+  // Score et niveau Galerie s'ils passent dans une réponse EA (format non documenté : champs cherchés par nom)
+  X.galleryLive = null;
+  function recordGallery(url, j) {
+    const found = { score: 0, level: 0 };
+    const walk = (o, depth) => {
+      if (!o || typeof o !== 'object' || depth > 4) return;
+      for (const [k, v] of Object.entries(o)) {
+        if (typeof v === 'number' && v > 0) {
+          if (/^(gallery|total|overall)?_?score$/i.test(k) && v > found.score) found.score = v;
+          else if (/^(gallery|player)?_?level$/i.test(k) && v <= 100 && v > found.level) found.level = v;
+        } else walk(v, depth + 1);
+      }
+    };
+    walk(j, 0);
+    if (found.score || found.level) X.galleryLive = { ...found, url: String(url).replace(/\?.*$/, ''), at: Date.now() };
+  }
   function onResponse(url, status, body) {
     if (status !== 200) return;
     const text = typeof body === 'string' ? body : null;
     let j = typeof body === 'object' && body ? body : null;
+    if (/\/ut\/game\/[^?]*gallery/i.test(url)) {
+      try {
+        j ??= JSON.parse(text);
+        recordGallery(url, j);
+      } catch {}
+    }
     if (/\/ut\/game\//i.test(url) && (j || /"itemData"/.test(text ?? ''))) {
       try {
         j ??= JSON.parse(text);

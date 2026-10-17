@@ -1013,6 +1013,7 @@
       this.homeContent.replaceChildren(
         ...[
           t.length >= 2 ? this.playerHits(info) : null,
+          !t && info.length ? this.levelBlock() : null,
           !t && info.length ? this.proposalBlock() : null,
           tiles.length || extra.length ? h('div', { className: 'a-grid' }, ...tiles, ...extra) : h('div', { className: 'a-empty', textContent: 'Aucun set ne correspond.' }),
           intro,
@@ -1126,6 +1127,94 @@
         h('div', { className: 'a-hits', style: 'max-height:none' }, ...list),
       );
     }
+    // Objectif niveau Galerie : cartes qui rapportent le plus de points estimés par crédit, jusqu'au score visé
+    levelPlan() {
+      const a = this.album;
+      const cfg = this.cfg;
+      const est = a.estimatedScore();
+      const live = X.galleryLive?.score || 0;
+      const current = cfg.levelScore || live || est;
+      const need = Math.max(0, cfg.levelTarget - current);
+      const coins = X.coins();
+      const budget = cfg.levelBudget || coins || 0;
+      return { est, live, current, need, budget, coins, plan: need && budget ? a.planLevel(need, budget) : { picks: [], spend: 0, gain: 0, cost: 0, candidates: 0 } };
+    }
+    levelBlock() {
+      const a = this.album;
+      const cfg = this.cfg;
+      const L = this.levelPlan();
+      const { plan } = L;
+      const num = (key, value, placeholder, title) => {
+        const i = h('input', { type: 'number', className: 'a-in', min: '0', step: '1000', value: value ? String(value) : '', placeholder, title, style: 'width:130px;text-align:right' });
+        i.onchange = () => {
+          this.app.setConfig({ [key]: Math.max(0, Math.floor(Number(i.value) || 0)) });
+          this.renderHomeContent();
+        };
+        return i;
+      };
+      const field = (label, input) => h('label', { className: 'a-row', style: 'gap:.4rem;font-size:.75rem;color:var(--dim)' }, label, input);
+      const inputs = h(
+        'div',
+        { className: 'a-row', style: 'gap:.5rem 1rem' },
+        field('Score actuel', num('levelScore', cfg.levelScore, fmt(L.live || L.est), 'Score Galerie affiché dans le jeu. Vide : score lu dans la Web App, sinon estimé.')),
+        field('Objectif', num('levelTarget', cfg.levelTarget, '3000000', 'Niveau 10 : ~3 000 000 points (estimation des joueurs, EA n’a pas publié le barème)')),
+        field('Budget', num('levelBudget', cfg.levelBudget, L.coins == null ? 'solde' : fmt(L.coins), 'Crédits engagés au plus. Vide : le solde.')),
+      );
+      const src = cfg.levelScore ? 'saisi' : L.live ? 'lu dans la Web App, à vérifier' : 'estimé sur les sets importés, sans bonus de tags';
+      const pct = L.need ? Math.min(100, Math.round((100 * plan.gain) / L.need)) : 100;
+      const reach = L.need && plan.gain >= L.need;
+      const keep = cfg.afterBuy === 'keep';
+      const status = !L.need
+        ? h('div', { className: 'a-block-hint', style: 'color:var(--ok)', textContent: `Objectif atteint (${fmt(L.current)} points, ${src}).` })
+        : h(
+            'div',
+            { className: 'a-proj' },
+            h('span', {}, 'Manque ', h('b', { textContent: fmt(L.need) }), ` (score ${fmt(L.current)}, ${src})`),
+            plan.picks.length ? h('span', {}, `plan ${plan.picks.length} carte(s) · `, h('b', { textContent: `+${fmt(plan.gain)}` }), ` points (${pct} %)`) : null,
+            plan.picks.length ? h('span', {}, 'engagés ', h('b', { textContent: `~${fmt(plan.spend)}` })) : null,
+            plan.picks.length ? h('span', {}, `coût réel${keep ? ' (club)' : ''} `, h('b', { className: 'neg', textContent: `~${fmt(plan.cost)}` })) : null,
+            plan.picks.length && !reach ? h('span', { className: 'warn', textContent: 'budget insuffisant : relancer après les ventes' }) : null,
+          );
+      const shown = this.levelAll ? plan.picks : plan.picks.slice(0, 8);
+      const rows = shown.map(({ p, price, gain, keys }) =>
+        h(
+          'div',
+          { className: 'a-hit', title: keys.map((k) => a.sets[k]?.name).filter(Boolean).join('\n') },
+          h('span', { className: 'ac', textContent: `+${fmt(gain)}` }),
+          h('span', { className: 'n' }, p.rating ? h('i', { textContent: String(p.rating) }) : null, p.name, h('span', { className: 'm', textContent: ` · ${keys.length} set(s)` })),
+          h('span', { className: 'm', textContent: `${fmt(price)} · ${fmt(Math.round((gain / price) * 1e3))} pts / 1k` }),
+          h('button', { type: 'button', className: 'a-x', textContent: '↗', title: 'Ouvrir le set', onclick: () => this.openSet(keys[0]) }),
+        ),
+      );
+      const more = plan.picks.length > 8 ? h('button', { type: 'button', className: 'a-link', textContent: this.levelAll ? 'Réduire' : `Voir les ${plan.picks.length} cartes`, onclick: () => ((this.levelAll = !this.levelAll), this.renderHomeContent()) }) : null;
+      const go = btn(a.mode === 'buy' ? 'Achats en cours…' : `Acheter le plan (${plan.picks.length})`, () => void this.runLevel(), 'small primary', {
+        disabled: !plan.picks.length || a.running,
+        title: 'Achète au prix du marché les cartes du plan, de la plus rentable à la moins rentable, puis les traite selon « Après achat ». Le sniper est suspendu pendant les achats puis reprend.',
+      });
+      const snipe = btn(`🎯 Sniper le plan`, () => this.app.snipeSelection(plan.picks.map((x) => x.p.defId)), 'small', { disabled: !plan.picks.length, title: 'Les cartes du plan deviennent des cibles du sniper : achat sous le prix du marché, plus lent' });
+      return h(
+        'div',
+        { className: 'a-block' },
+        h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: 'Objectif niveau Galerie' }), snipe, go),
+        inputs,
+        status,
+        rows.length ? h('div', { className: 'a-hits', style: 'max-height:none' }, ...rows) : null,
+        more,
+        hint(
+          'Points estimés : barème des joueurs (or 75 = 90 … 85 = 2 100, 90 = 14 000, 99 = 100 000 ; argent 35 ; bronze 20), non publié par EA. Une carte compte dans chaque set importé où elle entre ou remplace une carte plus faible. Une carte achetée n’a pas le tag First Owner et les bonus de tags ne sont pas comptés. Après les achats, placer les cartes dans les sets du jeu (remplissage automatique de chaque set) : le score reste acquis même après la revente.',
+        ),
+      );
+    }
+    async runLevel() {
+      const a = this.album;
+      if (a.running) return;
+      const { plan, coins } = this.levelPlan();
+      if (!plan.picks.length) return;
+      if (coins !== null && plan.spend > coins && !confirm(`Solde ${fmt(coins)} pour ~${fmt(plan.spend)} crédits engagés. Les cartes les plus rentables passent d’abord ; ensuite les achats attendent les ventes en cours, ou s’arrêtent faute de crédits. Lancer ?`)) return;
+      const ids = plan.picks.map((x) => x.p.defId);
+      this.openBuy([...new Set(plan.picks.flatMap((x) => x.keys))]);
+      await this.runBuy(ids, () => a.buyLevel(plan.picks));
+    }
     async scanClub() {
       const a = this.album;
       if (a.running) return;
@@ -1145,7 +1234,7 @@
       this.homeSel.clear();
       const order = plan.map((x) => x.key);
       this.openBuy(order);
-      await this.runBuy(ids, order);
+      await this.runBuy(ids, () => a.completeSets(order));
     }
     // Plusieurs sets cochés : cartes à acheter pour les finir, en un clic (ou sniper)
     renderHomeActionbar() {
@@ -1348,11 +1437,11 @@
       this.buyLayer.classList.remove('open');
       if (this.isOpen) this.renderBody();
     }
-    async runBuy(ids, keys) {
+    async runBuy(ids, run) {
       this.buyRan = true;
       this.buyRanKey = this.buyKey;
       this.buyRows = ids;
-      await (keys ? this.album.completeSets(keys) : this.album.validate(ids));
+      await (run ? run() : this.album.validate(ids));
       this.buyRows = this.album.queue.map((q) => q.defId);
       this.renderBuy();
     }
@@ -1857,7 +1946,7 @@
       this.renderStrip();
       const a = this.album;
       const s = this.sniper;
-      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : `${a.catalog.text}|${X.coins()}`}|${s.running}|${s.task}|${s.idx}|${this.cfg.snipeFilters}|${this.cfg.rotate}`;
+      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : `${a.catalog.text}|${X.coins()}|${X.galleryLive?.score}|${this.cfg.levelScore}|${this.cfg.levelTarget}|${this.cfg.levelBudget}|${this.cfg.afterBuy}`}|${s.running}|${s.task}|${s.idx}|${this.cfg.snipeFilters}|${this.cfg.rotate}`;
       if (sig !== this.lastSig && !this.typing()) {
         this.lastSig = sig;
         if (this.tab === 'gallery' || this.tab === 'snipe') this.renderBody();
