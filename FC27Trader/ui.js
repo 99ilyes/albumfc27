@@ -291,6 +291,16 @@
     const el = h('div', { className: 'stbl', style: `--cols:${cols}` }, r(head, 'hd'), ...rows.map(([cells, cls, title]) => r(cells, cls, title)));
     return el;
   }
+  // Grade estimé d'un set (score sans bonus de tags) et prochain seuil
+  const gradePill = (gr) =>
+    gr.grade || gr.next
+      ? h('span', {
+          className: `a-pill${gr.grade === 'S' ? ' ok' : gr.grade ? ' ac' : ''}`,
+          title: `Score estimé ~${fmt(gr.score)} (cartes de ta collection, sans bonus de tags : souvent plus haut en jeu)${gr.next ? ` · ${gr.next.grade} à ${fmt(gr.next.at)}` : ''}`,
+          textContent: `Grade ${gr.grade ?? '—'}${gr.next ? ` · ${gr.next.grade} à ${fmtShort(gr.next.at)}` : ''}`,
+        })
+      : null;
+  const fmtShort = (v) => (v >= 1e6 ? `${(v / 1e6).toLocaleString('fr-FR', { maximumFractionDigits: 1 })} M` : v >= 1e3 ? `${Math.round(v / 1e3)} k` : String(v));
   const cell = (text, cls) => h('span', { className: cls, textContent: text });
   const ago = (t) => {
     const m = Math.floor((Date.now() - t) / 6e4);
@@ -505,7 +515,8 @@
       if (set) {
         const all = a.setPlayers(set);
         const pr = a.progress(set);
-        this.subEl.textContent = `Places remplies ${pr.have} / ${pr.slots} · ${pr.crit ? `${X.CRIT_LABEL[pr.crit.k]} : ${fmt(pr.owned.size)} joueur(s) de ta collection` : 'liste fut.gg'} · ${all.length} joueurs listés (équipe la moins chère fut.gg)`;
+        const gr = a.gradeOf(set);
+        this.subEl.textContent = `Places remplies ${pr.have} / ${pr.slots} · ${gr.grade || gr.next ? `grade estimé ${gr.grade ?? '—'} (~${fmt(gr.score)}${gr.next ? `, ${gr.next.grade} à ${fmt(gr.next.at)}` : ''}) · ` : ''}${pr.crit ? `${X.CRIT_LABEL[pr.crit.k]} : ${fmt(pr.owned.size)} joueur(s) de ta collection` : 'liste fut.gg'} · ${all.length} joueurs listés (équipe la moins chère fut.gg)`;
       } else
         this.subEl.textContent = {
           snipe: 'Achète sous le prix du marché et revend avec profit, sans interruption',
@@ -970,7 +981,8 @@
           h(
             'div',
             { className: 'a-tile-stats' },
-            h('span', { textContent: `${pr.slots} places` }),
+            h('span', { textContent: `${pr.slots} places${s.needed ? '' : ' ?'}`, title: s.needed ? 'Joueurs requis lus sur fut.gg' : 'Nombre de joueurs requis non lu sur fut.gg : taille de la liste fut.gg (« ↻ Réimporter » pour relire)' }),
+            gradePill(a.gradeOf(s)),
             pr.crit ? h('span', { className: 'a-pill', title: 'Critère déduit des joueurs listés par fut.gg : tout joueur de ta collection qui le remplit compte', textContent: `${X.CRIT_LABEL[pr.crit.k]} · ${fmt(pr.owned.size)} à toi` }) : h('span', { className: 'a-pill', title: 'Critère non reconnu : seuls les joueurs listés par fut.gg comptent', textContent: 'liste fut.gg' }),
             left ? h('span', { textContent: `manquants ~${fmt(left)} crédits` }) : null,
             hits.length ? h('span', { className: 'a-pill ac', textContent: `${hits.length} joueur(s) trouvé(s)` }) : null,

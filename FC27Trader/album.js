@@ -347,6 +347,21 @@
       return out;
     }
 
+    // Score estimé du set (meilleures cartes dans la limite des places, sans bonus de tags) et grade atteint selon les seuils fut.gg
+    gradeOf(set) {
+      const { owned, slots } = this.progress(set);
+      const score = [...owned.values()]
+        .sort((x, y) => y - x)
+        .slice(0, slots)
+        .reduce((t, v) => t + v, 0);
+      const g = set.grades;
+      if (!g) return { score, grade: null, next: null };
+      const order = ['D', 'C', 'B', 'A', 'S'].filter((k) => g[k] > 0);
+      const reached = order.filter((k) => score >= g[k]).pop() ?? null;
+      const nextKey = order.find((k) => score < g[k]) ?? null;
+      return { score, grade: reached, next: nextKey ? { grade: nextKey, at: g[nextKey] } : null };
+    }
+
     // --- Sets à faire : scan du club, coût pour finir chaque set, sets proposés selon le solde ---
 
     priceOf(p) {
@@ -406,10 +421,11 @@
     scoreOf(p) {
       return itemScore(p.rating, p.rareflag);
     }
-    // Emplacements d'un set : cartes requises, sinon tous ses joueurs
+    // Places d'un set : joueurs requis lus sur fut.gg (« requires 20 … players »), sinon taille de la liste
     slotsOf(set) {
-      const n = Object.keys(set.players ?? {}).length;
-      return set.needed > 0 && set.needed < n ? set.needed : n;
+      if (set.needed > 0) return set.needed;
+      // Places inconnues : taille de la liste fut.gg actuelle (sans les joueurs gardés d'une liste précédente)
+      return Object.values(set.players ?? {}).filter((p) => !p.kept).length;
     }
     // Meilleurs scores collectés de chaque set, dans la limite de ses emplacements
     levelState() {
@@ -676,7 +692,8 @@
       const list = Array.isArray(data?.players) ? data.players : [];
       const slug = String(data?.slug || data?.name || 'set');
       const key = `futgg:${slug}`;
-      const prev = this.sets[key]?.players ?? {};
+      const before = this.sets[key];
+      const prev = before?.players ?? {};
       const players = {};
       for (const x of list) {
         const defId = validId(x?.defId);
@@ -688,11 +705,17 @@
           rating: Number(x.rating) || prev[defId]?.rating || 0,
           minPrice: Number(x.price) >= 150 ? Math.round(Number(x.price)) : 0,
           rareflag: this.findPlayer(defId)?.rareflag ?? null,
+          l: prev[defId]?.l || 0,
+          c: prev[defId]?.c || 0,
+          n: prev[defId]?.n || 0,
           collected: nc === true || this.done.has(defId) || (nc === undefined && prev[defId]?.collected === true),
         };
       }
       if (!Object.keys(players).length) return null;
-      return { kind: 'futgg', slug, key, name: String(data.name || 'Set fut.gg').slice(0, 60), url: String(data.url || ''), needed: Number(data.needed) || 0, source: 'futgg', at: Date.now(), players };
+      // fut.gg change sa liste au gré des prix et des nouvelles cartes : un joueur déjà collecté du set reste compté
+      for (const p of Object.values(prev)) if (!players[p.defId] && (p.collected || this.coll.has(p.defId))) players[p.defId] = { ...p, kept: true };
+      const grades = data.grades && typeof data.grades === 'object' ? data.grades : (before?.grades ?? null);
+      return { kind: 'futgg', slug, key, name: String(data.name || 'Set fut.gg').slice(0, 60), url: String(data.url || ''), needed: Number(data.needed) || before?.needed || 0, grades, source: 'futgg', at: Date.now(), players };
     }
     importSet(data) {
       const set = this.buildSet(data);

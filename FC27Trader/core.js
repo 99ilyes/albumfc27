@@ -6,7 +6,7 @@
   X.SNIPE_NS = 'snipefc27';
   X.ALBUM_NS = 'albumfc27';
   X.APP = 'FC27 Trader';
-  X.VERSION = '1.4.2';
+  X.VERSION = '1.4.3';
 
   // ---------- Prix EA ----------
 
