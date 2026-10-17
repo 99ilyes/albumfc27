@@ -31,7 +31,13 @@ Hésitations : 8 % des recherches, +0,5 à 1,5 s (au lieu de +1 à 4 s).
 
 ## Ventes
 
-Un seul **Relister les invendus** (sniper arrêté) : remet chaque invendu un palier sous la moins chère du marché, jamais sous le prix d'achat (taxe comprise pour un snipe, prix payé pour une carte Galerie). « Cartes Galerie en vente » : recalé sur la vraie liste de transferts à chaque lecture (ouverture de la Web App, pauses du sniper, liste ouverte dans la Web App, bouton « ↻ Actualiser ») ; une carte absente n'est plus suivie. Suivi du sniper (profit réel, par heure, en attente, snipes, recherches, temps), coût réel de la Galerie, dernières ventes.
+Un seul **Relister les invendus** (sniper arrêté) : remet chaque invendu un palier sous la moins chère du marché, jamais sous le prix d'achat (taxe comprise pour un snipe, prix payé pour une carte Galerie). « Cartes Galerie en vente » : recalé sur la vraie liste de transferts à chaque lecture (ouverture de la Web App, pauses du sniper, liste ouverte dans la Web App, bouton « ↻ Actualiser ») ; une carte absente n'est plus suivie. Suivi du sniper (profit réel, par heure, en attente, snipes, recherches, temps, rendement sur les cartes vendues, taxe EA payée, délai de vente moyen, profit du jour), coût réel de la Galerie, dernières ventes.
+
+Suivi détaillé du sniper (bouton « Réinitialiser » commun) :
+
+- **Sessions** : une session couvre le fonctionnement continu du sniper, rechargements de la Web App et tâches Galerie compris ; un arrêt manuel la clôt, plus de 30 min d'interruption en ouvre une nouvelle. Par session : durée, recherches, snipes / ratés, profit réel (rattaché à la session d'achat, même si la vente arrive plus tard), en attente, profit / h ; détail des cibles au survol. 30 dernières sessions conservées. L'onglet Sniper et la popup affichent la session en cours.
+- **Par joueur** : snipes / ratés, ventes, profit réel, profit moyen par vente, délai moyen de vente, cartes en attente ; recherches ciblées, investi et meilleure vente au survol. Tri par profit, snipes ou activité récente, export CSV (presse-papiers).
+- **Par jour** : 14 derniers jours, durée, recherches, snipes, ventes, profit réel.
 
 ## Garde-fous (communs à toutes les tâches)
 

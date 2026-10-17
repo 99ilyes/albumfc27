@@ -9,6 +9,7 @@ function el(tag, props = {}, ...children) {
 }
 const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('fr-FR'));
 const signed = (n) => `${n > 0 ? '+' : ''}${fmt(n)}`;
+const dur = (ms) => (ms >= 36e5 ? `${Math.floor(ms / 36e5)} h ${String(Math.floor((ms % 36e5) / 6e4)).padStart(2, '0')}` : `${Math.round(ms / 6e4)} min`);
 const hm = (t) => new Date(t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
 const send = (cmd) => tabId !== null && chrome.tabs.sendMessage(tabId, cmd);
 
@@ -20,6 +21,7 @@ function render(st) {
   const s = st?.sniper ?? {};
   const a = st?.album ?? {};
   const ses = s.session ?? {};
+  const cur = s.current;
   const snipe = s.running && s.task === 'snipe';
   const locked = (s.lockedUntil ?? 0) > Date.now();
   const busy = s.running || a.running;
@@ -37,6 +39,7 @@ function render(st) {
       ...[
         ['Crédits', fmt(s.coins)],
         ['Cible', s.filter ? `${s.filter}${s.buyPrice ? ` ≤ ${fmt(s.buyPrice)}` : ''}` : `${s.targets ?? 0} cible(s)`],
+        ['Session en cours', cur ? `${dur(cur.ms)} · ${cur.snipes} snipe(s) · ${signed(cur.realized)}` : '—'],
         ['Snipes / ratés', `${ses.snipes ?? 0} / ${ses.misses ?? 0}`],
         ['Profit réel · par heure', `${signed(ses.realized ?? 0)}${perH === null ? '' : ` · ${signed(perH)} / h`}`],
         ['En attente de vente', `${s.pending?.count ?? 0} (${signed(s.pending?.expected ?? 0)})`],
