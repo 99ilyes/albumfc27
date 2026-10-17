@@ -504,7 +504,8 @@
       this.titleEl.textContent = set ? set.name : Object.fromEntries(TABS)[this.tab];
       if (set) {
         const all = a.setPlayers(set);
-        this.subEl.textContent = `Collectés ${all.filter((p) => p.collected).length} / ${all.length}${set.needed ? ` · ${set.needed} cartes requises` : ''}`;
+        const pr = a.progress(set);
+        this.subEl.textContent = `Places remplies ${pr.have} / ${pr.slots} · ${pr.crit ? `${X.CRIT_LABEL[pr.crit.k]} : ${fmt(pr.owned.size)} joueur(s) de ta collection` : 'liste fut.gg'} · ${all.length} joueurs listés (équipe la moins chère fut.gg)`;
       } else
         this.subEl.textContent = {
           snipe: 'Achète sous le prix du marché et revend avec profit, sans interruption',
@@ -913,8 +914,10 @@
       const targets = new Set(this.app.targets().filter((f) => f.album).map((f) => f.defId));
       const info = a.setList().map((s) => {
         const all = a.setPlayers(s);
-        const missing = all.filter((p) => !p.collected);
-        return { s, all, missing, hits: t ? all.filter((p) => norm(p.name).includes(t)) : [], nameHit: !t || norm(s.name).includes(t) };
+        const pr = a.progress(s);
+        // missing : joueurs listés à acheter pour combler les places libres (vide si le set est rempli)
+        const missing = pr.have < pr.slots ? all.filter((p) => !p.collected) : [];
+        return { s, all, pr, missing, hits: t ? all.filter((p) => norm(p.name).includes(t)) : [], nameHit: !t || norm(s.name).includes(t) };
       });
       // Sets complétés ou retirés : plus cochables
       const byKey = new Map(info.map((x) => [x.s.key, x]));
@@ -936,9 +939,9 @@
         for (const x of pickable) allPicked ? this.homeSel.delete(x.s.key) : this.homeSel.add(x.s.key);
         this.renderHomeContent();
       };
-      const tiles = shown.map(({ s, all, missing, hits }) => {
-        const got = all.length - missing.length;
-        const left = missing.reduce((n, p) => n + (p.minPrice || 0), 0);
+      const tiles = shown.map(({ s, all, pr, missing, hits }) => {
+        const got = pr.have;
+        const left = a.toFinish(s).reduce((n, p) => n + (p.minPrice || 0), 0);
         const sel = missing.filter((p) => a.isSelected(p.defId)).length;
         const tg = missing.filter((p) => targets.has(p.defId)).length;
         const picked = this.homeSel.has(s.key);
@@ -967,15 +970,15 @@
           h(
             'div',
             { className: 'a-tile-stats' },
-            h('span', { textContent: `${all.length} joueurs` }),
-            s.needed ? h('span', { textContent: `${s.needed} cartes requises` }) : null,
+            h('span', { textContent: `${pr.slots} places` }),
+            pr.crit ? h('span', { className: 'a-pill', title: 'Critère déduit des joueurs listés par fut.gg : tout joueur de ta collection qui le remplit compte', textContent: `${X.CRIT_LABEL[pr.crit.k]} · ${fmt(pr.owned.size)} à toi` }) : h('span', { className: 'a-pill', title: 'Critère non reconnu : seuls les joueurs listés par fut.gg comptent', textContent: 'liste fut.gg' }),
             left ? h('span', { textContent: `manquants ~${fmt(left)} crédits` }) : null,
             hits.length ? h('span', { className: 'a-pill ac', textContent: `${hits.length} joueur(s) trouvé(s)` }) : null,
             sel ? h('span', { className: 'a-pill ac', textContent: `${sel} sélectionné(s)` }) : null,
             tg ? h('span', { className: 'a-pill', style: 'color:var(--warn);border-color:rgba(255,179,71,.4)', textContent: `🎯 ${tg} ciblé(s)` }) : null,
           ),
-          h('div', { className: 'a-bar' }, h('span', { style: `width:${all.length ? (got / all.length) * 100 : 0}%` })),
-          h('div', { className: 'a-tile-foot' }, h('span', { style: 'color:#dfe4ec;font-weight:400', textContent: `Collectés ${got} / ${all.length}` }), h('span', { textContent: 'Voir les joueurs →' })),
+          h('div', { className: 'a-bar' }, h('span', { style: `width:${pr.slots ? (got / pr.slots) * 100 : 0}%` })),
+          h('div', { className: 'a-tile-foot' }, h('span', { style: 'color:#dfe4ec;font-weight:400', textContent: `Remplies ${got} / ${pr.slots}` }), h('span', { textContent: 'Voir les joueurs →' })),
         );
       });
       const c = a.catalog;
@@ -1069,10 +1072,11 @@
         disabled: a.running,
         title: 'Lit les joueurs présents au club et ceux passés au club (Galerie EA), puis propose les sets faisables avec le solde. Le sniper est suspendu pendant le scan.',
       });
-      const head = h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: `Sets à faire (${rows.length})` }), scan);
+      const diag = h('button', { type: 'button', className: 'a-link', textContent: 'Copier le diagnostic', title: 'Copie dans le presse-papiers ce que l’extension lit chez EA (Galerie, club, statut collecté), pour corriger la synchro', onclick: () => void this.copyDiag(diag) });
+      const head = h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: `Sets à faire (${rows.length})` }), diag, scan);
       const spend = prop.reduce((t, x) => t + x.spend, 0);
       const info = hint(
-        `${a.clubAt ? `Club scanné ${ago(a.clubAt)} (${fmt(a.clubIds.size)} joueurs)` : 'Club jamais scanné'} · ${
+        `${a.clubAt ? `Club scanné ${ago(a.clubAt)} (${fmt(a.clubIds.size)} joueurs)` : 'Club jamais scanné'} · collection connue ${fmt(a.coll.size)} joueur(s) · ${
           coins === null ? 'solde inconnu' : `${prop.length} set(s) faisable(s) avec ${fmt(coins)} crédits${prop.length ? ` (~${fmt(spend)})` : ''}`
         }`,
       );
@@ -1092,7 +1096,8 @@
       const list = shown.map(({ s, cards, spend: v, unpriced }) => {
         const on = this.homeSel.has(s.key);
         const ok = rank.has(s.key);
-        const req = s.needed > 0 && s.needed < Object.keys(s.players ?? {}).length ? ` · ${s.needed} requises` : '';
+        const pr = a.progress(s);
+        const req = ` · ${pr.have} / ${pr.slots} places`;
         return h(
           'div',
           {
@@ -1214,6 +1219,30 @@
       const ids = plan.picks.map((x) => x.p.defId);
       this.openBuy([...new Set(plan.picks.flatMap((x) => x.keys))]);
       await this.runBuy(ids, () => a.buyLevel(plan.picks));
+    }
+    async copyDiag(el) {
+      const a = this.album;
+      const sets = a.setList();
+      const withAttrs = [...a.coll.values()].filter((x) => x.l || x.c || x.n).length;
+      const first = [...a.itemData.values()][0];
+      const out = {
+        version: X.VERSION,
+        at: new Date().toISOString(),
+        sets: sets.length,
+        collection: { total: a.coll.size, withAttrs, club: a.clubIds.size, clubAt: a.clubAt, done: a.done.size },
+        netCollected: [...X.netItems.values()].filter((x) => x.collected).length,
+        galleryLive: X.galleryLive,
+        defidSample: first ? { keys: Object.keys(first), item: first } : null,
+        clubSample: a.clubSample ?? null,
+        setsSample: sets.slice(0, 40).map((s) => {
+          const pr = a.progress(s);
+          return { name: s.name, url: s.url, needed: s.needed, listed: Object.keys(s.players ?? {}).length, crit: pr.crit ? { k: pr.crit.k, v: [...pr.crit.v], tier: pr.crit.tier } : null, owned: pr.owned.size, slots: pr.slots };
+        }),
+        galleryResponses: X.galleryDiag,
+      };
+      const ok = await copyText(JSON.stringify(out, null, 1));
+      el.textContent = ok ? 'Diagnostic copié' : 'Copie impossible';
+      setTimeout(() => (el.textContent = 'Copier le diagnostic'), 3e3);
     }
     async scanClub() {
       const a = this.album;

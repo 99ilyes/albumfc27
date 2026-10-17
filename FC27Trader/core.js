@@ -6,6 +6,7 @@
   X.SNIPE_NS = 'snipefc27';
   X.ALBUM_NS = 'albumfc27';
   X.APP = 'FC27 Trader';
+  X.VERSION = '1.4.1';
 
   // ---------- Prix EA ----------
 
@@ -180,14 +181,29 @@
   X.lastPile = () => lastPile;
   X.onPile = (cb) => pileListeners.push(cb);
 
+  // Attributs utiles à la Galerie (note, rareté, ligue, club, nation), depuis un itemData EA ou une carte Web App
+  X.attrsFrom = (it) => {
+    if (!it || typeof it !== 'object') return null;
+    const pos = (v) => (Number(v) > 0 ? Number(v) : 0);
+    const f = Number(it.rareflag ?? it._rareflag);
+    return {
+      r: pos(it.rating ?? it._rating),
+      f: it.rareflag == null && it._rareflag == null ? null : Number.isFinite(f) ? f : null,
+      l: pos(it.leagueId ?? it._leagueId),
+      c: pos(it.teamId ?? it.teamid ?? it._teamId),
+      n: pos(it.nationId ?? it.nation ?? it._nationId),
+    };
+  };
   function recordItems(j) {
     const list = [...(Array.isArray(j.itemData) ? j.itemData : []), ...(Array.isArray(j.auctionInfo) ? j.auctionInfo.map((a) => a?.itemData) : [])];
     for (const it of list) {
       const defId = Number(it?.resourceId ?? 0);
       if (!defId || it.itemType !== 'player') continue;
-      X.netItems.set(defId, { collected: it.isCollected === true || !!X.netItems.get(defId)?.collected });
+      X.netItems.set(defId, { ...X.attrsFrom(it), collected: it.isCollected === true || !!X.netItems.get(defId)?.collected });
     }
   }
+  // Diagnostic Galerie : dernières réponses EA dont l'URL évoque la Galerie (format FC 27 non documenté)
+  X.galleryDiag = [];
   // Score et niveau Galerie s'ils passent dans une réponse EA (format non documenté : champs cherchés par nom)
   X.galleryLive = null;
   function recordGallery(url, j) {
@@ -202,13 +218,16 @@
       }
     };
     walk(j, 0);
+    try {
+      X.galleryDiag = [{ url: String(url).replace(/\?.*$/, ''), at: Date.now(), body: JSON.stringify(j).slice(0, 4e3) }, ...X.galleryDiag].slice(0, 12);
+    } catch {}
     if (found.score || found.level) X.galleryLive = { ...found, url: String(url).replace(/\?.*$/, ''), at: Date.now() };
   }
   function onResponse(url, status, body) {
     if (status !== 200) return;
     const text = typeof body === 'string' ? body : null;
     let j = typeof body === 'object' && body ? body : null;
-    if (/\/ut\/game\/[^?]*gallery/i.test(url)) {
+    if (/\/ut\/game\/[^?]*(gallery|collection|album)/i.test(url)) {
       try {
         j ??= JSON.parse(text);
         recordGallery(url, j);

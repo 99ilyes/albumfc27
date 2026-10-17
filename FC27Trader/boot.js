@@ -154,7 +154,7 @@
       onUpdate,
       (patch) => app.setConfig(patch),
       {
-        onSnipe: (defId) => album.onSnipe(defId),
+        onSnipe: (defId, raw) => album.onSnipe(defId, raw),
         isCollected: (defId) => album.isCollected(defId),
         albumSold: (i) => album.recordSold(i),
         albumPrice: (id) => album.bought[id]?.price ?? 0,

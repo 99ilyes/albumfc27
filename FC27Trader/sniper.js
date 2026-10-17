@@ -92,7 +92,7 @@
     albumDone = false;
     nextPileAt = 0;
 
-    // hooks : { onSnipe(defId), isCollected(defId), albumSold(item), albumPrice(id), albumOnSale(), onListed(id, price), otherBusy(), afterTask() }
+    // hooks : { onSnipe(defId, raw), isCollected(defId), albumSold(item), albumPrice(id), albumOnSale(), onListed(id, price), otherBusy(), afterTask() }
     constructor(getConfig, onUpdate, patchConfig, hooks) {
       this.getConfig = getConfig;
       this.onUpdate = onUpdate;
@@ -813,7 +813,7 @@
           }
           this.note(`Snipé ${name} à ${fmt(it.buyNow)} ! (${ageText(it.expires)}, réponse en ${ms} ms)`, 'snipe');
           if (this.cfg.snipeSound) X.beep();
-          if (defId && this.hooks.onSnipe(defId) && this.filter.album && this.filter.defId === defId) this.albumDone = true;
+          if (defId && this.hooks.onSnipe(defId, it.raw) && this.filter.album && this.filter.defId === defId) this.albumDone = true;
           won.push(it);
         } else if (res.status === 401 || X.BAD_STATUS.has(res.status)) fatal ??= res.status;
         else if (X.MISS_STATUS.has(res.status)) {
