@@ -769,7 +769,7 @@
       const c = X.coins();
       return c === null || c >= price || (await X.refreshCoins()) >= price;
     }
-    // Crédits insuffisants : encaisse les ventes toutes les 2 min jusqu'à couvrir need ; false si rien n'est en vente
+    // Crédits insuffisants : encaisse les ventes toutes les minutes jusqu'à couvrir need ; false si rien n'est en vente
     async waitCredits(need, name) {
       while (!this.stopRequested) {
         const rest = await this.syncPile();
@@ -783,8 +783,8 @@
           return false;
         }
         const pending = active.reduce((t, i) => t + netOf(i.buyNow || 0), 0);
-        this.log(`Crédits insuffisants pour ${name} (${fmtNum(c)} / ${fmtNum(need)}) : attente des ventes (${active.length} en vente, ~${fmtNum(pending)} nets attendus), nouvel essai dans 2 min`, 'warn');
-        await this.sleep(12e4, `Attente des ventes pour ${name}`);
+        this.log(`Crédits insuffisants pour ${name} (${fmtNum(c)} / ${fmtNum(need)}) : attente des ventes (${active.length} en vente, ~${fmtNum(pending)} nets attendus), nouvel essai dans 1 min`, 'warn');
+        await this.sleep(rand(6e4, 8e4), `Attente des ventes pour ${name}`);
       }
       return false;
     }

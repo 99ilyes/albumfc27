@@ -24,6 +24,9 @@
   const MAX_RETRIES = 5;
   const RECHECK_MS = 9e5;
   const PRICE_FRESH = 3e5;
+  // Relecture de la liste de transferts pendant le sniping (cartes en vente) et pendant une attente de vente
+  const PILE_EVERY = [12e4, 24e4];
+  const SALE_POLL = [6e4, 1e5];
   // Hésitation : 8 % des recherches, +0,5 à 1,5 s
   const HESITATION = [500, 1500];
   const BREAK0 = { preset: '', worked: 0, target: 0, until: 0, stoppedAt: 0, sinceLong: 0, longTarget: 0 };
@@ -87,8 +90,9 @@
     pricedAt = 0;
     tooManyNoted = false;
     albumDone = false;
+    nextPileAt = 0;
 
-    // hooks : { onSnipe(defId), isCollected(defId), albumSold(item), albumPrice(id), onListed(id, price), otherBusy(), afterTask() }
+    // hooks : { onSnipe(defId), isCollected(defId), albumSold(item), albumPrice(id), albumOnSale(), onListed(id, price), otherBusy(), afterTask() }
     constructor(getConfig, onUpdate, patchConfig, hooks) {
       this.getConfig = getConfig;
       this.onUpdate = onUpdate;
@@ -422,6 +426,27 @@
       await this.idle(ms);
       await this.upkeep();
     }
+    // Cartes en vente suivies (snipes ou achats Galerie) : la liste de transferts mérite d'être relue
+    hasListings() {
+      return Object.values(this.snipes).some((s) => s.listPrice) || this.hooks.albumOnSale() > 0;
+    }
+    // Liste pleine ou crédits insuffisants : ventes relues toutes les 1 à 2 min, reprise dès que ok() ;
+    // entretien complet (invendus remis en vente, non-assignés rangés) au début puis toutes les 8 à 12 min
+    async waitForSales(reason, ok) {
+      this.note(`${reason} : attente des ventes, liste de transferts relue toutes les 1 à 2 min`, 'error');
+      let upkeepAt = 0;
+      for (;;) {
+        if (Date.now() >= upkeepAt) {
+          this.setActivity(`${reason} : entretien de la liste de transferts`, 'wait');
+          await this.upkeep();
+          upkeepAt = Date.now() + rand(...BLOCKED_WAIT);
+        } else await this.syncTradePile();
+        if (await ok()) return this.note(`${reason.split(' (')[0]} : levé, reprise`);
+        const ms = rand(...SALE_POLL);
+        this.setActivity(`${reason}, ventes relues à ${clockIn(ms)}`, 'wait');
+        await this.idle(ms);
+      }
+    }
     async idle(ms) {
       const counting = !!this.segStart;
       if (counting) this.pauseClock();
@@ -541,13 +566,19 @@
           win = { n: 0, start: Date.now() };
         }
         const f = this.filter;
+        if (Date.now() >= this.nextPileAt && this.hasListings()) {
+          this.setActivity('Lecture des ventes', 'price');
+          await this.syncTradePile();
+        }
         if (await this.transferListFull()) {
-          await this.blocked('Liste de transferts pleine');
+          await this.waitForSales('Liste de transferts pleine', async () => !(await this.transferListFull()));
+          win = { n: 0, start: Date.now() };
           continue;
         }
         const c0 = X.coins();
         if (c0 !== null && c0 < f.buyPrice) {
-          await this.blocked(`Crédits insuffisants (${fmt(c0)} < ${fmt(f.buyPrice)})`);
+          await this.waitForSales(`Crédits insuffisants (${fmt(c0)} < ${fmt(f.buyPrice)})`, async () => (X.coins() ?? Infinity) >= this.filter.buyPrice);
+          win = { n: 0, start: Date.now() };
           continue;
         }
         const g = [this.guard.check(), this.guard.checkBid()].find((x) => !x.ok);
@@ -862,6 +893,7 @@
       if (sold.length && (await X.clearSold()).success) total -= sold.length;
       await X.refreshCoins();
       this.pileCheck = { at: Date.now(), total };
+      this.nextPileAt = Date.now() + rand(...PILE_EVERY);
       this.emit();
       return { items: r.data.filter((i) => i.state !== 'sold'), total, complete: r.complete };
     }
