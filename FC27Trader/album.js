@@ -1,4 +1,4 @@
-// Galerie (AlbumFC27 3.3) : sets fut.gg, statut Galerie lu chez EA, achat direct au prix du marché (méthode FST)
+// Galerie : sets fut.gg, scan du club et sets proposés selon le solde, statut Galerie lu chez EA, achat direct au prix du marché (méthode FST)
 // Garde-fous, délais et pause anti-captcha : ceux du moteur de sniping (communs)
 (function () {
   const X = globalThis.__fc27;
@@ -24,6 +24,8 @@
   const K_IMPORT_AT = `${NS}:importAt`;
   const K_HIDDEN = `${NS}:hiddenSets`;
   const K_CATALOG_AT = `${NS}:catalogAt`;
+  const K_CLUB = `${NS}:club`;
+  const CLUB_PAGES = 120;
   X.ALBUM_KEYS = { K_RESUME, K_ACTIVE, K_LOCK_RESUME, K_IMPORT_AT };
 
   const tolCap = (p, n) => {
@@ -86,6 +88,8 @@
     itemData = new Map(); // defId -> itemData EA (/defid), pour afficher les cartes
     hiddenSets = new Set(load(K_HIDDEN, []));
     catalog = { busy: false, text: '', at: Number(load(K_CATALOG_AT, 0)) || 0 };
+    clubIds = new Set(load(K_CLUB, null)?.ids ?? []); // joueurs présents au club au dernier scan
+    clubAt = Number(load(K_CLUB, null)?.at) || 0;
     waitUntil = 0;
     waitLabel = '';
 
@@ -164,7 +168,7 @@
       return Object.values(this.sets).sort((a, b) => b.at - a.at);
     }
     refreshCollected(p) {
-      if (!p.collected && (X.netItems.get(p.defId)?.collected || this.done.has(p.defId))) p.collected = true;
+      if (!p.collected && (X.netItems.get(p.defId)?.collected || this.done.has(p.defId) || this.clubIds.has(p.defId))) p.collected = true;
       return p;
     }
     setPlayers(set) {
@@ -245,6 +249,122 @@
       };
     }
 
+    // --- Sets à faire : scan du club, coût pour finir chaque set, sets proposés selon le solde ---
+
+    priceOf(p) {
+      const v = Number(this.selection[p.defId]);
+      return v >= 150 ? Math.floor(v) : p.minPrice || 0;
+    }
+    // Coût réel d'une carte selon « Après achat » (revente : taxe ; club : prix payé)
+    costFor(price) {
+      const cfg = this.getConfig();
+      return price - (cfg.afterBuy === 'keep' ? 0 : netOf(sellFor(price, cfg)));
+    }
+    // Cartes à acheter pour finir un set : les manquantes, ou les moins chères si le set n'en demande qu'une partie
+    toFinish(set) {
+      const all = this.setPlayers(set);
+      const missing = all.filter((p) => !p.collected).sort((x, y) => (this.priceOf(x) || Infinity) - (this.priceOf(y) || Infinity));
+      const req = set.needed > 0 && set.needed < all.length ? set.needed : all.length;
+      return missing.slice(0, Math.max(0, req - (all.length - missing.length)));
+    }
+    // Ordre glouton : à chaque tour le set le moins cher à finir, joueurs communs déjà prévus comptés une fois.
+    // Avec budget : seuls les sets entièrement chiffrés qui tiennent dans ce qui reste du solde (sets proposés)
+    planSets(keys, budget = null) {
+      const left = keys
+        .map((k) => this.sets[k])
+        .filter(Boolean)
+        .map((s) => ({ s, need: this.toFinish(s) }))
+        .filter((x) => x.need.length);
+      const covered = new Set();
+      const out = [];
+      let rest = budget ?? Infinity;
+      while (left.length) {
+        let best = null;
+        for (const [i, x] of left.entries()) {
+          const cards = x.need.filter((p) => !covered.has(p.defId));
+          const unpriced = cards.filter((p) => !this.priceOf(p)).length;
+          const spend = cards.reduce((t, p) => t + this.priceOf(p), 0);
+          if (budget !== null && (unpriced || spend > rest)) continue;
+          const rank = unpriced * 1e12 + spend;
+          if (!best || rank < best.rank) best = { i, x, cards, unpriced, spend, rank };
+        }
+        if (!best) break;
+        left.splice(best.i, 1);
+        for (const p of best.cards) covered.add(p.defId);
+        rest -= best.spend;
+        const { s, need } = best.x;
+        out.push({ key: s.key, name: s.name, need: need.length, cards: best.cards, spend: best.spend, unpriced: best.unpriced, cost: best.cards.reduce((t, p) => t + this.costFor(this.priceOf(p)), 0) });
+      }
+      return out;
+    }
+    proposedSets() {
+      const c = X.coins();
+      return c === null ? [] : this.planSets(this.setList().map((s) => s.key), c);
+    }
+
+    // Joueurs présents au club (scan page par page) puis Galerie EA (joueurs passés) ; true si mené à terme
+    async scanClub() {
+      if (!this.setList().length) {
+        this.requestCatalog(true);
+        this.log('Scan du club : aucun set importé, lecture du catalogue fut.gg lancée, relancer le scan ensuite', 'warn');
+        return false;
+      }
+      if (!(await this.enter('scan'))) return false;
+      const ids = new Set();
+      try {
+        let full = false;
+        for (let page = 0; page < CLUB_PAGES && !this.stopRequested; page++) {
+          if (page) await this.sleep(rand(1200, 2500), 'Scan du club, page suivante');
+          if (this.stopRequested) break;
+          this.activity(`Scan du club : page ${page + 1}, ${ids.size} joueur(s)`);
+          const r = await X.searchClub(page * X.CLUB_PAGE);
+          if (!r.success) {
+            if (!this.fatal(r, 'club')) this.log(`Lecture du club impossible (statut ${r.status})${errText(r.error)}`, 'error');
+            break;
+          }
+          for (const it of r.items) {
+            const t = it?.type ?? it?.itemType;
+            const d = Number(it?.definitionId ?? it?.resourceId ?? 0);
+            if (d > 0 && (!t || t === 'player')) ids.add(d);
+          }
+          if (r.all) {
+            full = true;
+            break;
+          }
+        }
+        // Lecture partielle : joueurs vus ajoutés, aucun retiré
+        this.clubIds = full ? ids : new Set([...this.clubIds, ...ids]);
+        if (full) this.clubAt = Date.now();
+        save(K_CLUB, { at: this.clubAt, ids: [...this.clubIds] });
+        const got = new Set();
+        for (const s of Object.values(this.sets))
+          for (const p of Object.values(s.players ?? {}))
+            if (this.clubIds.has(p.defId) && !p.collected) {
+              p.collected = true;
+              got.add(p.defId);
+            }
+        this.saveSets();
+        if (ids.size || full) this.log(`Club ${full ? 'scanné' : 'lu en partie'} : ${ids.size} joueur(s) présent(s)${got.size ? `, ${got.size} carte(s) de set marquée(s) collectée(s)` : ''}`);
+        if (!this.stopRequested) {
+          this.activity('Galerie EA : joueurs passés au club');
+          await this.syncGallery();
+        }
+        if (this.stopRequested) return false;
+        const done = this.setList().filter((s) => !this.toFinish(s).length).length;
+        const prop = this.proposedSets();
+        const c = X.coins();
+        this.log(
+          `Sets : ${done} complet(s) sur ${this.setList().length}${c === null ? '' : `, ${prop.length} faisable(s) avec ${fmtNum(c)} crédits (~${fmtNum(prop.reduce((t, x) => t + x.spend, 0))})`}`,
+        );
+        return true;
+      } catch (err) {
+        this.log(`Erreur : ${errMsg(err)}`, 'error');
+        return false;
+      } finally {
+        this.leave();
+      }
+    }
+
     selectedPlayers() {
       const seen = new Set();
       const out = [];
@@ -286,7 +406,7 @@
             if (it.isCollected) {
               if (!p.collected) got.add(defId);
               p.collected = true;
-            } else if (p.collected) {
+            } else if (p.collected && !this.clubIds.has(defId)) {
               if (this.done.has(defId)) lost.add(p.name);
               p.collected = false;
             }
@@ -490,6 +610,7 @@
       this.log('Galerie : reprise automatique');
       if (intent.mode === 'buy' && this.queue.some(isOpen)) await this.runQueue();
       else if (intent.mode === 'check') await this.checkPrices(true);
+      else if (intent.mode === 'scan') await this.scanClub();
     }
     sessionExpired() {
       const d = rand(6e4, 12e4);
@@ -681,12 +802,31 @@
       const only = defIds ? new Set(defIds.map(Number)) : null;
       const queue = this.selectedPlayers()
         .filter(({ p }) => !only || only.has(p.defId))
-        .map(({ p, set }) => {
-          const v = Number(this.selection[p.defId]);
-          const start = v >= 150 ? Math.floor(v) : 0;
-          return { defId: p.defId, name: p.name, rating: p.rating, rareflag: p.rareflag ?? null, set: set.name, start, max: start, cap: tolCap(start, tol), status: 'pending', searches: 0, price: 0, sell: 0 };
-        });
+        .map(({ p, set }) => this.entryOf(p, set.name, tol));
       if (!queue.length) return this.log('Aucun joueur coché');
+      this.queue = queue;
+      save(K_QUEUE, this.queue);
+      this.touch();
+      await this.runQueue();
+    }
+    entryOf(p, set, tol) {
+      const v = Number(this.selection[p.defId]);
+      const start = v >= 150 ? Math.floor(v) : 0;
+      return { defId: p.defId, name: p.name, rating: p.rating, rareflag: p.rareflag ?? null, set, start, max: start, cap: tolCap(start, tol), status: 'pending', searches: 0, price: 0, sell: 0 };
+    }
+    // Sets cochés : cartes à acheter pour les finir, set par set du moins cher au plus cher
+    async completeSets(keys) {
+      if (this.running) return;
+      const tol = tolOf(this.getConfig());
+      const plan = this.planSets(keys);
+      const queue = plan.flatMap(({ name, cards }) =>
+        cards.map((p) => {
+          this.setSelected(p.defId, true);
+          return this.entryOf(p, name, tol);
+        }),
+      );
+      if (!queue.length) return this.log('Sets cochés déjà complets : rien à acheter');
+      this.log(`Sets à faire (${plan.length}) : ${plan.map((x) => `« ${x.name} » ${x.cards.length} carte(s)`).join(', ')}`);
       this.queue = queue;
       save(K_QUEUE, this.queue);
       this.touch();

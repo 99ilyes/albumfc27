@@ -97,7 +97,7 @@
 #afc-root .a-hit .n { color: #fff; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #afc-root .a-hit .n i { font-style: normal; color: #ffd76a; margin-right: .35rem; }
 #afc-root .a-hit .m { font-size: 11px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#afc-root .a-hit .ok { color: var(--ok); } #afc-root .a-hit .ac { color: var(--ac); }
+#afc-root .a-hit .ok { color: var(--ok); } #afc-root .a-hit .ac { color: var(--ac); } #afc-root .a-hit .warn { color: var(--warn); }
 #afc-root .a-tile-foot { margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: .5rem; font-size: .75rem; color: var(--ac); font-weight: 600; }
 #afc-root .a-x { background: none; border: 0; color: var(--dim); font-size: 15px; cursor: pointer; padding: 0 2px; }
 #afc-root .a-x:hover:not(:disabled) { color: #fff; } #afc-root .a-x:disabled { opacity: .3; cursor: default; }
@@ -558,7 +558,7 @@
       const lockAt = s.guard.lockedUntil();
       if (a.running) {
         const left = a.waitUntil - now;
-        const what = a.mode === 'buy' ? 'Achats Galerie' : 'Vérification des prix';
+        const what = a.mode === 'buy' ? 'Achats Galerie' : a.mode === 'scan' ? 'Scan du club' : 'Vérification des prix';
         return `${what} · ${left > 0 ? `${a.waitLabel || 'Prochaine action'} dans ${fmtWait(left)}` : a.activityText || 'en cours…'}`;
       }
       if (s.running && s.task === 'relist') return `Relister · ${s.relistProgress ? `${s.relistProgress.done} / ${s.relistProgress.total} · ` : ''}${s.activity}`;
@@ -918,7 +918,7 @@
       });
       // Sets complétés ou retirés : plus cochables
       const byKey = new Map(info.map((x) => [x.s.key, x]));
-      for (const k of [...this.homeSel]) if (!byKey.get(k)?.missing.length) this.homeSel.delete(k);
+      for (const k of [...this.homeSel]) if (!byKey.get(k)?.missing.length || !a.toFinish(byKey.get(k).s).length) this.homeSel.delete(k);
       const counts = { all: info.length, todo: info.filter((x) => x.missing.length).length, done: info.filter((x) => !x.missing.length).length };
       this.homeSeg.replaceChildren(
         ...[
@@ -952,7 +952,7 @@
               ? h('span', {
                   className: `a-check${picked ? ' on' : ''}`,
                   textContent: '✓',
-                  title: picked ? 'Retirer de la sélection de sets' : 'Cocher pour sniper ou acheter plusieurs sets d’un coup',
+                  title: picked ? 'Retirer de la sélection de sets' : 'Cocher pour faire plusieurs sets d’un coup',
                   onclick: (ev) => {
                     ev.stopPropagation();
                     picked ? this.homeSel.delete(s.key) : this.homeSel.add(s.key);
@@ -1005,20 +1005,21 @@
               'ol',
               {},
               h('li', { textContent: 'Les sets de la Galerie fut.gg sont importés à l’ouverture (ou « ↻ Réimporter »), ou un par un avec « + Importer un set fut.gg ».' }),
-              h('li', { textContent: 'Ouvre un set : les joueurs déjà collectés sont lus chez EA.' }),
-              h('li', { textContent: 'Sélectionne les cartes manquantes, ou coche plusieurs sets : « Sniper » (sous le prix du marché, revente avec profit) ou « Acheter maintenant » (au prix du marché, coût = taxe EA).' }),
+              h('li', { textContent: '« Scanner le club » : joueurs présents au club et passés (Galerie EA), puis sets proposés selon le solde.' }),
+              h('li', { textContent: 'Coche les sets puis « Faire les sets » : les cartes manquantes sont achetées au prix du marché, set par set. Ou « Sniper » (sous le prix du marché, revente avec profit).' }),
             ),
           );
       const top = this.body.scrollTop;
       this.homeContent.replaceChildren(
         ...[
           t.length >= 2 ? this.playerHits(info) : null,
+          !t && info.length ? this.proposalBlock() : null,
           tiles.length || extra.length ? h('div', { className: 'a-grid' }, ...tiles, ...extra) : h('div', { className: 'a-empty', textContent: 'Aucun set ne correspond.' }),
           intro,
         ].filter(Boolean),
       );
       this.body.scrollTop = top;
-      this.renderHomeActionbar(byKey);
+      this.renderHomeActionbar();
     }
     // Joueurs trouvés dans tous les sets : un clic sélectionne une carte manquante, ↗ ouvre son set
     playerHits(info) {
@@ -1049,22 +1050,131 @@
       });
       return block(`Joueurs (${list.length}${list.length > 60 ? ', 60 premiers' : ''})`, hint('Touche un joueur manquant pour le sélectionner ; il est acheté ou snipé avec les sets cochés ou depuis son set.'), h('div', { className: 'a-hits' }, ...rows));
     }
-    // Plusieurs sets cochés : toutes leurs cartes manquantes, sniper ou achat direct d'un coup
-    renderHomeActionbar(byKey) {
+    // Sets à faire : coût pour finir chaque set incomplet, sets proposés (les moins chers qui tiennent ensemble dans le solde)
+    proposalBlock() {
+      const a = this.album;
+      const coins = X.coins();
+      const prop = a.proposedSets();
+      const rank = new Map(prop.map((x, i) => [x.key, i]));
+      const rows = a
+        .setList()
+        .map((s) => {
+          const cards = a.toFinish(s);
+          return { s, cards, spend: cards.reduce((t, p) => t + a.priceOf(p), 0), unpriced: cards.filter((p) => !a.priceOf(p)).length };
+        })
+        .filter((x) => x.cards.length)
+        .sort((x, y) => (rank.get(x.s.key) ?? Infinity) - (rank.get(y.s.key) ?? Infinity) || x.unpriced - y.unpriced || x.spend - y.spend);
+      const scan = btn(a.mode === 'scan' ? 'Scan en cours…' : '⟳ Scanner le club', () => void this.scanClub(), 'small primary', {
+        disabled: a.running,
+        title: 'Lit les joueurs présents au club et ceux passés au club (Galerie EA), puis propose les sets faisables avec le solde. Le sniper est suspendu pendant le scan.',
+      });
+      const head = h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: `Sets à faire (${rows.length})` }), scan);
+      const spend = prop.reduce((t, x) => t + x.spend, 0);
+      const info = hint(
+        `${a.clubAt ? `Club scanné ${ago(a.clubAt)} (${fmt(a.clubIds.size)} joueurs)` : 'Club jamais scanné'} · ${
+          coins === null ? 'solde inconnu' : `${prop.length} set(s) faisable(s) avec ${fmt(coins)} crédits${prop.length ? ` (~${fmt(spend)})` : ''}`
+        }`,
+      );
+      if (!rows.length) return h('div', { className: 'a-block' }, head, info, h('div', { className: 'a-empty', textContent: 'Tous les sets importés sont complets.' }));
+      const allProp = prop.length > 0 && prop.every((x) => this.homeSel.has(x.key));
+      const pick = h('button', {
+        type: 'button',
+        className: 'a-link',
+        textContent: allProp ? 'Sets proposés cochés' : `Cocher les ${prop.length} set(s) proposé(s)`,
+        disabled: !prop.length || allProp || a.running,
+        onclick: () => {
+          this.homeSel = new Set(prop.map((x) => x.key));
+          this.renderHomeContent();
+        },
+      });
+      const shown = this.propAll ? rows : rows.slice(0, 10);
+      const list = shown.map(({ s, cards, spend: v, unpriced }) => {
+        const on = this.homeSel.has(s.key);
+        const ok = rank.has(s.key);
+        const req = s.needed > 0 && s.needed < Object.keys(s.players ?? {}).length ? ` · ${s.needed} requises` : '';
+        return h(
+          'div',
+          {
+            className: `a-hit${a.running ? '' : ' pick'}`,
+            title: cards.map((p) => `${p.name}${a.priceOf(p) ? ` · ${fmt(a.priceOf(p))}` : ' · sans prix'}`).join('\n'),
+            onclick: () => {
+              if (a.running) return;
+              on ? this.homeSel.delete(s.key) : this.homeSel.add(s.key);
+              this.renderHomeContent();
+            },
+          },
+          h('span', { className: `a-check${on ? ' on' : ''}`, textContent: '✓' }),
+          h('span', { className: 'n' }, s.name, h('span', { className: 'm', textContent: ` · ${cards.length} carte(s) à acheter${req}` })),
+          h('span', {
+            className: `m ${ok ? 'ok' : unpriced || (coins !== null && v > coins) ? 'warn' : ''}`,
+            textContent: `${v ? `~${fmt(v)}` : ''}${unpriced ? `${v ? ' + ' : ''}${unpriced} sans prix` : ''}${ok ? ' · proposé' : coins !== null && v > coins ? ' · au-delà du solde' : ''}`,
+          }),
+          h('button', { type: 'button', className: 'a-x', textContent: '↗', title: 'Voir les joueurs du set', onclick: (ev) => (ev.stopPropagation(), this.openSet(s.key)) }),
+        );
+      });
+      const more =
+        rows.length > 10
+          ? h('button', { type: 'button', className: 'a-link', textContent: this.propAll ? 'Réduire' : `Voir les ${rows.length} sets`, onclick: () => ((this.propAll = !this.propAll), this.renderHomeContent()) })
+          : null;
+      return h(
+        'div',
+        { className: 'a-block' },
+        head,
+        info,
+        hint('Proposés : les sets les moins chers à finir qui tiennent ensemble dans le solde (joueur commun à plusieurs sets acheté une fois). Coche les sets puis « Faire les sets » : les cartes manquantes sont achetées au prix du marché, set par set, du moins cher au plus cher.'),
+        h('div', { className: 'a-row' }, pick, h('span', { className: 'a-grow' }), more),
+        h('div', { className: 'a-hits', style: 'max-height:none' }, ...list),
+      );
+    }
+    async scanClub() {
+      const a = this.album;
+      if (a.running) return;
+      if (await a.scanClub()) this.homeSel = new Set(a.proposedSets().map((x) => x.key));
+      this.renderAll();
+    }
+    // Sets cochés : cartes à acheter pour les finir, achat direct lancé tout de suite (progression dans la fenêtre d'achat)
+    async completeSets(keys) {
+      const a = this.album;
+      if (a.running) return;
+      const plan = a.planSets(keys);
+      const ids = plan.flatMap((x) => x.cards.map((p) => p.defId));
+      if (!ids.length) return a.log('Sets cochés déjà complets : rien à acheter');
+      const spend = plan.reduce((t, x) => t + x.spend, 0);
+      const c = X.coins();
+      if (c !== null && spend > c && !confirm(`Solde ${fmt(c)} pour ~${fmt(spend)} crédits nécessaires. Les sets les moins chers passent d’abord ; ensuite les achats attendent les ventes en cours, ou s’arrêtent faute de crédits. Lancer ?`)) return;
+      this.homeSel.clear();
+      const order = plan.map((x) => x.key);
+      this.openBuy(order);
+      await this.runBuy(ids, order);
+    }
+    // Plusieurs sets cochés : cartes à acheter pour les finir, en un clic (ou sniper)
+    renderHomeActionbar() {
       const a = this.album;
       const keys = [...this.homeSel];
       if (!keys.length) return this.actionbar.classList.add('hidden');
-      const missing = [...new Map(keys.flatMap((k) => byKey.get(k)?.missing ?? []).map((p) => [p.defId, p])).values()];
-      const spend = missing.reduce((n, p) => n + (Number(a.selection[p.defId]) || p.minPrice || 0), 0);
-      const unpriced = missing.filter((p) => !(Number(a.selection[p.defId]) || p.minPrice)).length;
-      const ids = missing.map((p) => p.defId);
+      const plan = a.planSets(keys);
+      const ids = plan.flatMap((x) => x.cards.map((p) => p.defId));
+      const sum = (f) => plan.reduce((t, x) => t + f(x), 0);
+      const spend = sum((x) => x.spend);
+      const cost = sum((x) => x.cost);
+      const unpriced = sum((x) => x.unpriced);
+      const c = X.coins();
+      const over = c !== null && spend > c;
+      const keep = this.cfg.afterBuy === 'keep';
       this.actionbar.classList.remove('hidden');
       this.actionbar.replaceChildren(
         h(
           'div',
           { className: 'a-row a-grow' },
           h('span', { className: 'a-count', textContent: `${keys.length} set(s) coché(s)` }),
-          h('span', { className: 'a-proj' }, `${missing.length} carte(s) manquante(s) · achat direct `, h('b', { textContent: `~${fmt(spend)}` }), unpriced ? h('span', { className: 'dim', textContent: ` + ${unpriced} sans prix` }) : null),
+          h(
+            'span',
+            { className: 'a-proj' },
+            h('span', {}, `${ids.length} carte(s) · achat `, h('b', { textContent: `~${fmt(spend)}` })),
+            h('span', {}, `coût réel${keep ? ' (club)' : ''} `, h('b', { className: cost > 0 ? 'neg' : 'pos', textContent: cost < 0 ? `+${fmt(-cost)}` : `~${fmt(cost)}` })),
+            unpriced ? h('span', { className: 'dim', textContent: `+ ${unpriced} sans prix` }) : null,
+            over ? h('span', { className: 'warn', textContent: `solde ${fmt(c)} insuffisant` }) : null,
+          ),
         ),
         h(
           'div',
@@ -1072,12 +1182,16 @@
           btn('Décocher', () => (this.homeSel.clear(), this.renderHomeContent(), this.actionbar.classList.add('hidden')), 'ghost'),
           btn(`🎯 Sniper (${ids.length})`, () => (this.homeSel.clear(), this.app.snipeSelection(ids)), '', {
             disabled: !ids.length,
-            title: 'Toutes les cartes manquantes des sets cochés deviennent des cibles du sniper (alternance) : achat sous le prix du marché, revente avec profit.',
+            title: 'Les cartes à acheter des sets cochés deviennent des cibles du sniper (alternance) : achat sous le prix du marché, revente avec profit.',
           }),
-          btn(a.mode === 'buy' ? 'Achats en cours…' : `Acheter maintenant (${ids.length})`, () => {
-            if (a.mode !== 'buy') for (const id of ids) a.setSelected(id, true);
-            this.openBuy(keys);
-          }, 'primary', { disabled: (!ids.length || a.running) && a.mode !== 'buy', title: 'Achat direct au prix du marché de toutes les cartes manquantes des sets cochés, set par set (décochables dans la fenêtre)' }),
+          btn('Ajuster…', () => {
+            for (const id of ids) a.setSelected(id, true);
+            this.openBuy(plan.map((x) => x.key));
+          }, '', { disabled: !ids.length || a.running, title: 'Ouvre la fenêtre d’achat : prix de départ, cartes, écart max, après achat' }),
+          btn(a.mode === 'buy' ? 'Achats en cours…' : `Faire ${keys.length > 1 ? `les ${keys.length} sets` : 'le set'}`, () => void this.completeSets(keys), 'primary', {
+            disabled: !ids.length || a.running,
+            title: 'Achète au prix du marché les cartes qui manquent pour finir les sets cochés, set par set du moins cher au plus cher, puis les traite selon « Après achat ». Le sniper est suspendu pendant les achats puis reprend.',
+          }),
         ),
       );
     }
@@ -1234,11 +1348,11 @@
       this.buyLayer.classList.remove('open');
       if (this.isOpen) this.renderBody();
     }
-    async runBuy(ids) {
+    async runBuy(ids, keys) {
       this.buyRan = true;
       this.buyRanKey = this.buyKey;
       this.buyRows = ids;
-      await this.album.validate(ids);
+      await (keys ? this.album.completeSets(keys) : this.album.validate(ids));
       this.buyRows = this.album.queue.map((q) => q.defId);
       this.renderBuy();
     }
@@ -1743,7 +1857,7 @@
       this.renderStrip();
       const a = this.album;
       const s = this.sniper;
-      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : a.catalog.text}|${s.running}|${s.task}|${s.idx}|${this.cfg.snipeFilters}|${this.cfg.rotate}`;
+      const sig = `${a.mode}|${a.version}|${this.setKey ? '' : `${a.catalog.text}|${X.coins()}`}|${s.running}|${s.task}|${s.idx}|${this.cfg.snipeFilters}|${this.cfg.rotate}`;
       if (sig !== this.lastSig && !this.typing()) {
         this.lastSig = sig;
         if (this.tab === 'gallery' || this.tab === 'snipe') this.renderBody();

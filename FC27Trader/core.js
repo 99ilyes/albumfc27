@@ -477,6 +477,18 @@
     const r = await X.observe(services.Item.requestUnassignedItems?.());
     return { ...r, data: r.data?.items ?? [] };
   };
+  // Club : joueurs possédés, page par page (même recherche que l'écran Club de la Web App)
+  X.CLUB_PAGE = 91;
+  X.searchClub = async (offset) => {
+    const c = new UTSearchCriteriaDTO();
+    c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
+    c.offset = offset;
+    c.count = X.CLUB_PAGE;
+    const r = await X.observe(services.Club?.search?.(c));
+    const res = r.response ?? r.data ?? {};
+    const items = Array.isArray(res.items) ? res.items : [];
+    return { ...r, items, all: res.retrievedAll === true || items.length < X.CLUB_PAGE };
+  };
   X.clearSold = () => X.observe(services.Item.clearSoldItems?.());
   X.relistExpired = () => X.observe(services.Item.relistExpiredAuctions?.());
 
