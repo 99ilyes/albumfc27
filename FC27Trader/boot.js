@@ -154,7 +154,7 @@
       onUpdate,
       (patch) => app.setConfig(patch),
       {
-        onSnipe: (defId) => album.onSnipe(defId),
+        onSnipe: (defId, raw) => album.onSnipe(defId, raw),
         isCollected: (defId) => album.isCollected(defId),
         albumSold: (i) => album.recordSold(i),
         albumPrice: (id) => album.bought[id]?.price ?? 0,
@@ -190,7 +190,11 @@
     const n = album.setList().length;
     album.log(`${X.APP} prêt${n ? ` (${n} set${n > 1 ? 's' : ''} Galerie)` : ''}`);
     if (n) setTimeout(() => !album.running && void album.syncGallery(), 5e3);
-    if (app.cfg.autoCatalog) album.requestCatalog(false);
+    // Lecture fut.gg enrichie (joueurs requis, seuils de grade) : catalogue relu une fois après la mise à jour
+    if (Number(load(`${NS}:parseV`, 0)) < 2) {
+      save(`${NS}:parseV`, 2);
+      if (n) album.requestCatalog(true);
+    } else if (app.cfg.autoCatalog) album.requestCatalog(false);
     // Suivi des cartes Galerie recalé sur la vraie liste de transferts au démarrage
     if (Object.keys(album.bought).length) setTimeout(() => !album.running && !sniper.running && app.refreshPile(), 8e3);
 

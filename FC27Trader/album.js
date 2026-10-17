@@ -25,6 +25,7 @@
   const K_HIDDEN = `${NS}:hiddenSets`;
   const K_CATALOG_AT = `${NS}:catalogAt`;
   const K_CLUB = `${NS}:club`;
+  const K_COLL = `${NS}:collection`;
   const CLUB_PAGES = 120;
   X.ALBUM_KEYS = { K_RESUME, K_ACTIVE, K_LOCK_RESUME, K_IMPORT_AT };
 
@@ -44,6 +45,35 @@
   const DURATIONS = [3600, 10800, 21600, 43200, 86400, 259200];
   const settled = (sr) => !Number.isFinite(sr) || Math.floor(((DURATIONS.find((d) => sr < d) ?? DURATIONS[DURATIONS.length - 1]) - sr) / 60) > 1;
   const validId = (v) => (Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : null);
+  // Score Galerie d'une carte : barème communautaire FC 27 (non publié par EA, ajustable en cours de saison).
+  // Or 75-99 selon la note, argent 35, bronze 20 ; rareté spéciale x1,25 (estimation). Bonus de tags non comptés.
+  const GOLD_SCORE = { 75: 90, 76: 100, 77: 120, 78: 140, 79: 160, 80: 180, 81: 280, 82: 340, 83: 410, 84: 830, 85: 2100, 86: 4100, 87: 5500, 88: 8300, 89: 11e3, 90: 14e3, 91: 19e3, 92: 2e4, 93: 25e3, 94: 3e4, 95: 4e4, 96: 55e3, 97: 85e3, 98: 9e4, 99: 1e5 };
+  const itemScore = (rating, rareflag) => {
+    const r = Math.floor(Number(rating) || 0);
+    if (r < 40) return 0;
+    const base = r >= 99 ? 1e5 : r >= 75 ? GOLD_SCORE[r] : r >= 65 ? 35 : 20;
+    return Math.round(base * (Number(rareflag) > 1 ? 1.25 : 1));
+  };
+  X.itemScore = itemScore;
+  const tierOf = (r) => (r >= 75 ? 'g' : r >= 65 ? 's' : r > 0 ? 'b' : '');
+  // Critère d'un set selon sa rubrique fut.gg (/fut-gallery/<rubrique>/<set>/) : ligue, nation, rareté ; sinon club
+  const CRIT_HINT = { leagues: 'l', nations: 'n', rarities: 'f', clubs: 'c' };
+  const CRIT_LABEL = { l: 'Ligue', n: 'Nation', f: 'Rareté', c: 'Club' };
+  X.CRIT_LABEL = CRIT_LABEL;
+  function loadColl() {
+    const out = new Map();
+    for (const [id, v] of Object.entries(load(K_COLL, {}) ?? {})) {
+      const d = validId(id);
+      if (d && Array.isArray(v)) out.set(d, { r: v[0] || 0, f: v[1] >= 0 ? v[1] : null, l: v[2] || 0, c: v[3] || 0, n: v[4] || 0 });
+    }
+    // Première ouverture : cartes déjà snipées, passées au club donc dans la Galerie (attributs lus chez EA à la synchro)
+    if (load(K_COLL, null) === null)
+      for (const id of Object.keys(load(`${X.SNIPE_NS}:stats`, {})?.players ?? {})) {
+        const d = validId(id);
+        if (d && !out.has(d)) out.set(d, { r: 0, f: null, l: 0, c: 0, n: 0 });
+      }
+    return out;
+  }
 
   function loadBought() {
     const out = {};
@@ -90,6 +120,9 @@
     catalog = { busy: false, text: '', at: Number(load(K_CATALOG_AT, 0)) || 0 };
     clubIds = new Set(load(K_CLUB, null)?.ids ?? []); // joueurs présents au club au dernier scan
     clubAt = Number(load(K_CLUB, null)?.at) || 0;
+    // Collection Galerie connue : joueurs passés au club (scans, achats, snipes, statut EA), defId -> attributs
+    coll = loadColl();
+    progCache = { v: -1, map: new Map() };
     waitUntil = 0;
     waitLabel = '';
 
@@ -168,7 +201,7 @@
       return Object.values(this.sets).sort((a, b) => b.at - a.at);
     }
     refreshCollected(p) {
-      if (!p.collected && (X.netItems.get(p.defId)?.collected || this.done.has(p.defId) || this.clubIds.has(p.defId))) p.collected = true;
+      if (!p.collected && (X.netItems.get(p.defId)?.collected || this.done.has(p.defId) || this.clubIds.has(p.defId) || this.coll.has(p.defId))) p.collected = true;
       return p;
     }
     setPlayers(set) {
@@ -249,6 +282,86 @@
       };
     }
 
+    // --- Collection et critère des sets ---
+
+    addOwned(defId, a) {
+      const d = validId(defId);
+      if (!d) return;
+      const prev = this.coll.get(d) ?? { r: 0, f: null, l: 0, c: 0, n: 0 };
+      const next = { ...prev };
+      if (a) for (const k of ['r', 'l', 'c', 'n']) if (a[k] > 0) next[k] = a[k];
+      if (a && a.f !== null && a.f !== undefined) next.f = a.f;
+      this.coll.set(d, next);
+    }
+    saveColl() {
+      const o = {};
+      for (const [id, a] of this.coll) o[id] = [a.r, a.f ?? -1, a.l, a.c, a.n];
+      if (!save(K_COLL, o)) this.log('Stockage local plein : collection Galerie non enregistrée', 'warn');
+      this.touch();
+    }
+    // Attributs connus d'une carte : collection, réponse EA /defid, carte fut.gg
+    attrsOf(defId) {
+      const c = this.coll.get(defId);
+      if (c?.l || c?.c || c?.n) return c;
+      const e = X.attrsFrom(this.itemData.get(defId));
+      if (e && (e.l || e.c || e.n)) return e;
+      const p = this.findPlayer(defId);
+      return p && (p.l || p.c || p.n) ? { r: p.rating || 0, f: p.rareflag ?? null, l: p.l || 0, c: p.c || 0, n: p.n || 0 } : (c ?? null);
+    }
+    // Critère du set (ligue, club, nation, rareté) déduit de sa rubrique et des joueurs listés par fut.gg (équipe la moins chère) ;
+    // null : set à liste fixe (seuls les joueurs listés comptent)
+    critOf(set) {
+      let seg = [];
+      try {
+        seg = new URL(set.url).pathname.split('/').filter(Boolean);
+      } catch {}
+      const k = CRIT_HINT[seg[1]] ?? (seg.length >= 3 ? 'c' : null);
+      if (!k) return null;
+      const ps = Object.values(set.players ?? {});
+      const known = ps.map((p) => this.attrsOf(p.defId)).filter((a) => a && (k === 'f' ? a.f !== null && a.f !== undefined : a[k] > 0));
+      if (!known.length || known.length < ps.length * 0.6) return null;
+      const v = new Set(known.map((a) => a[k]));
+      if (v.size > (k === 'n' ? 1 : 2)) return null;
+      // Club déduit (rubrique non reconnue) : un club doit dominer la liste, sinon set à liste fixe (saisons, promos…)
+      if (!CRIT_HINT[seg[1]] && Math.max(...[...v].map((x) => known.filter((a) => a[k] === x).length)) < Math.max(3, known.length * 0.7)) return null;
+      const tiers = new Set(known.map((a) => tierOf(a.r)));
+      return { k, v, tier: k === 'f' && tiers.size === 1 ? [...tiers][0] : '' };
+    }
+    eligible(crit, a) {
+      if (!a) return false;
+      if (crit.k === 'f') return a.f !== null && crit.v.has(a.f) && (!crit.tier || tierOf(a.r) === crit.tier);
+      return crit.v.has(a[crit.k]);
+    }
+    // Avancement d'un set : cartes de la collection qui y entrent (défId -> score), emplacements remplis
+    progress(set) {
+      if (this.progCache.v !== this.version) this.progCache = { v: this.version, map: new Map() };
+      const hit = this.progCache.map.get(set.key);
+      if (hit) return hit;
+      const crit = this.critOf(set);
+      const owned = new Map();
+      for (const p of Object.values(set.players ?? {})) if (this.refreshCollected(p).collected) owned.set(p.defId, this.scoreOf(p));
+      if (crit) for (const [id, a] of this.coll) if (!owned.has(id) && this.eligible(crit, a)) owned.set(id, itemScore(a.r, a.f));
+      const slots = this.slotsOf(set);
+      const out = { crit, owned, slots, have: Math.min(slots, owned.size) };
+      this.progCache.map.set(set.key, out);
+      return out;
+    }
+
+    // Score estimé du set (meilleures cartes dans la limite des places, sans bonus de tags) et grade atteint selon les seuils fut.gg
+    gradeOf(set) {
+      const { owned, slots } = this.progress(set);
+      const score = [...owned.values()]
+        .sort((x, y) => y - x)
+        .slice(0, slots)
+        .reduce((t, v) => t + v, 0);
+      const g = set.grades;
+      if (!g) return { score, grade: null, next: null };
+      const order = ['D', 'C', 'B', 'A', 'S'].filter((k) => g[k] > 0);
+      const reached = order.filter((k) => score >= g[k]).pop() ?? null;
+      const nextKey = order.find((k) => score < g[k]) ?? null;
+      return { score, grade: reached, next: nextKey ? { grade: nextKey, at: g[nextKey] } : null };
+    }
+
     // --- Sets à faire : scan du club, coût pour finir chaque set, sets proposés selon le solde ---
 
     priceOf(p) {
@@ -260,12 +373,13 @@
       const cfg = this.getConfig();
       return price - (cfg.afterBuy === 'keep' ? 0 : netOf(sellFor(price, cfg)));
     }
-    // Cartes à acheter pour finir un set : les manquantes, ou les moins chères si le set n'en demande qu'une partie
+    // Cartes à acheter pour finir un set : places libres comblées par les joueurs listés les moins chers
     toFinish(set) {
-      const all = this.setPlayers(set);
-      const missing = all.filter((p) => !p.collected).sort((x, y) => (this.priceOf(x) || Infinity) - (this.priceOf(y) || Infinity));
-      const req = set.needed > 0 && set.needed < all.length ? set.needed : all.length;
-      return missing.slice(0, Math.max(0, req - (all.length - missing.length)));
+      const { owned, slots, have } = this.progress(set);
+      const missing = this.setPlayers(set)
+        .filter((p) => !p.collected && !owned.has(p.defId))
+        .sort((x, y) => (this.priceOf(x) || Infinity) - (this.priceOf(y) || Infinity));
+      return missing.slice(0, Math.max(0, slots - have));
     }
     // Ordre glouton : à chaque tour le set le moins cher à finir, joueurs communs déjà prévus comptés une fois.
     // Avec budget : seuls les sets entièrement chiffrés qui tiennent dans ce qui reste du solde (sets proposés)
@@ -302,6 +416,134 @@
       return c === null ? [] : this.planSets(this.setList().map((s) => s.key), c);
     }
 
+    // --- Objectif niveau Galerie : points estimés gagnés par carte achetée ---
+
+    scoreOf(p) {
+      return itemScore(p.rating, p.rareflag);
+    }
+    // Places d'un set : joueurs requis lus sur fut.gg (« requires 20 … players »), sinon taille de la liste
+    slotsOf(set) {
+      if (set.needed > 0) return set.needed;
+      // Places inconnues : taille de la liste fut.gg actuelle (sans les joueurs gardés d'une liste précédente)
+      return Object.values(set.players ?? {}).filter((p) => !p.kept).length;
+    }
+    // Meilleurs scores collectés de chaque set, dans la limite de ses emplacements
+    levelState() {
+      const state = new Map();
+      for (const s of this.setList()) {
+        const { slots, owned } = this.progress(s);
+        state.set(s.key, { slots, top: [...owned.values()].sort((x, y) => y - x).slice(0, slots) });
+      }
+      return state;
+    }
+    estimatedScore() {
+      let t = 0;
+      for (const { top } of this.levelState().values()) for (const v of top) t += v;
+      return t;
+    }
+    // Glouton paresseux sur points / crédit : une carte compte dans chaque set où elle entre (ou remplace une carte plus faible).
+    // need : points à gagner ; budget : crédits engagés au plus (achats successifs, sans compter les reventes)
+    planLevel(need, budget) {
+      const state = this.levelState();
+      const sets = this.setList();
+      const crits = new Map(sets.map((s) => [s.key, this.progress(s).crit]));
+      const where = new Map();
+      for (const s of sets)
+        for (const p of Object.values(s.players ?? {})) {
+          if (where.has(p.defId) || this.refreshCollected(p).collected || !this.priceOf(p) || !this.scoreOf(p)) continue;
+          const a = this.attrsOf(p.defId);
+          // Une carte compte dans tous les sets dont elle remplit le critère, et dans ceux qui la listent
+          const keys = sets.filter((x) => (crits.get(x.key) && a ? this.eligible(crits.get(x.key), a) : false) || x.players?.[p.defId]).map((x) => x.key);
+          where.set(p.defId, { p, keys, price: this.priceOf(p), score: this.scoreOf(p) });
+        }
+      const gainOf = (w) =>
+        w.keys.reduce((t, k) => {
+          const st = state.get(k);
+          return t + (st.top.length < st.slots ? w.score : Math.max(0, w.score - st.top[st.top.length - 1]));
+        }, 0);
+      const ratio = (x) => x.gain / x.w.price;
+      const heap = [...where.values()].map((w) => ({ w, gain: gainOf(w) })).filter((x) => x.gain > 0);
+      heap.sort((a, b) => ratio(b) - ratio(a));
+      const picks = [];
+      let spend = 0;
+      let gain = 0;
+      while (heap.length && gain < need && budget - spend >= 150) {
+        const x = heap.shift();
+        const g = gainOf(x.w);
+        if (g < x.gain) {
+          x.gain = g;
+          if (g > 0) {
+            let i = heap.findIndex((y) => ratio(y) < ratio(x));
+            heap.splice(i < 0 ? heap.length : i, 0, x);
+          }
+          continue;
+        }
+        if (spend + x.w.price > budget) continue;
+        picks.push({ p: x.w.p, price: x.w.price, gain: g, keys: x.w.keys });
+        spend += x.w.price;
+        gain += g;
+        for (const k of x.w.keys) {
+          const st = state.get(k);
+          st.top.push(x.w.score);
+          st.top.sort((a, b) => b - a);
+          if (st.top.length > st.slots) st.top.pop();
+        }
+      }
+      return { picks, spend, gain, cost: picks.reduce((t, x) => t + this.costFor(x.price), 0), candidates: where.size };
+    }
+    async buyLevel(picks) {
+      if (this.running) return;
+      const tol = tolOf(this.getConfig());
+      const queue = picks.map(({ p }) => {
+        this.setSelected(p.defId, true);
+        return this.entryOf(p, 'Objectif niveau', tol);
+      });
+      if (!queue.length) return this.log('Objectif niveau : aucune carte à acheter');
+      const gain = picks.reduce((t, x) => t + x.gain, 0);
+      this.log(`Objectif niveau : ${queue.length} carte(s) pour ~${fmtNum(gain)} points estimés, de la plus rentable (points / crédit) à la moins rentable`);
+      this.queue = queue;
+      save(K_QUEUE, this.queue);
+      this.touch();
+      await this.runQueue();
+    }
+
+    // Statut « collecté » (Galerie) de chaque joueur du jeu : recherche « concept » de la Web App, 200 joueurs par page ;
+    // Map defId -> attributs des joueurs collectés, null si arrêt ou lecture impossible
+    async readCollected() {
+      const listed = new Map();
+      for (const st of Object.values(this.sets)) for (const p of Object.values(st.players ?? {})) listed.set(p.defId, [...(listed.get(p.defId) ?? []), p]);
+      const got = new Map();
+      let read = 0;
+      for (let page = 0; page < 500; page++) {
+        if (page) await this.sleep(rand(1e3, 2200), 'Joueurs collectés, page suivante');
+        if (this.stopRequested) return null;
+        this.activity(`Galerie EA : page ${page + 1}, ${fmtNum(read)} joueurs lus, ${fmtNum(got.size)} collecté(s)`);
+        const r = await X.searchConcept(page * X.CONCEPT_PAGE);
+        if (!r.success) {
+          if (!this.fatal(r, 'concept')) this.log(`Lecture des joueurs collectés impossible (statut ${r.status})${errText(r.error)} : statut lu sur les joueurs des sets seulement`, 'warn');
+          return null;
+        }
+        if (!r.items) {
+          this.log('Lecture des joueurs collectés : réponse EA non reçue, statut lu sur les joueurs des sets seulement', 'warn');
+          return null;
+        }
+        if (!r.items.length) return got;
+        for (const it of r.items) {
+          const d = validId(it?.resourceId ?? it?.id);
+          if (!d) continue;
+          read++;
+          const a = X.attrsFrom(it);
+          for (const p of listed.get(d) ?? []) {
+            Object.assign(p, { l: a.l || p.l || 0, c: a.c || p.c || 0, n: a.n || p.n || 0 });
+            if (a.f !== null) p.rareflag = a.f;
+            if (!p.rating && a.r) p.rating = a.r;
+          }
+          if (it.isCollected === true) got.set(d, a);
+        }
+      }
+      return got;
+    }
+
     // Joueurs présents au club (scan page par page) puis Galerie EA (joueurs passés) ; true si mené à terme
     async scanClub() {
       if (!this.setList().length) {
@@ -325,7 +567,14 @@
           for (const it of r.items) {
             const t = it?.type ?? it?.itemType;
             const d = Number(it?.definitionId ?? it?.resourceId ?? 0);
-            if (d > 0 && (!t || t === 'player')) ids.add(d);
+            // Joueurs prêtés exclus (pas comptés par la Galerie)
+            if (d <= 0 || (t && t !== 'player') || Number(it?.loans) > 0) continue;
+            ids.add(d);
+            this.addOwned(d, X.attrsFrom(it));
+            if (!this.clubSample)
+              try {
+                this.clubSample = Object.fromEntries(Object.entries(it).filter(([, v]) => v === null || typeof v !== 'object').slice(0, 60));
+              } catch {}
           }
           if (r.all) {
             full = true;
@@ -336,17 +585,24 @@
         this.clubIds = full ? ids : new Set([...this.clubIds, ...ids]);
         if (full) this.clubAt = Date.now();
         save(K_CLUB, { at: this.clubAt, ids: [...this.clubIds] });
-        const got = new Set();
-        for (const s of Object.values(this.sets))
-          for (const p of Object.values(s.players ?? {}))
-            if (this.clubIds.has(p.defId) && !p.collected) {
-              p.collected = true;
-              got.add(p.defId);
-            }
+        this.saveColl();
+        for (const s of Object.values(this.sets)) for (const p of Object.values(s.players ?? {})) if (this.clubIds.has(p.defId)) p.collected = true;
         this.saveSets();
-        if (ids.size || full) this.log(`Club ${full ? 'scanné' : 'lu en partie'} : ${ids.size} joueur(s) présent(s)${got.size ? `, ${got.size} carte(s) de set marquée(s) collectée(s)` : ''}`);
-        if (!this.stopRequested) {
-          this.activity('Galerie EA : joueurs passés au club');
+        if (ids.size || full) this.log(`Club ${full ? 'scanné' : 'lu en partie'} : ${ids.size} joueur(s) présent(s), collection Galerie connue ${this.coll.size} joueur(s)`);
+        // Joueurs passés au club : statut « collecté » de toute la base EA ; repli sur les joueurs des sets si indisponible
+        const got = this.stopRequested ? null : await this.readCollected();
+        if (got) {
+          const club = [...this.clubIds].map((id) => [id, this.coll.get(id)]);
+          this.coll = new Map(got);
+          for (const [id, a] of club) this.addOwned(id, a);
+          for (const st of Object.values(this.sets))
+            for (const p of Object.values(st.players ?? {})) p.collected = this.coll.has(p.defId) || this.done.has(p.defId);
+          this.saveColl();
+          this.saveSets();
+          this.gallerySyncAt = Date.now();
+          this.log(`Galerie EA : ${fmtNum(got.size)} joueur(s) collecté(s) (présents ou passés au club), collection ${fmtNum(this.coll.size)}`);
+        } else if (!this.stopRequested) {
+          this.activity('Galerie EA : joueurs des sets');
           await this.syncGallery();
         }
         if (this.stopRequested) return false;
@@ -383,7 +639,9 @@
       const sets = (keys ?? Object.keys(this.sets)).map((k) => this.sets[k]).filter(Boolean);
       const byId = new Map();
       for (const s of sets) for (const p of Object.values(s.players ?? {})) byId.set(p.defId, [...(byId.get(p.defId) ?? []), p]);
-      const ids = [...byId.keys()];
+      // Cartes de la collection sans attributs (snipes, achats anciens) : lues avec le reste
+      const bare = keys ? [] : [...this.coll].filter(([id, a]) => !byId.has(id) && !(a.l || a.c || a.n)).map(([id]) => id);
+      const ids = [...byId.keys(), ...bare];
       if (!ids.length) return true;
       const seen = new Set();
       const got = new Set();
@@ -397,16 +655,19 @@
         for (const it of r.items) {
           const defId = Number(it.resourceId || it.assetId || it.id);
           if (byId.has(defId)) this.itemData.set(defId, it);
+          const at = X.attrsFrom(it);
+          if (this.coll.has(defId) || it.isCollected === true) this.addOwned(defId, at);
           for (const p of byId.get(defId) ?? []) {
             seen.add(defId);
             if (Number.isFinite(Number(it.rareflag))) p.rareflag = Number(it.rareflag);
             if (!p.rating && Number(it.rating)) p.rating = Number(it.rating);
+            Object.assign(p, { l: at.l || p.l || 0, c: at.c || p.c || 0, n: at.n || p.n || 0 });
             if (typeof it.isCollected !== 'boolean') continue;
-            X.netItems.set(defId, { collected: it.isCollected });
+            X.netItems.set(defId, { ...at, collected: it.isCollected });
             if (it.isCollected) {
               if (!p.collected) got.add(defId);
               p.collected = true;
-            } else if (p.collected && !this.clubIds.has(defId)) {
+            } else if (p.collected && !this.clubIds.has(defId) && !this.coll.has(defId)) {
               if (this.done.has(defId)) lost.add(p.name);
               p.collected = false;
             }
@@ -416,6 +677,7 @@
         }
       }
       save(K_DONE, [...this.done]);
+      this.saveColl();
       for (const s of sets) s.syncedAt = Date.now();
       this.saveSets();
       if (!keys) this.gallerySyncAt = Date.now();
@@ -430,7 +692,8 @@
       const list = Array.isArray(data?.players) ? data.players : [];
       const slug = String(data?.slug || data?.name || 'set');
       const key = `futgg:${slug}`;
-      const prev = this.sets[key]?.players ?? {};
+      const before = this.sets[key];
+      const prev = before?.players ?? {};
       const players = {};
       for (const x of list) {
         const defId = validId(x?.defId);
@@ -442,11 +705,17 @@
           rating: Number(x.rating) || prev[defId]?.rating || 0,
           minPrice: Number(x.price) >= 150 ? Math.round(Number(x.price)) : 0,
           rareflag: this.findPlayer(defId)?.rareflag ?? null,
+          l: prev[defId]?.l || 0,
+          c: prev[defId]?.c || 0,
+          n: prev[defId]?.n || 0,
           collected: nc === true || this.done.has(defId) || (nc === undefined && prev[defId]?.collected === true),
         };
       }
       if (!Object.keys(players).length) return null;
-      return { kind: 'futgg', slug, key, name: String(data.name || 'Set fut.gg').slice(0, 60), url: String(data.url || ''), needed: Number(data.needed) || 0, source: 'futgg', at: Date.now(), players };
+      // fut.gg change sa liste au gré des prix et des nouvelles cartes : un joueur déjà collecté du set reste compté
+      for (const p of Object.values(prev)) if (!players[p.defId] && (p.collected || this.coll.has(p.defId))) players[p.defId] = { ...p, kept: true };
+      const grades = data.grades && typeof data.grades === 'object' ? data.grades : (before?.grades ?? null);
+      return { kind: 'futgg', slug, key, name: String(data.name || 'Set fut.gg').slice(0, 60), url: String(data.url || ''), needed: Number(data.needed) || before?.needed || 0, grades, source: 'futgg', at: Date.now(), players };
     }
     importSet(data) {
       const set = this.buildSet(data);
@@ -497,7 +766,10 @@
     // --- Liens avec le sniper ---
 
     // Carte snipée : comptée pour la Galerie si elle manquait ; true si c'était une carte manquante
-    onSnipe(defId) {
+    onSnipe(defId, raw) {
+      // Toute carte snipée passe au club : comptée dans la collection Galerie
+      this.addOwned(defId, X.attrsFrom(raw));
+      this.saveColl();
       const p = this.findPlayer(defId);
       if (!p || this.refreshCollected(p).collected) return false;
       this.markCollected(defId);
@@ -1013,7 +1285,9 @@
       this.touch();
       await this.runQueue();
     }
-    markCollected(defId) {
+    markCollected(defId, raw) {
+      this.addOwned(defId, raw ? X.attrsFrom(raw) : this.attrsOf(Number(defId)));
+      this.saveColl();
       this.done.add(Number(defId));
       save(K_DONE, [...this.done]);
       for (const s of Object.values(this.sets)) if (s.players?.[defId]) s.players[defId].collected = true;
@@ -1041,7 +1315,7 @@
       const price = it.buyNow;
       e.price = price;
       e.status = 'bought';
-      this.markCollected(e.defId);
+      this.markCollected(e.defId, it.raw);
       this.setSelected(e.defId, false);
       this.addTotal('bought', 1);
       this.addTotal('spent', price);

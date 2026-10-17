@@ -6,6 +6,7 @@
   X.SNIPE_NS = 'snipefc27';
   X.ALBUM_NS = 'albumfc27';
   X.APP = 'FC27 Trader';
+  X.VERSION = '1.4.3';
 
   // ---------- Prix EA ----------
 
@@ -132,6 +133,9 @@
     afterBuy: 'relist',
     markupPct: 5,
     autoCatalog: true,
+    levelTarget: 3e6,
+    levelScore: 0,
+    levelBudget: 0,
     tab: 'snipe',
   };
   const K_CONFIG = `${X.SNIPE_NS}:config`;
@@ -177,18 +181,69 @@
   X.lastPile = () => lastPile;
   X.onPile = (cb) => pileListeners.push(cb);
 
+  // Attributs utiles à la Galerie (note, rareté, ligue, club, nation), depuis un itemData EA ou une carte Web App
+  X.attrsFrom = (it) => {
+    if (!it || typeof it !== 'object') return null;
+    const pos = (v) => (Number(v) > 0 ? Number(v) : 0);
+    const f = Number(it.rareflag ?? it._rareflag);
+    return {
+      r: pos(it.rating ?? it._rating),
+      f: it.rareflag == null && it._rareflag == null ? null : Number.isFinite(f) ? f : null,
+      l: pos(it.leagueId ?? it._leagueId),
+      c: pos(it.teamId ?? it.teamid ?? it._teamId),
+      n: pos(it.nationId ?? it.nation ?? it._nationId),
+    };
+  };
   function recordItems(j) {
     const list = [...(Array.isArray(j.itemData) ? j.itemData : []), ...(Array.isArray(j.auctionInfo) ? j.auctionInfo.map((a) => a?.itemData) : [])];
     for (const it of list) {
       const defId = Number(it?.resourceId ?? 0);
       if (!defId || it.itemType !== 'player') continue;
-      X.netItems.set(defId, { collected: it.isCollected === true || !!X.netItems.get(defId)?.collected });
+      X.netItems.set(defId, { ...X.attrsFrom(it), collected: it.isCollected === true || !!X.netItems.get(defId)?.collected });
     }
+  }
+  X.defidPages = new Map();
+  // Diagnostic Galerie : dernières réponses EA dont l'URL évoque la Galerie (format FC 27 non documenté)
+  X.galleryDiag = [];
+  // Score et niveau Galerie s'ils passent dans une réponse EA (format non documenté : champs cherchés par nom)
+  X.galleryLive = null;
+  function recordGallery(url, j) {
+    const found = { score: 0, level: 0 };
+    const walk = (o, depth) => {
+      if (!o || typeof o !== 'object' || depth > 4) return;
+      for (const [k, v] of Object.entries(o)) {
+        if (typeof v === 'number' && v > 0) {
+          if (/^(gallery|total|overall)?_?score$/i.test(k) && v > found.score) found.score = v;
+          else if (/^(gallery|player)?_?level$/i.test(k) && v <= 100 && v > found.level) found.level = v;
+        } else walk(v, depth + 1);
+      }
+    };
+    walk(j, 0);
+    try {
+      X.galleryDiag = [{ url: String(url).replace(/\?.*$/, ''), at: Date.now(), body: JSON.stringify(j).slice(0, 4e3) }, ...X.galleryDiag].slice(0, 12);
+    } catch {}
+    if (found.score || found.level) X.galleryLive = { ...found, url: String(url).replace(/\?.*$/, ''), at: Date.now() };
   }
   function onResponse(url, status, body) {
     if (status !== 200) return;
     const text = typeof body === 'string' ? body : null;
     let j = typeof body === 'object' && body ? body : null;
+    if (/\/ut\/game\/[^?]*(gallery|collection|album)/i.test(url)) {
+      try {
+        j ??= JSON.parse(text);
+        recordGallery(url, j);
+      } catch {}
+    }
+    // Page de la recherche « concept » (base complète des joueurs) : /defid?start=… sans defId
+    if (/\/ut\/game\/[^/]+\/defid\?/i.test(url)) {
+      try {
+        const u = new URL(url, location.href);
+        if (!u.searchParams.has('defId')) {
+          j ??= JSON.parse(text);
+          X.defidPages.set(Number(u.searchParams.get('start')) || 0, { at: Date.now(), items: Array.isArray(j?.itemData) ? j.itemData : [] });
+        }
+      } catch {}
+    }
     if (/\/ut\/game\//i.test(url) && (j || /"itemData"/.test(text ?? ''))) {
       try {
         j ??= JSON.parse(text);
@@ -322,7 +377,7 @@
   };
   // Recherche du sniper : filtre (joueur ou critères copiés de la Web App), bornes de prix variées pour éviter le cache EA
   X.searchFilter = async (filter, range) => {
-    const c = new UTSearchCriteriaDTO();
+    const c = X.newCriteria();
     if (filter.criteria) Object.assign(c, filter.criteria);
     else {
       c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
@@ -340,7 +395,7 @@
   X.PAGE_COUNT = 21;
   X.PAGE_FULL = 20;
   X.searchCard = async (defId, { minBuy = 0, maxBuy = 0, minBid = 0 } = {}) => {
-    const c = new UTSearchCriteriaDTO();
+    const c = X.newCriteria();
     c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
     c.defId = [defId];
     c.count = X.PAGE_COUNT;
@@ -477,10 +532,45 @@
     const r = await X.observe(services.Item.requestUnassignedItems?.());
     return { ...r, data: r.data?.items ?? [] };
   };
+  // Critères de recherche de la Web App : classe globale, sinon retrouvée par ses méthodes (nom minifié selon les versions)
+  let Criteria = null;
+  X.newCriteria = () => {
+    if (!Criteria) {
+      if (typeof UTSearchCriteriaDTO === 'function') Criteria = UTSearchCriteriaDTO;
+      else
+        for (const k of Object.getOwnPropertyNames(window))
+          try {
+            const v = window[k];
+            if (typeof v === 'function' && v.prototype && 'hasValidDefId' in v.prototype && 'resetDefId' in v.prototype) {
+              Criteria = v;
+              break;
+            }
+          } catch {}
+    }
+    if (!Criteria) throw new Error('classe de critères de recherche introuvable dans la Web App');
+    return new Criteria();
+  };
+  // Base complète des joueurs du jeu, 200 par page ; la réponse EA (/defid) donne isCollected (Galerie) et les attributs de chaque carte
+  X.CONCEPT_PAGE = 200;
+  X.searchConcept = async (offset) => {
+    if (typeof services.Item.searchConceptItems !== 'function') return { success: false, status: -1, error: 'recherche « concept » absente de cette version de la Web App', items: null };
+    const c = X.newCriteria();
+    c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
+    c.sort = 'desc';
+    c.count = X.CONCEPT_PAGE;
+    c.offset = offset;
+    try {
+      Object.defineProperty(c, 'cacheable', { value: false });
+    } catch {}
+    X.defidPages.delete(offset);
+    const r = await X.observe(services.Item.searchConceptItems(c));
+    for (let n = 0; n < 40 && !X.defidPages.has(offset); n++) await sleep(50);
+    return { ...r, items: X.defidPages.get(offset)?.items ?? null };
+  };
   // Club : joueurs possédés, page par page (même recherche que l'écran Club de la Web App)
   X.CLUB_PAGE = 91;
   X.searchClub = async (offset) => {
-    const c = new UTSearchCriteriaDTO();
+    const c = X.newCriteria();
     c.type = typeof SearchType !== 'undefined' ? SearchType.PLAYER : 'player';
     c.offset = offset;
     c.count = X.CLUB_PAGE;

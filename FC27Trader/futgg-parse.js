@@ -70,10 +70,49 @@ globalThis.AlbumFutgg = (() => {
     return h1 && h1.length <= 60 ? h1 : toName(slug);
   }
 
+  // Texte de la page, nœuds séparés par des espaces (textContent les colle bout à bout dans un document non affiché)
+  function pageText(doc) {
+    const out = [];
+    const w = doc.createTreeWalker(doc.body ?? doc, 4);
+    for (let n = w.nextNode(); n; n = w.nextNode()) {
+      const v = n.nodeValue.replace(/\s+/g, ' ').trim();
+      if (v) out.push(v);
+    }
+    return out.join(' ');
+  }
+
+  // Places du set : « requires 20 Arsenal Men's or Women's players to complete », « needs 30 Premier League players », « Players needed: 20 »
   function needed(doc) {
-    const t = doc.body?.innerText || doc.body?.textContent || '';
-    const m = t.match(/(\d{1,3})\s+(?:players?\s+)?(?:needed|required|requis|nécessaires)/i) || t.match(/(?:players? needed|required players?)\s*:?\s*(\d{1,3})/i);
+    const t = pageText(doc);
+    const m =
+      t.match(/\b(?:requires?|needs?)\s+(\d{1,3})\s+(?:[^.\d]{0,60}?\s)?players?\b/i) ||
+      t.match(/(\d{1,3})\s+(?:players?\s+)?(?:needed|required|requis|nécessaires)/i) ||
+      t.match(/(?:players? needed|required players?)\s*:?\s*(\d{1,3})/i);
     return m ? Number(m[1]) : 0;
+  }
+
+  const num = (v) => {
+    const m = String(v).trim().match(/^(\d+(?:[.,]\d+)?)\s*([km])$/i);
+    if (m) return Math.round(parseFloat(m[1].replace(',', '.')) * (m[2].toLowerCase() === 'k' ? 1e3 : 1e6));
+    return parseInt(String(v).replace(/[^\d]/g, ''), 10);
+  };
+  // Seuils de grade (score de set) du tableau « Grade requirements » : D < C < B < A < S, sinon null
+  function grades(doc) {
+    const t = pageText(doc);
+    const at = [/grade requirements?/i, /requirements?/i, /grades?/i].map((re) => t.search(re)).find((i) => i >= 0) ?? 0;
+    const sec = t.slice(at, at + 4e3);
+    const out = {};
+    let from = 0;
+    for (const g of ['D', 'C', 'B', 'A', 'S']) {
+      const re = new RegExp(`(?:^|[^A-Za-z])${g}(?![A-Za-z])[^\\d]{0,30}?(\\d{1,3}(?:[ ,.]\\d{3})+|\\d+(?:[.,]\\d+)?\\s*[kKmM](?![A-Za-z])|\\d+)`, 'g');
+      re.lastIndex = from;
+      const m = re.exec(sec);
+      if (!m) return null;
+      out[g] = num(m[1]);
+      from = re.lastIndex;
+    }
+    const v = Object.values(out);
+    return v.every((x, i) => Number.isFinite(x) && x > 0 && (!i || x > v[i - 1])) ? out : null;
   }
 
   // Liens fut.gg de la page qui vérifient re (pathname), sans doublon
@@ -100,7 +139,7 @@ globalThis.AlbumFutgg = (() => {
   // Même format que l'envoi depuis la page fut.gg (commande « import » du panneau)
   function setData(doc, url, list) {
     const path = new URL(url).pathname;
-    return { at: Date.now(), slug: path.match(GALLERY_RE)?.[1] ?? 'set', name: setName(doc, path), url, needed: needed(doc), players: list };
+    return { at: Date.now(), slug: path.match(GALLERY_RE)?.[1] ?? 'set', name: setName(doc, path), url, needed: needed(doc), grades: grades(doc), players: list };
   }
 
   return {
