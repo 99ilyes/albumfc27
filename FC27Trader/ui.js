@@ -1070,7 +1070,7 @@
         .sort((x, y) => (rank.get(x.s.key) ?? Infinity) - (rank.get(y.s.key) ?? Infinity) || x.unpriced - y.unpriced || x.spend - y.spend);
       const scan = btn(a.mode === 'scan' ? 'Scan en cours…' : '⟳ Scanner le club', () => void this.scanClub(), 'small primary', {
         disabled: a.running,
-        title: 'Lit les joueurs présents au club et ceux passés au club (Galerie EA), puis propose les sets faisables avec le solde. Le sniper est suspendu pendant le scan.',
+        title: 'Lit les joueurs présents au club, puis le statut « collecté » de tous les joueurs du jeu chez EA (joueurs passés au club, 200 par page, quelques minutes), et propose les sets faisables avec le solde. Le sniper est suspendu pendant le scan.',
       });
       const diag = h('button', { type: 'button', className: 'a-link', textContent: 'Copier le diagnostic', title: 'Copie dans le presse-papiers ce que l’extension lit chez EA (Galerie, club, statut collecté), pour corriger la synchro', onclick: () => void this.copyDiag(diag) });
       const head = h('div', { className: 'a-row' }, h('span', { className: 'a-block-title a-grow', textContent: `Sets à faire (${rows.length})` }), diag, scan);

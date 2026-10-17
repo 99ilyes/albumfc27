@@ -66,11 +66,12 @@
       const d = validId(id);
       if (d && Array.isArray(v)) out.set(d, { r: v[0] || 0, f: v[1] >= 0 ? v[1] : null, l: v[2] || 0, c: v[3] || 0, n: v[4] || 0 });
     }
-    // Cartes déjà snipées : passées au club, donc dans la Galerie (attributs lus chez EA à la synchro)
-    for (const id of Object.keys(load(`${X.SNIPE_NS}:stats`, {})?.players ?? {})) {
-      const d = validId(id);
-      if (d && !out.has(d)) out.set(d, { r: 0, f: null, l: 0, c: 0, n: 0 });
-    }
+    // Première ouverture : cartes déjà snipées, passées au club donc dans la Galerie (attributs lus chez EA à la synchro)
+    if (load(K_COLL, null) === null)
+      for (const id of Object.keys(load(`${X.SNIPE_NS}:stats`, {})?.players ?? {})) {
+        const d = validId(id);
+        if (d && !out.has(d)) out.set(d, { r: 0, f: null, l: 0, c: 0, n: 0 });
+      }
     return out;
   }
 
@@ -490,6 +491,43 @@
       await this.runQueue();
     }
 
+    // Statut « collecté » (Galerie) de chaque joueur du jeu : recherche « concept » de la Web App, 200 joueurs par page ;
+    // Map defId -> attributs des joueurs collectés, null si arrêt ou lecture impossible
+    async readCollected() {
+      const listed = new Map();
+      for (const st of Object.values(this.sets)) for (const p of Object.values(st.players ?? {})) listed.set(p.defId, [...(listed.get(p.defId) ?? []), p]);
+      const got = new Map();
+      let read = 0;
+      for (let page = 0; page < 500; page++) {
+        if (page) await this.sleep(rand(1e3, 2200), 'Joueurs collectés, page suivante');
+        if (this.stopRequested) return null;
+        this.activity(`Galerie EA : page ${page + 1}, ${fmtNum(read)} joueurs lus, ${fmtNum(got.size)} collecté(s)`);
+        const r = await X.searchConcept(page * X.CONCEPT_PAGE);
+        if (!r.success) {
+          if (!this.fatal(r, 'concept')) this.log(`Lecture des joueurs collectés impossible (statut ${r.status})${errText(r.error)} : statut lu sur les joueurs des sets seulement`, 'warn');
+          return null;
+        }
+        if (!r.items) {
+          this.log('Lecture des joueurs collectés : réponse EA non reçue, statut lu sur les joueurs des sets seulement', 'warn');
+          return null;
+        }
+        if (!r.items.length) return got;
+        for (const it of r.items) {
+          const d = validId(it?.resourceId ?? it?.id);
+          if (!d) continue;
+          read++;
+          const a = X.attrsFrom(it);
+          for (const p of listed.get(d) ?? []) {
+            Object.assign(p, { l: a.l || p.l || 0, c: a.c || p.c || 0, n: a.n || p.n || 0 });
+            if (a.f !== null) p.rareflag = a.f;
+            if (!p.rating && a.r) p.rating = a.r;
+          }
+          if (it.isCollected === true) got.set(d, a);
+        }
+      }
+      return got;
+    }
+
     // Joueurs présents au club (scan page par page) puis Galerie EA (joueurs passés) ; true si mené à terme
     async scanClub() {
       if (!this.setList().length) {
@@ -535,8 +573,20 @@
         for (const s of Object.values(this.sets)) for (const p of Object.values(s.players ?? {})) if (this.clubIds.has(p.defId)) p.collected = true;
         this.saveSets();
         if (ids.size || full) this.log(`Club ${full ? 'scanné' : 'lu en partie'} : ${ids.size} joueur(s) présent(s), collection Galerie connue ${this.coll.size} joueur(s)`);
-        if (!this.stopRequested) {
-          this.activity('Galerie EA : joueurs passés au club');
+        // Joueurs passés au club : statut « collecté » de toute la base EA ; repli sur les joueurs des sets si indisponible
+        const got = this.stopRequested ? null : await this.readCollected();
+        if (got) {
+          const club = [...this.clubIds].map((id) => [id, this.coll.get(id)]);
+          this.coll = new Map(got);
+          for (const [id, a] of club) this.addOwned(id, a);
+          for (const st of Object.values(this.sets))
+            for (const p of Object.values(st.players ?? {})) p.collected = this.coll.has(p.defId) || this.done.has(p.defId);
+          this.saveColl();
+          this.saveSets();
+          this.gallerySyncAt = Date.now();
+          this.log(`Galerie EA : ${fmtNum(got.size)} joueur(s) collecté(s) (présents ou passés au club), collection ${fmtNum(this.coll.size)}`);
+        } else if (!this.stopRequested) {
+          this.activity('Galerie EA : joueurs des sets');
           await this.syncGallery();
         }
         if (this.stopRequested) return false;
